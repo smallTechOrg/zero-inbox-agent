@@ -80,13 +80,30 @@ def main() -> None:
         .execute()
     )
     thread_id = inserted["threadId"]
+    inserted_message_id = inserted["id"]
 
     import datetime as dt
 
     import db.session as session_module
     from db.models import Category, Cluster, Decision, Item, TriageRun
 
-    with session_module._SessionLocal() as session:
+    try:
+        _seed_db_rows(session_module, conn, thread_id, subject, tag)
+    except Exception:
+        # Don't leave an orphaned synthetic message in the real inbox on failure.
+        try:
+            service.users().messages().trash(userId="me", id=inserted_message_id).execute()
+        except Exception:
+            pass
+        raise
+
+
+def _seed_db_rows(session_module, conn, thread_id, subject, tag):
+    import datetime as dt
+
+    from db.models import Category, Cluster, Decision, Item, TriageRun
+
+    with session_module._get_session_factory()() as session:
         category = (
             session.query(Category)
             .filter(Category.user_id == conn["user_id"], Category.key == "e2e-actions-test")

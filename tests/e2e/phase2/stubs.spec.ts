@@ -20,8 +20,9 @@ test.describe('Phase 2 — remaining stubs stay labelled and inert', () => {
   }) => {
     // Stub nav buttons carry an aria-label of "<Label> (coming soon, Phase N)" —
     // match unanchored so this doesn't couple to that exact phrasing.
+    const nav = page.getByRole('navigation', { name: /Main/i });
     for (const name of [/Rules/i, /Chat/i, /Digest/i, /Backlog/i, /Cost/i]) {
-      const button = page.getByRole('button', { name });
+      const button = nav.getByRole('button', { name });
       await expect(button).toBeVisible();
       await expect(button).toBeDisabled();
       await expect(button).toHaveAttribute('aria-disabled', 'true');
@@ -102,10 +103,17 @@ test.describe('Phase 2 — remaining stubs stay labelled and inert', () => {
 
     const threads = page.locator('[data-testid="thread-row"]');
     await expect(threads.first()).toBeVisible({ timeout: 30_000 });
-    await threads.first().click();
+
+    // These stubs only render inside an EXPANDED thread detail — expand it via the
+    // row's own "+" toggle button (ThreadRow.tsx aria-label="Expand thread details"),
+    // not by clicking the row itself, since only the toggle button carries the
+    // onClick handler that flips it open.
+    await threads.first().getByRole('button', { name: /Expand thread details/i }).click();
+    const detail = threads.first().locator('[data-testid="thread-detail"]');
+    await expect(detail).toBeVisible({ timeout: 15_000 });
 
     for (const label of [/Create Gmail filter/i, /Draft reply/i]) {
-      const control = page.getByRole('button', { name: label });
+      const control = detail.getByRole('button', { name: label });
       await expect(control.first()).toBeVisible();
       await expect(control.first()).toBeDisabled();
     }

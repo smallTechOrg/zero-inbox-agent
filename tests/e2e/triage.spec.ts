@@ -33,12 +33,26 @@ test.describe('Phase 1 — clustered triage queue', () => {
   test('launching a run shows the progress bar and populates the clustered queue', async ({
     page,
   }) => {
-    // D14: this is the one test in the file that actually triggers a fresh live
-    // triage run (a real ~80s LLM cascade) and waits for it to land — every other
-    // test in this file reuses that same completed run via GET /api/triage/clusters
-    // defaulting to "latest". The global 60s project timeout is deliberately left
-    // sane for the rest of the suite; only this real end-to-end test gets more room.
-    test.slow();
+    // D14/D-phase2-B/D-phase2-C: this is the one test in the file that actually
+    // triggers a fresh live triage run over the default 200-thread limit and waits
+    // for it to land — every other test in this file reuses that same completed run
+    // via GET /api/triage/clusters defaulting to "latest". The global 60s project
+    // timeout is deliberately left sane for the rest of the suite; only this real
+    // end-to-end test gets more room.
+    //
+    // Clusters are NOT streamed progressively — persist_decisions (src/graph/
+    // persistence.py) writes items, clusters, decisions and llm_calls atomically in
+    // one shot at the very end of the graph, after the never-miss second-pass
+    // reviewer has already run over every archive proposal. That is intentional:
+    // nothing should ever be shown to the user as "archived" before the reviewer has
+    // had a chance to flip a false negative back to keep. So this test must wait for
+    // the run to reach a terminal state, not for clusters to trickle in mid-run.
+    //
+    // Timing varies with how many items the reviewer has to re-check (extra real LLM
+    // calls per archived item, not just per batch). Two real measurements on this
+    // live account: 209s and 429s for the same 200-thread limit. 600s budgets ~1.4x
+    // over the slower observed run.
+    test.setTimeout(600_000);
 
     const runButton = page
       .getByRole('button', { name: /Run triage/i })
@@ -48,13 +62,13 @@ test.describe('Phase 1 — clustered triage queue', () => {
 
     await runButton.click();
 
-    // Live progress while the run is in flight.
+    // Progress is visible immediately; it does not imply clusters exist yet.
     const progress = byTestIdOrText(page, 'run-progress', /\d+\s*\/\s*\d+/);
     await expect(progress).toBeVisible({ timeout: 30_000 });
 
-    // Results stream in: clusters appear and are usable before the run finishes.
+    // Clusters only exist once the run has actually finished (see comment above).
     const clusters = await clusterRows(page);
-    await expect(clusters.first()).toBeVisible({ timeout: 180_000 });
+    await expect(clusters.first()).toBeVisible({ timeout: 570_000 });
     expect(await clusters.count()).toBeGreaterThan(0);
 
     // A cluster row carries its count and a suggested action.
@@ -64,8 +78,14 @@ test.describe('Phase 1 — clustered triage queue', () => {
   test('expanding a cluster and a thread reveals category, confidence, reasoning and tier badge', async ({
     page,
   }) => {
+    // Reuses the already-completed run from the previous test (GET /api/triage/clusters
+    // defaults to "latest"), so this should resolve in low single-digit seconds — the
+    // wait stays inside the file's default 60s test timeout, unlike the fresh-run test
+    // above which calls test.setTimeout() to get real room. A 180s inner wait here with
+    // no matching outer bump was structurally unwinnable (always killed by the 60s
+    // default first); found via a full-suite failure after that fresh-run test.
     const clusters = await clusterRows(page);
-    await expect(clusters.first()).toBeVisible({ timeout: 180_000 });
+    await expect(clusters.first()).toBeVisible({ timeout: 30_000 });
 
     await clusters.first().click();
 
@@ -74,8 +94,13 @@ test.describe('Phase 1 — clustered triage queue', () => {
       .or(page.getByRole('listitem').filter({ hasText: TIER_BADGE }));
     await expect(threads.first()).toBeVisible({ timeout: 30_000 });
 
-    // Tier badge is text, not colour alone.
-    await expect(threads.first()).toContainText(TIER_BADGE);
+    // Tier badge is text, not colour alone — assert against the badge element itself
+    // (data-testid="tier-badge"), not the row's concatenated textContent, since
+    // adjacent DOM text nodes render without whitespace between them and break \b
+    // word-boundary matching.
+    const tierBadge = threads.first().locator('[data-testid="tier-badge"]');
+    await expect(tierBadge).toBeVisible();
+    await expect(tierBadge).toContainText(TIER_BADGE);
 
     await threads.first().click();
 
@@ -123,7 +148,7 @@ test.describe('Phase 1 — clustered triage queue', () => {
 
   test('approving a cluster records the decision and does not touch Gmail', async ({ page }) => {
     const clusters = await clusterRows(page);
-    await expect(clusters.first()).toBeVisible({ timeout: 180_000 });
+    await expect(clusters.first()).toBeVisible({ timeout: 30_000 });
 
     const approve = clusters
       .first()
@@ -151,7 +176,7 @@ test.describe('Phase 1 — clustered triage queue', () => {
 
   test('rejecting a cluster is recorded as rejected', async ({ page }) => {
     const clusters = await clusterRows(page);
-    await expect(clusters.first()).toBeVisible({ timeout: 180_000 });
+    await expect(clusters.first()).toBeVisible({ timeout: 30_000 });
 
     const target = clusters.nth((await clusters.count()) > 1 ? 1 : 0);
     const reject = target

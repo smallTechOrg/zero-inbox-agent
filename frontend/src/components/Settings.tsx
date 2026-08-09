@@ -34,6 +34,7 @@ function SliderRow({ label, value, min, max, step, unit, onChange, hint, testid 
           step={step}
           value={value}
           onChange={e => onChange(clamp(Number(e.target.value), min, max))}
+          onInput={e => onChange(clamp(Number((e.target as HTMLInputElement).value), min, max))}
           data-testid={testid ?? `slider-${label.toLowerCase().replace(/\s/g, '-')}`}
           className="flex-1 accent-gray-900"
         />

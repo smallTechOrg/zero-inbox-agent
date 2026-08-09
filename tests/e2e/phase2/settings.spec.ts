@@ -106,7 +106,14 @@ test.describe('Phase 2 — Settings', () => {
     const slider = page.locator('[data-testid="slider-auto-act-threshold"]');
     await expect(slider).toBeVisible();
 
-    await slider.fill('0.9');
+    // Pick a target value guaranteed to differ from whatever the mailbox currently has,
+    // so the dirty-check actually has a diff to detect (not a coincidental no-op).
+    const meResponse = await page.request.get('http://localhost:8001/api/me');
+    const meBody = await meResponse.json();
+    const current = Number(meBody?.data?.settings?.auto_act_threshold ?? 0.8);
+    const target = Math.abs(current - 0.6) > 0.02 ? 0.6 : 0.75;
+
+    await slider.fill(String(target));
     const saveBtn = page.locator('[data-testid="settings-save"]');
     await expect(saveBtn).toBeEnabled();
 
@@ -119,7 +126,14 @@ test.describe('Phase 2 — Settings', () => {
     ]);
     expect(response.status()).toBe(200);
     const body = await response.json();
-    expect(body.data.auto_act_threshold).toBeCloseTo(0.9, 1);
+    expect(body.data.auto_act_threshold).toBeCloseTo(target, 1);
+
+    // Persistence must survive a real reload, not just in-memory React state.
+    await openApp(page);
+    await openSettings(page);
+    const meAfterReload = await page.request.get('http://localhost:8001/api/me');
+    const afterReloadBody = await meAfterReload.json();
+    expect(afterReloadBody.data.settings.auto_act_threshold).toBeCloseTo(target, 1);
   });
 
   test('VIP editor: adding an entry shows it in the list, removing it clears it', async ({

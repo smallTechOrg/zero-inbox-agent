@@ -145,6 +145,10 @@ test.describe('Phase 2 — real Gmail actions and undo', () => {
       Boolean(seeded.skipped),
       `seed_test_thread.py could not seed a throwaway thread: ${seeded.reason ?? 'unknown'}`,
     );
+    // Reload so the client's "latest run" reflects the run seedTestThread() just
+    // created — without this the page still shows whatever run it loaded in
+    // beforeEach, and the seeded cluster/thread never appears.
+    await openApp(page);
 
     const applyCalls: string[] = [];
     page.on('request', (req) => {
