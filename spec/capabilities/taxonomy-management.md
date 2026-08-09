@@ -33,6 +33,9 @@ materialising every category **1:1 as a real Gmail label**.
 - Every category maps to exactly one mailbox label, namespaced `ZeroInbox/<Name>`. Creating a category
   creates the label; renaming renames it; **deleting a category never deletes the label or any mail** —
   the label is left in place.
+- The Gmail label sidebar is the master list of what is archived and how it is categorized — there is no
+  separate archive table; see [gmail-actions-and-undo](gmail-actions-and-undo.md) for the atomic
+  archive+label write and the audit-trail-vs-source-of-truth distinction.
 - A proposed taxonomy is only a proposal: nothing is created until the user approves it.
 - Categories are per user; two users' taxonomies never interact.
 - The `Urgent` category can never carry `default_action = archive`.

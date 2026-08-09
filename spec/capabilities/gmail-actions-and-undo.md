@@ -22,12 +22,27 @@ token for every mutation so any action can be fully reversed in one click.
 ## External Calls
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| Mailbox channel | `modify(threadId, addLabelIds, removeLabelIds)` | Retry 3× with backoff; on failure the decision stays `approved`, nothing is logged as applied, and the UI shows the error with Retry |
-| Mailbox channel | inverse `modify` for undo | Retry 3×; on failure surface the failure explicitly — never mark it undone optimistically |
+| Mailbox channel | `archive_and_label(threadId, add=[category_label], remove_inbox=True)` — one atomic `modify()` call | Retry 3× with backoff; on failure the decision stays `approved`, nothing is logged as applied, and the UI shows the error with Retry |
+| Mailbox channel | `undo_archive_and_label` — inverse atomic `modify()` call | Retry 3×; on failure surface the failure explicitly — never mark it undone optimistically |
 
 ## Business Rules
+- **Archive means exactly one thing:** removing the `INBOX` label, nothing else. It is applied in the
+  **same atomic `modify(threadId, addLabelIds=[category_label], removeLabelIds=['INBOX'])` call** as
+  adding the matching category label — a thread is never left labelled-but-still-in-inbox or
+  archived-but-uncategorized by a partial write.
+- **The Gmail label state is the sole source of truth for what is archived and how it is categorized.**
+  There is no separate "archive" table or system of record; `action_logs` and `decisions` record what
+  the agent *did* and *why* (per [decision-audit-trail](decision-audit-trail.md)), but they are history,
+  not the live state — the live state is always read from Gmail's own label list.
 - **Never delete.** Only `addLabelIds` and removing `INBOX` are permitted. `trash`, `delete` and
-  `spam` are not implementable operations in the adapter.
+  `spam` are not implementable operations in the adapter — the `ChannelAdapter` interface
+  (`src/channels/base.py`, see [architecture.md](../architecture.md)) has no `trash()`, `delete()`, or
+  `report_spam()` method at all, on any implementation. This is a structural guarantee, not a promise
+  enforced only by business logic: the methods do not exist to be called.
+- **Reject performs zero mutation, ever, in any phase.** Rejecting a decision only sets
+  `decisions.status = rejected`; it is never passed to `actions.apply_decision()` and never reaches the
+  adapter. The thread stays exactly as it was — still in the inbox, no label change, no Gmail API call.
+  Only `approved` decisions are eligible for `POST /api/actions/apply`.
 - **Nothing acts without approval** unless a rule has been explicitly promoted to `automatic` by the
   user, and even then only above `auto_act_threshold`.
 - No mutation runs while `dry_run` is true — the attempt raises `dry_run_violation` (409).

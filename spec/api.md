@@ -29,8 +29,8 @@ The frontend static export is mounted at `/app` (canonical entry: `http://localh
 | `POST` | `/api/runs/{run_id}/cancel` | | `{status: "cancelled"}` |
 | `GET` | `/api/triage/clusters` | `?run_id=` | `[{id, kind, label, item_count, suggested_action, min_confidence, avg_confidence, sample_subjects: [3]}]` |
 | `GET` | `/api/triage/items` | `?cluster_id=` or `?run_id=&status=` | `[{decision_id, item: {subject, from_name, from_email, snippet_redacted, internal_date, message_count, is_unread}, category, proposed_action, confidence, reasoning, decided_by, rule_id, rule_name, time_sensitive, status}]` |
-| `POST` | `/api/triage/decisions/{decision_id}` | `{status: "approved"\|"rejected"}` | updated decision. **Phase 1: records intent only — no Gmail call** |
-| `POST` | `/api/triage/clusters/{cluster_id}/approve` | `{status: "approved"\|"rejected"}` | `{updated: n}` — the bulk sweep |
+| `POST` | `/api/triage/decisions/{decision_id}` | `{status: "approved"\|"rejected"}` | updated decision. **Phase 1: records intent only — no Gmail call.** `rejected` never causes a Gmail call in any phase — only `approved` decisions can later be passed to `POST /api/actions/apply` (Phase 2) |
+| `POST` | `/api/triage/clusters/{cluster_id}/approve` | `{status: "approved"\|"rejected"}` | `{updated: n}` — the bulk sweep, same rule: rejecting never mutates the mailbox |
 | `GET` | `/api/categories` | | the user's taxonomy |
 
 Any attempt to mutate Gmail while `dry_run` is true raises `api_error("dry_run_violation", …, 409)`.

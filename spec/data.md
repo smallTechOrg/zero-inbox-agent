@@ -236,11 +236,16 @@ at runtime, so per-user edits never affect other users.
 Item ingested ──▶ Decision(proposed | needs_your_call)
                       │
       user approves ──┼──▶ Decision(approved) ──▶ [dry_run off] ActionLog(+undo_token) ──▶ Decision(applied)
-      user rejects  ──┘                                    │
-                      └──▶ Correction ──▶ SenderProfile.importance_score ↑
-                                     └──▶ candidate Rule(proposed)
-                                                                └── undo ──▶ Decision(undone), ActionLog.undone_at set
+      user rejects  ──┘                                    │                                        │
+                      └──▶ Correction ──▶ SenderProfile.importance_score ↑                          undo
+                              │  (Phase 2: signal only — no Rule row written here)                    │
+                              └── read later by Phase 3 rule-mining ──▶ candidate Rule(proposed)      ▼
+                                                                        Decision(undone), ActionLog.undone_at set
 ```
+
+`rules` (line above, under Phase 1 Entities) is schema-present from Phase 1 for forward-compatibility but
+is only ever **written to** starting Phase 3 (`rule-mining`/`chat-to-rules`); no Phase 1 or Phase 2 code
+path inserts a `rules` row.
 
 Retention: `items` and `decisions` are retained indefinitely (they carry no body). `llm_calls` are
 retained for cost reporting. Nothing is ever hard-deleted by the agent.

@@ -20,7 +20,7 @@ all fed back into triage as evidence so the agent gets more accurate with use.
 | `ever_replied` flag | bool | `sender_profiles` |
 | VIP list | entities | `vip_entries` |
 | Priorities profile | text injected into the classifier prompt | LLM context |
-| Rule candidates | proposals | `rules` (status `proposed`) |
+| Correction pattern signal | aggregated counts (no `rules` row created) | `corrections`, read later by Phase 3 rule-mining |
 
 ## External Calls
 | System | Operation | On Failure |
@@ -29,7 +29,10 @@ all fed back into triage as evidence so the agent gets more accurate with use.
 
 ## Business Rules
 - Un-archiving a thread the agent hid is the strongest correction signal: it raises the sender's
-  importance score and creates a candidate rule proposal to stop hiding that sender or topic.
+  importance score. **Phase 2 stops at recording the signal** — it does not create, propose, or write
+  any `rules` row. Turning a pattern of corrections into a proposed rule is
+  [rule-proposals](rule-proposals.md), Phase 3 only; Phase 2's `corrections` table is simply the input
+  Phase 3's rule miner later reads.
 - `ever_replied` is derived from the user's sent mail and is never cleared by the agent — only an
   explicit user override can demote a replied-to sender.
 - The VIP list holds emails, domains and keywords; a match can never be archived automatically.
@@ -43,7 +46,9 @@ all fed back into triage as evidence so the agent gets more accurate with use.
 ## Success Criteria
 - [ ] Un-archiving an agent-hidden thread creates a `corrections` row and increases that sender's
       `importance_score`.
-- [ ] After three corrections against the same sender, a rule proposal covering that sender appears.
+- [ ] After three corrections against the same sender, no `rules` row is created in Phase 2 — the
+      corrections are simply queryable as a pattern (verified in Phase 3 by the rule miner picking them
+      up; see [rule-proposals](rule-proposals.md)).
 - [ ] A sender added to VIP is never proposed for archive on the next run, at any confidence.
 - [ ] Writing "I care about anything from investors and about our fundraise" in the priorities profile
       changes the classification of at least one matching thread on the next run.

@@ -35,8 +35,8 @@ SQLite via SQLAlchemy 2.0 + Alembic  (headers, IDs, decisions, reasoning — nev
 | Component | Path | Responsibility |
 |-----------|------|----------------|
 | API surface | `src/api/` | HTTP routes, session cookie, response envelope `ok()` / `api_error()` |
-| Channel interface | `src/channels/base.py` | Abstract `ChannelAdapter`: read + mutate + filters + drafts, all in terms of `Item` |
-| Gmail adapter | `src/channels/gmail/` | OAuth client, thread listing, header/snippet extraction, label + archive mutations, filter creation, draft creation |
+| Channel interface | `src/channels/base.py` | Abstract `ChannelAdapter`: `list_threads`, `get_thread`, `archive_and_label(thread_id, add_label_ids, remove_inbox=True)`, `undo_archive_and_label(thread_id, ...)`, `create_label`, `create_filter`, `create_draft` — **no `trash`, `delete`, or `report_spam` method exists on this interface**, so no implementation, including `GmailAdapter`, can expose one |
+| Gmail adapter | `src/channels/gmail/` | OAuth client, thread listing, header/snippet extraction, the single atomic `modify()` call behind `archive_and_label`, filter creation, draft creation |
 | Triage graph | `src/graph/` | LangGraph state machine — the cost-tiered cascade; see [`agent.md`](agent.md) |
 | Tools | `src/tools/` | Pure functions: `(inputs) → domain model`. No side effects except the explicitly-named action tools |
 | LLM layer | `src/llm/` | `LLMClient` wrapper + swappable OpenAI-compatible provider |
