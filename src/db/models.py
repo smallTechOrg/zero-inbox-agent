@@ -379,6 +379,36 @@ class Correction(Base):
     created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
 
 
+class VipEntry(Base):
+    """The never-hide list. A match here can never be archived automatically."""
+
+    __tablename__ = "vip_entries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "kind", "value", name="uq_vip_entry"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)  # email | domain | keyword
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+
+
+class PriorityProfile(Base):
+    """The plain-English priorities profile, written once by the user and injected
+    verbatim into the classifier and reviewer prompts. Never rewritten by the agent."""
+
+    __tablename__ = "priority_profiles"
+
+    user_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_at: Mapped[datetime] = _ts(nullable=False, default=_now, onupdate=_now)
+
+
 #: Tables that are NOT scoped to a single user. Empty in Phase 1 — shared
 #: rule-pack templates (Phase 3) will be the only entry.
 NON_USER_SCOPED_TABLES: frozenset[str] = frozenset()
@@ -399,6 +429,8 @@ __all__ = [
     "LLMCall",
     "ActionLog",
     "Correction",
+    "VipEntry",
+    "PriorityProfile",
     "ALLOWED_ACTION_OPERATIONS",
     "FORBIDDEN_COLUMN_SUBSTRINGS",
     "NON_USER_SCOPED_TABLES",

@@ -10,11 +10,22 @@ import { ThreadRow } from './ThreadRow'
  * Everything below the confidence floor. Attention-positive, not an error:
  * these threads stayed in the inbox on purpose.
  */
-export function NeedsYourCall({ runId, refreshKey }: { runId: string; refreshKey: number }) {
+export function NeedsYourCall({
+  runId,
+  refreshKey,
+  dryRun,
+}: {
+  runId: string
+  refreshKey: number
+  dryRun: boolean
+}) {
   const [items, setItems] = useState<TriageItem[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [busy, setBusy] = useState(false)
+  const [actionLogIds, setActionLogIds] = useState<Record<string, string>>({})
+  const [undoingId, setUndoingId] = useState<string | null>(null)
+  const [undoResults, setUndoResults] = useState<Record<string, 'ok' | 'error'>>({})
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -32,17 +43,52 @@ export function NeedsYourCall({ runId, refreshKey }: { runId: string; refreshKey
     void load()
   }, [load, refreshKey])
 
-  const decide = useCallback(async (decisionId: string, status: 'approved' | 'rejected') => {
-    setBusy(true)
+  const decide = useCallback(
+    async (decisionId: string, status: 'approved' | 'rejected') => {
+      setBusy(true)
+      try {
+        await api.decide(decisionId, status)
+        setItems(prev =>
+          prev ? prev.map(i => (i.decision_id === decisionId ? { ...i, status } : i)) : prev,
+        )
+        // Reject never mutates the mailbox, in any phase. Approve only applies
+        // for real once dry-run is off.
+        if (status === 'approved' && !dryRun) {
+          try {
+            const [result] = await api.applyDecisions([decisionId])
+            if (result?.action_log_id) {
+              setActionLogIds(prev => ({ ...prev, [decisionId]: result.action_log_id }))
+              setItems(prev =>
+                prev
+                  ? prev.map(i => (i.decision_id === decisionId ? { ...i, status: 'applied' } : i))
+                  : prev,
+              )
+            }
+          } catch (e) {
+            setError(e)
+          }
+        }
+      } catch (e) {
+        setError(e)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [dryRun],
+  )
+
+  const undo = useCallback(async (decisionId: string, actionLogId: string) => {
+    setUndoingId(decisionId)
     try {
-      await api.decide(decisionId, status)
+      await api.undoAction(actionLogId)
+      setUndoResults(prev => ({ ...prev, [decisionId]: 'ok' }))
       setItems(prev =>
-        prev ? prev.map(i => (i.decision_id === decisionId ? { ...i, status } : i)) : prev,
+        prev ? prev.map(i => (i.decision_id === decisionId ? { ...i, status: 'undone' } : i)) : prev,
       )
-    } catch (e) {
-      setError(e)
+    } catch {
+      setUndoResults(prev => ({ ...prev, [decisionId]: 'error' }))
     } finally {
-      setBusy(false)
+      setUndoingId(null)
     }
   }, [])
 
@@ -68,7 +114,16 @@ export function NeedsYourCall({ runId, refreshKey }: { runId: string; refreshKey
       ) : items && items.length > 0 ? (
         <ul className="rounded border border-amber-200 bg-white">
           {items.map(item => (
-            <ThreadRow key={item.decision_id} item={item} onDecide={decide} busy={busy} />
+            <ThreadRow
+              key={item.decision_id}
+              item={item}
+              onDecide={decide}
+              busy={busy}
+              actionLogId={actionLogIds[item.decision_id] ?? null}
+              onUndo={undo}
+              undoing={undoingId === item.decision_id}
+              undoResult={undoResults[item.decision_id] ?? null}
+            />
           ))}
         </ul>
       ) : (

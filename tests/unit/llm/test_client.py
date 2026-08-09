@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from fakes import FakeOpenAIClient, FakeResponse
+from tests.unit.llm.fakes import FakeOpenAIClient, FakeResponse
 
 from llm.client import LLMClient, get_llm_client, reset_llm_client
 from llm.providers.base import LLMSchemaError

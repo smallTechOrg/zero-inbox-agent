@@ -46,6 +46,13 @@ def _category_block(categories: list[dict]) -> str:
     )
 
 
+def _priorities_block(state: TriageState) -> str:
+    """The user's priorities profile, injected verbatim — never rewritten by the
+    agent. Empty when the user has not written one yet."""
+    text = (state.get("priority_profile") or "").strip()
+    return text or "(The user has not written a priorities profile yet.)"
+
+
 def _age_days(item: dict) -> int | None:
     raw = item.get("internal_date")
     if isinstance(raw, str):
@@ -399,6 +406,12 @@ def fetch_items(state: TriageState) -> dict:
         # heuristic feed tier 2 of the cascade. Best-effort: a channel read
         # failure must not fail ingestion of the threads already fetched.
         sender_stats = _harvest_sender_stats(adapter, state["user_id"])
+        # Un-archive correction detection (spec/capabilities/user-memory.md): if a
+        # thread we previously archived (an `applied` archive Decision) is fetched
+        # again with INBOX present, the user manually restored it — that is the
+        # strongest correction signal and must raise the sender's importance
+        # score. Best-effort: never fails ingestion of the threads already fetched.
+        _detect_and_record_mailbox_corrections(state["user_id"], items)
         return {
             "items": items,
             "sender_stats": sender_stats,
@@ -406,6 +419,76 @@ def fetch_items(state: TriageState) -> dict:
         }
     except Exception as exc:
         return {"error": f"fetch_items failed: {exc}"}
+
+
+def _detect_and_record_mailbox_corrections(user_id: str, items: list[dict]) -> None:
+    """Detect threads the agent archived that are now back in INBOX.
+
+    Reconciliation, not the app's own undo flow: a decision the user reversed via
+    ``POST /api/actions/{id}/undo`` is marked ``status="undone"`` by
+    ``tools.actions.undo_action`` and is skipped here — only an ``applied`` archive
+    decision whose thread has INBOX again (i.e. reversed *outside* the app, by the
+    user re-adding it in Gmail) counts as a correction.
+    """
+    from channels.gmail.mutations import INBOX_LABEL_ID
+    from db.session import create_db_session
+    from tools.memory import record_correction
+
+    restored_thread_ids = [
+        item.get("external_thread_id")
+        for item in items
+        if item.get("external_thread_id") and INBOX_LABEL_ID in (item.get("channel_labels") or [])
+    ]
+    if not restored_thread_ids:
+        return
+    try:
+        with create_db_session() as session:
+            from db import models as m
+            from sqlalchemy import select
+
+            restored_items = list(
+                session.execute(
+                    select(m.Item).where(
+                        m.Item.user_id == user_id,
+                        m.Item.external_thread_id.in_(restored_thread_ids),
+                    )
+                ).scalars()
+            )
+            for db_item in restored_items:
+                decision = session.execute(
+                    select(m.Decision)
+                    .where(
+                        m.Decision.item_id == db_item.id,
+                        m.Decision.user_id == user_id,
+                        m.Decision.status == "applied",
+                        m.Decision.proposed_action == "archive",
+                    )
+                    .order_by(m.Decision.decided_at.desc(), m.Decision.created_at.desc())
+                ).scalars().first()
+                if decision is None:
+                    continue
+                already_recorded = session.execute(
+                    select(m.Correction.id).where(
+                        m.Correction.user_id == user_id,
+                        m.Correction.decision_id == decision.id,
+                        m.Correction.source == "mailbox_reconciliation",
+                    )
+                ).scalar_one_or_none()
+                if already_recorded is not None:
+                    continue
+                record_correction(
+                    session,
+                    user_id,
+                    item_id=db_item.id,
+                    from_action="archive",
+                    to_action="keep",
+                    source="mailbox_reconciliation",
+                    decision_id=decision.id,
+                    note="thread found back in INBOX outside the app's own undo flow",
+                )
+            session.flush()
+    except Exception as exc:  # pragma: no cover - best effort, never blocks a run
+        log.warning("triage.mailbox_correction_detect_failed", user_id=user_id, error=str(exc))
 
 
 def _harvest_sender_stats(adapter, user_id: str) -> dict[str, dict]:
@@ -509,8 +592,10 @@ def llm_classify_batch(state: TriageState) -> dict:
     categories = state.get("categories") or []
     category_keys = {c["key"] for c in categories}
     by_id = {i["id"]: i for i in batch}
-    instructions = _prompt("classify.md").replace(
-        "{categories}", _category_block(categories)
+    instructions = (
+        _prompt("classify.md")
+        .replace("{categories}", _category_block(categories))
+        .replace("{priorities}", _priorities_block(state))
     )
     from llm.client import get_llm_client
 

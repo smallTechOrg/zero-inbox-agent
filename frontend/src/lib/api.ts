@@ -2,11 +2,17 @@
 
 import {
   ApiError,
+  type ActionLogRow,
+  type ApplyResult,
   type Cluster,
   type Envelope,
   type Me,
+  type PriorityProfile,
   type Run,
+  type Settings,
   type TriageItem,
+  type VipEntry,
+  type VipKind,
 } from './types'
 
 /**
@@ -86,6 +92,50 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status }),
     }),
+
+  // --- Phase 2 ---
+
+  updateSettings: (patch: Partial<Settings>) =>
+    request<Settings>('/api/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  /**
+   * Performs the real Gmail mutations for already-approved decisions. Only
+   * ever called when dry_run is off — the server itself enforces this
+   * (409 dry_run_violation) but the client never calls it in dry-run mode
+   * either, and never for a `rejected` decision.
+   */
+  applyDecisions: (decisionIds: string[]) =>
+    request<ApplyResult[]>('/api/actions/apply', {
+      method: 'POST',
+      body: JSON.stringify({ decision_ids: decisionIds }),
+    }),
+
+  undoAction: (actionLogId: string) =>
+    request<ActionLogRow>(`/api/actions/${actionLogId}/undo`, { method: 'POST' }),
+
+  actions: () => request<ActionLogRow[]>('/api/actions'),
+
+  vip: {
+    list: () => request<VipEntry[]>('/api/vip'),
+    add: (kind: VipKind, value: string) =>
+      request<VipEntry>('/api/vip', {
+        method: 'POST',
+        body: JSON.stringify({ kind, value }),
+      }),
+    remove: (id: string) => request<{ deleted: boolean }>(`/api/vip/${id}`, { method: 'DELETE' }),
+  },
+
+  profile: {
+    get: () => request<PriorityProfile>('/api/profile'),
+    put: (text: string) =>
+      request<PriorityProfile>('/api/profile', {
+        method: 'PUT',
+        body: JSON.stringify({ text }),
+      }),
+  },
 }
 
 export const AUTH_START_URL = '/auth/google/start'

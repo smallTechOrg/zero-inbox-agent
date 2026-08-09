@@ -2,7 +2,7 @@
 
 import pytest
 
-from fake_gmail import FakeGmailService, http_error
+from tests.unit.channels.fake_gmail import FakeGmailService, http_error
 
 
 def _msg(mid, *, frm="Ada <ada@example.com>", subject="Hi", to="me@mine.com", labels=None):

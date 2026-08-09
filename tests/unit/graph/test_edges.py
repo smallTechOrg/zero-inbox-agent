@@ -27,8 +27,11 @@ class TestRouteAfterLlm:
     def test_deep_when_unsure_items_exist(self):
         assert route_after_llm({"deep_queue": [{"id": "a"}]}) == "deep"
 
-    def test_done_when_nothing_unsure(self):
-        assert route_after_llm({"deep_queue": []}) == "done"
+    def test_always_deep_when_nothing_unsure(self):
+        # Every branch takes the same number of hops through deep_read_escalation
+        # (a no-op on an empty queue) so Send-fanned branches converge on
+        # cluster_decisions at a uniform depth. See edges.route_after_llm.
+        assert route_after_llm({"deep_queue": []}) == "deep"
 
     def test_error_short_circuits(self):
         assert route_after_llm({"deep_queue": [], "error": "x"}) == "handle_error"

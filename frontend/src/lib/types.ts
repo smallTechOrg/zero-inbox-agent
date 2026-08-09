@@ -117,6 +117,40 @@ export type TriageItem = {
   status: DecisionStatus
 }
 
+/** Phase 2: vip_entries (spec/data.md). */
+export type VipKind = 'email' | 'domain' | 'keyword'
+
+export type VipEntry = {
+  id: string
+  kind: VipKind
+  value: string
+  created_at: string
+}
+
+/** Phase 2: priority_profiles (spec/data.md) — one row per user. */
+export type PriorityProfile = {
+  text: string
+  updated_at: string | null
+}
+
+/** Phase 2: action_logs (spec/data.md) — the mutation audit trail. */
+export type ActionLogRow = {
+  id: string
+  decision_id: string | null
+  operation: string
+  request_params: unknown
+  response: unknown
+  undo_token: unknown
+  undone_at: string | null
+  created_at: string
+}
+
+/** POST /api/actions/apply → [{action_log_id, undo_token_id}], ordered like the request's decision_ids. */
+export type ApplyResult = {
+  action_log_id: string
+  undo_token_id: string | null
+}
+
 export class ApiError extends Error {
   code: string
   status: number

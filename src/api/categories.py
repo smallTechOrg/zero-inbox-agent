@@ -1,0 +1,144 @@
+"""Taxonomy management — categories map 1:1 to real Gmail labels.
+
+spec/api.md § Phase 2:
+    POST   /api/categories                 create a category (creates the Gmail label)
+    PATCH  /api/categories/{id}             edit a category (renames the Gmail label)
+    POST   /api/categories/sync-labels      ensures every category has a real label (1:1)
+
+``GET /api/categories`` is already served by ``api/triage.py`` (Phase 1) — not
+duplicated here.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from api._common import VALIDATION_ERROR, api_error, not_found, ok
+from api.session import require_user_id
+from db.session import get_session
+from tools.rules import VALID_ACTIONS
+from tools.taxonomy import TaxonomyError, create_category, sync_labels, update_category
+
+router = APIRouter()
+
+
+class CategoryCreate(BaseModel):
+    key: str
+    name: str
+    description: str = ""
+    default_action: str = "keep"
+    sort_order: int = 0
+
+
+class CategoryUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    default_action: str | None = None
+    sort_order: int | None = None
+
+
+def _category_payload(category) -> dict:
+    return {
+        "id": category.id,
+        "key": category.key,
+        "name": category.name,
+        "description": category.description,
+        "channel_label_name": category.channel_label_name,
+        "channel_label_id": category.channel_label_id,
+        "default_action": category.default_action,
+        "is_default": bool(category.is_default),
+        "sort_order": category.sort_order,
+    }
+
+
+@router.post("/api/categories")
+def create_category_route(
+    body: CategoryCreate,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    if body.default_action not in VALID_ACTIONS:
+        raise api_error(VALIDATION_ERROR, f"default_action must be one of {list(VALID_ACTIONS)}")
+    try:
+        category = create_category(
+            session,
+            user_id,
+            key=body.key,
+            name=body.name,
+            description=body.description,
+            default_action=body.default_action,
+            sort_order=body.sort_order,
+        )
+    except TaxonomyError as exc:
+        raise api_error(VALIDATION_ERROR, str(exc)) from exc
+    return ok(_category_payload(category))
+
+
+@router.patch("/api/categories/{category_id}")
+def update_category_route(
+    category_id: str,
+    body: CategoryUpdate,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    if body.default_action is not None and body.default_action not in VALID_ACTIONS:
+        raise api_error(VALIDATION_ERROR, f"default_action must be one of {list(VALID_ACTIONS)}")
+    try:
+        category = update_category(
+            session,
+            user_id,
+            category_id,
+            name=body.name,
+            description=body.description,
+            default_action=body.default_action,
+            sort_order=body.sort_order,
+        )
+    except LookupError as exc:
+        raise not_found("Category") from exc
+    except TaxonomyError as exc:
+        raise api_error(VALIDATION_ERROR, str(exc)) from exc
+    return ok(_category_payload(category))
+
+
+def _label_manager_for_user(session: Session, user_id: str):
+    """Builds a GmailLabelManager for the user's connected mailbox.
+
+    Mirrors ``channels.gmail.adapter.GmailAdapter.for_refresh_token`` so this
+    module has no import-time coupling to the adapter and stays independent of
+    the parallel mutations slice.
+    """
+    from googleapiclient.discovery import build
+
+    from channels.gmail.labels import GmailLabelManager
+    from channels.gmail.oauth import credentials_from_refresh_token, google_oauth_config
+    from channels.gmail.store import SqlConnectionStore
+    from db.models import ChannelAccount
+
+    account = (
+        session.query(ChannelAccount)
+        .filter(ChannelAccount.user_id == user_id)
+        .order_by(ChannelAccount.connected_at.desc())
+        .first()
+    )
+    if account is None:
+        raise api_error(VALIDATION_ERROR, "no connected mailbox to sync labels against")
+
+    refresh_token = SqlConnectionStore().load_refresh_token(
+        user_id=user_id, connection_id=account.id
+    )
+    config = google_oauth_config()
+    credentials = credentials_from_refresh_token(config, refresh_token)
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    return GmailLabelManager(service)
+
+
+@router.post("/api/categories/sync-labels")
+def sync_labels_route(
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    label_manager = _label_manager_for_user(session, user_id)
+    results = sync_labels(session, user_id, label_manager)
+    return ok({"results": results})

@@ -176,6 +176,8 @@ export default function Dashboard() {
     }
   }, [run])
 
+  const dryRun = me?.settings.dry_run ?? true
+
   const statusTone = !run
     ? 'idle'
     : RUN_ACTIVE(run.status)
@@ -186,7 +188,7 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen">
-      <DryRunBanner />
+      <DryRunBanner dryRun={dryRun} />
 
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-gray-200 bg-white px-4 py-2.5">
         <div className="flex items-center gap-3">
@@ -245,7 +247,7 @@ export default function Dashboard() {
             <SettingsPanel
               settings={me?.settings ?? null}
               onSettingsChange={s => {
-                /* Phase 1: optimistic client-only (save endpoint lands in Phase 2) */
+                /* SettingsPanel already persisted this via PATCH /api/settings — mirror it locally. */
                 if (me) setMe({ ...me, settings: s })
               }}
             />
@@ -263,7 +265,9 @@ export default function Dashboard() {
                 <RunProgress run={run} onCancel={() => void cancelRun()} cancelling={cancelling} />
               ) : null}
 
-              {run ? <NeedsYourCall runId={run.id} refreshKey={refreshKey} /> : null}
+              {run ? (
+                <NeedsYourCall runId={run.id} refreshKey={refreshKey} dryRun={dryRun} />
+              ) : null}
 
               <section aria-label="Triage queue" className="space-y-2">
                 <div className="flex items-baseline justify-between gap-2">
@@ -303,6 +307,7 @@ export default function Dashboard() {
                       <ClusterCard
                         key={c.id}
                         cluster={c}
+                        dryRun={dryRun}
                         ref={node => {
                           clusterRefs.current.set(c.id, node)
                         }}
@@ -339,16 +344,10 @@ export default function Dashboard() {
             phase={3}
             description="Pick which NVIDIA free model triages your mail."
           />
-          <StubPanel
-            title="VIP / never-hide list"
-            phase={2}
-            description="People whose mail is never hidden, whatever the agent thinks."
-          />
-          <StubPanel
-            title="Priorities profile"
-            phase={2}
-            description="A plain-English description of what matters to you, fed into triage."
-          />
+          <p className="rounded-lg border border-emerald-300 bg-emerald-50 p-2.5 text-[11px] text-emerald-900">
+            VIP list and priorities profile are real now — open <strong>Settings</strong> to edit
+            them.
+          </p>
           <StubPanel
             title="Backlog cleanup"
             phase={3}
@@ -373,8 +372,9 @@ export default function Dashboard() {
       </div>
 
       <footer className="border-t border-gray-200 bg-white px-4 py-3 text-xs text-gray-500">
-        Phase 1 · dry run only. Approving or rejecting records your intent in the database; no Gmail
-        message is archived, labelled, deleted or moved.
+        {dryRun
+          ? 'Dry run is on. Approving or rejecting records your intent in the database; no Gmail message is archived, labelled, deleted or moved. Turn dry-run off in Settings to act for real.'
+          : 'Dry run is off. Approving a decision really archives and labels the matching thread in Gmail; rejecting still only records intent and never mutates your mailbox.'}
       </footer>
     </div>
   )

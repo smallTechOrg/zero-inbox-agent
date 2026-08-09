@@ -16,13 +16,25 @@ export function ThreadRow({
   item,
   onDecide,
   busy,
+  actionLogId = null,
+  onUndo,
+  undoing = false,
+  undoResult = null,
 }: {
   item: TriageItem
   onDecide: (decisionId: string, status: 'approved' | 'rejected') => void
   busy: boolean
+  /** Set once a real Gmail mutation has been applied for this decision (Phase 2). */
+  actionLogId?: string | null
+  onUndo?: (decisionId: string, actionLogId: string) => void
+  undoing?: boolean
+  undoResult?: 'ok' | 'error' | null
 }) {
   const [open, setOpen] = useState(false)
-  const decided = item.status === 'approved' || item.status === 'rejected'
+  const applied = item.status === 'applied'
+  const undone = item.status === 'undone'
+  const decided =
+    item.status === 'approved' || item.status === 'rejected' || applied || undone
   const sender = item.item.from_name || item.item.from_email || 'Unknown sender'
 
   return (
@@ -102,7 +114,40 @@ export function ThreadRow({
                 </div>
               </dl>
               <div className="mt-2.5 flex flex-wrap items-center gap-2">
-                <StubButton label="Undo" phase={2} />
+                {actionLogId && !undone ? (
+                  <button
+                    type="button"
+                    data-testid="undo-button"
+                    disabled={undoing}
+                    onClick={() => onUndo?.(item.decision_id, actionLogId)}
+                    className="rounded border border-amber-400 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-100 focus:ring-2 focus:ring-amber-400 focus:outline-none disabled:opacity-50"
+                  >
+                    {undoing ? 'Undoing…' : 'Undo'}
+                  </button>
+                ) : undone ? (
+                  <span className="rounded border border-gray-300 bg-gray-100 px-2.5 py-1 text-xs font-semibold text-gray-700">
+                    Undone — thread restored
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    disabled
+                    aria-disabled="true"
+                    title="Undo becomes available once this decision has been applied to your real mailbox (dry-run off, approved and archived)."
+                    className="cursor-not-allowed rounded border border-gray-300 bg-white px-2.5 py-1 text-xs font-medium text-gray-500 opacity-60"
+                  >
+                    Undo
+                  </button>
+                )}
+                {undoResult === 'ok' ? (
+                  <span className="text-xs font-medium text-emerald-800">
+                    Undone — the thread is back in your inbox.
+                  </span>
+                ) : undoResult === 'error' ? (
+                  <span className="text-xs font-medium text-red-800">
+                    Undo failed — nothing changed, try again.
+                  </span>
+                ) : null}
                 <StubButton label="Create Gmail filter" phase={3} />
                 <StubButton label="Draft reply" phase={3} />
               </div>
@@ -111,7 +156,18 @@ export function ThreadRow({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
-          {decided ? (
+          {applied ? (
+            <span
+              data-testid="applied-badge"
+              className="rounded border border-teal-300 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
+            >
+              Applied — archived in Gmail
+            </span>
+          ) : undone ? (
+            <span className="rounded border border-gray-300 bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-700">
+              Undone
+            </span>
+          ) : decided ? (
             <span
               className={`rounded border px-2 py-1 text-xs font-semibold ${
                 item.status === 'approved'

@@ -22,7 +22,16 @@ def route_after_history(state: TriageState) -> str:
 
 
 def route_after_llm(state: TriageState) -> str:
-    """`"deep"` iff the LLM marked anything unsure."""
+    """Always continue through ``deep_read_escalation`` (a no-op when its queue
+    is empty). Every ``llm_classify_batch`` branch spawned via ``Send`` for a
+    multi-batch run MUST take the same number of hops before converging on
+    ``cluster_decisions`` — letting some branches skip straight to
+    ``cluster_decisions`` while others detour through an extra
+    ``deep_read_escalation`` step causes uneven-depth fan-in at scale, which
+    LangGraph cannot resolve for the unreduced ``decisions`` key (see
+    ``graph/nodes_review.py`` and the InvalidUpdateError this used to raise on
+    the 220+-thread never-miss fixture).
+    """
     if state.get("error"):
         return "handle_error"
-    return "deep" if state.get("deep_queue") else "done"
+    return "deep"

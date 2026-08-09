@@ -21,7 +21,7 @@ from graph.runner import execute_triage
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
-from _threads_fixture import (
+from tests.integration._threads_fixture import (
     ACCOUNT_ID,
     BULK_SENDER,
     REPLIED_SENDERS,
@@ -163,7 +163,7 @@ class TestCostTiering:
             assert all(c.model for c in calls)
             assert all(c.tokens_in > 0 for c in calls)
             assert all(
-                c.purpose in {"classify", "classify_failed", "deep_read"} for c in calls
+                c.purpose in {"classify", "classify_failed", "deep_read", "review"} for c in calls
             )
 
 

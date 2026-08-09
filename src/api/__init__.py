@@ -57,12 +57,15 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return ok({"status": "ok", "version": VERSION})
 
-    from api import connections, runs, session, triage
+    from api import actions, categories, connections, memory, runs, session, triage
 
     app.include_router(session.router)
     app.include_router(connections.router)
     app.include_router(runs.router)
     app.include_router(triage.router)
+    app.include_router(memory.router)
+    app.include_router(categories.router)
+    app.include_router(actions.router)
 
     # Google OAuth routes live in api/auth.py (gmail-adapter slice). Mounted at the
     # paths spec/api.md documents: /auth/google/start, /auth/google/callback, /auth/logout.

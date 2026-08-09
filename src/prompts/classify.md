@@ -11,6 +11,10 @@ Choose exactly one `category` key per thread from this taxonomy:
 
 {categories}
 
+## User's stated priorities
+
+{priorities}
+
 ## Actions
 
 - `keep` — leave it in the inbox; the user should see it.

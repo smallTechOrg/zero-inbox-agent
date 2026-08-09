@@ -2,8 +2,33 @@
 
 import { ComingSoonChip } from './Stub'
 
-/** Phase 1: permanent, unmissable, pinned above all content. */
-export function DryRunBanner() {
+/**
+ * Pinned above all content (spec/ui.md §Global chrome). Shown red whenever
+ * `settings.dry_run` is true; replaced by a green LIVE bar the moment the
+ * user turns dry-run off in Settings.
+ */
+export function DryRunBanner({ dryRun = true }: { dryRun?: boolean }) {
+  if (!dryRun) {
+    return (
+      <div
+        role="status"
+        data-testid="dry-run-banner"
+        className="sticky top-0 z-50 w-full border-b-4 border-emerald-900 bg-emerald-600 px-4 py-2 text-center text-white shadow-md"
+      >
+        <p className="text-sm font-bold tracking-wide uppercase">
+          <span aria-hidden="true" className="mr-1.5">
+            ●
+          </span>
+          Live — actions will modify your Gmail
+        </p>
+        <p className="text-[11px] font-medium text-emerald-100">
+          Dry run is off. Approving a cluster or thread now really archives and labels mail. Every
+          action is logged with an undo token.
+        </p>
+      </div>
+    )
+  }
+
   return (
     <div
       role="status"
@@ -17,8 +42,8 @@ export function DryRunBanner() {
         Dry run — nothing in your Gmail has been changed
       </p>
       <p className="text-[11px] font-medium text-red-100">
-        Phase 1 records your approvals and rejections in the database only. No message is
-        archived, labelled, deleted or moved.
+        Approving or rejecting records your intent in the database only. No message is archived,
+        labelled, deleted or moved. Turn dry-run off in Settings to act for real.
       </p>
     </div>
   )

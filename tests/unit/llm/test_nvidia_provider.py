@@ -8,7 +8,7 @@ from openai import APIConnectionError, APIStatusError, RateLimitError
 
 from llm.providers.base import LLMError, LLMResult, estimate_cost_usd
 from llm.providers.nvidia import NvidiaProvider
-from fakes import FakeOpenAIClient, FakeResponse
+from tests.unit.llm.fakes import FakeOpenAIClient, FakeResponse
 
 
 def _provider(script=(), **kwargs) -> tuple[NvidiaProvider, FakeOpenAIClient]:

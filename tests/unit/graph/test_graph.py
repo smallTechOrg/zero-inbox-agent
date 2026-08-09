@@ -80,10 +80,13 @@ class TestAssembly:
         ):
             assert name in nodes
 
-    def test_phase_2_review_nodes_are_absent_in_phase_1(self):
+    def test_phase_2_review_nodes_are_wired(self):
+        """Phase 2: the never-miss safeguards (second-pass reviewer + confidence
+        floor) are live in the graph — this replaces the old Phase-1 scaffolding
+        assertion that these nodes were absent."""
         nodes = triage_graph.get_graph().nodes
-        assert "second_pass_reviewer" not in nodes
-        assert "apply_never_miss_floor" not in nodes
+        assert "second_pass_reviewer" in nodes
+        assert "apply_never_miss_floor" in nodes
 
 
 class TestZeroTokenPath:

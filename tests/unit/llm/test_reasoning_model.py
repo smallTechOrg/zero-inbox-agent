@@ -20,7 +20,7 @@ import json
 import time
 
 import pytest
-from fakes import FakeOpenAIClient, FakeResponse
+from tests.unit.llm.fakes import FakeOpenAIClient, FakeResponse
 
 from llm.client import LLMClient
 from llm.providers.base import LLMError, LLMSchemaError

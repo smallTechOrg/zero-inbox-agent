@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from graph.runner import execute_triage
 
-from _threads_fixture import (
+from tests.integration._threads_fixture import (
     ACCOUNT_ID,
     SMALL_TOTAL,
     USER_ID,
@@ -31,7 +31,7 @@ from _threads_fixture import (
 
 pytestmark = pytest.mark.integration
 
-VALID_TIERS = {"rule", "sender_history", "llm", "llm_deep", "error"}
+VALID_TIERS = {"rule", "sender_history", "llm", "llm_deep", "error", "reviewer"}
 FREE_TIER_MINIMUM = 16  # 6 substack + 4 github + 3 bulk + 3 replied-to
 
 
@@ -108,7 +108,13 @@ def test_tier3_answers_structurally_no_error_degradation_storm(triage_run):
     by_tier = triage_run["counts"]["by_tier"]
     assert by_tier.get("error", 0) == 0, by_tier
     assert by_tier.get("llm", 0) + by_tier.get("llm_deep", 0) > 0, by_tier
-    assert by_tier.get("rule", 0) + by_tier.get("sender_history", 0) >= FREE_TIER_MINIMUM
+    # "reviewer" only fires on candidates already resolved by tiers 1-2 (the
+    # never-miss reviewer re-tags rule/sender_history decisions it flips) — it
+    # doesn't represent new LLM cost, so it counts toward the cheap-resolution total.
+    assert (
+        by_tier.get("rule", 0) + by_tier.get("sender_history", 0) + by_tier.get("reviewer", 0)
+        >= FREE_TIER_MINIMUM
+    )
 
 
 def test_the_llm_ran_batched_within_the_time_budget(triage_run):

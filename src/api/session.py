@@ -137,10 +137,7 @@ def me(
 
 
 def _settings_payload(row) -> dict:
-    """Settings are returned with Phase-1 defaults when the row does not exist yet.
-
-    ``dry_run`` is always reported true in Phase 1 — the client cannot turn it off.
-    """
+    """Settings are returned with Phase-1 defaults when the row does not exist yet."""
     if row is None:
         return {
             "auto_act_threshold": 0.95,
@@ -153,8 +150,53 @@ def _settings_payload(row) -> dict:
     return {
         "auto_act_threshold": row.auto_act_threshold,
         "confidence_floor": row.confidence_floor,
-        "dry_run": True,
+        "dry_run": row.dry_run,
         "llm_model": row.llm_model,
         "digest_hour_local": row.digest_hour_local,
         "timezone": row.timezone,
     }
+
+
+@router.patch("/api/settings")
+def update_settings(
+    body: dict,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Partial update of the signed-in user's settings row.
+
+    Only fields present in the request body are changed. Creates the row with
+    defaults (overridden by the given fields) if it does not exist yet.
+    """
+    from db.models import UserSettings
+
+    allowed_fields = {
+        "auto_act_threshold",
+        "confidence_floor",
+        "dry_run",
+        "llm_model",
+        "timezone",
+        "digest_hour_local",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed_fields}
+
+    row = session.get(UserSettings, user_id)
+    if row is None:
+        row = UserSettings(
+            user_id=user_id,
+            auto_act_threshold=updates.get("auto_act_threshold", 0.95),
+            confidence_floor=updates.get("confidence_floor", 0.75),
+            dry_run=updates.get("dry_run", True),
+            llm_model=updates.get("llm_model", ""),
+            digest_hour_local=updates.get("digest_hour_local", 8),
+            timezone=updates.get("timezone", "UTC"),
+        )
+        session.add(row)
+    else:
+        for key, value in updates.items():
+            setattr(row, key, value)
+
+    session.commit()
+    session.refresh(row)
+
+    return ok(_settings_payload(row))
