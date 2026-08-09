@@ -81,6 +81,7 @@ def apply_decision(
     mutator: Mutator,
     label_lookup: LabelLookup,
     dry_run: bool,
+    force: bool = False,
 ) -> object:
     """Applies one ``approved`` decision. Returns the created ``ActionLog`` row.
 
@@ -88,6 +89,13 @@ def apply_decision(
     to ``applied`` — the ordering the spec requires. Raises ``DryRunViolation``,
     :class:`NeedsYourCallError`, :class:`NotApprovedError` or :class:`ActionsError`
     without ever calling ``mutator`` if the decision is not eligible.
+
+    ``force`` (default False) is the ONLY way to archive a ``keep``-proposed
+    decision. It exists for a deliberate, informed, user-initiated "archive
+    everything except what I have to look at" sweep — never set it from an
+    ordinary bulk-approve path, which must keep defaulting to the safe
+    behaviour (refuse). ``needs_your_call`` and non-``approved`` decisions are
+    never overridable, by ``force`` or anything else.
     """
     if dry_run:
         raise DryRunViolation("dry_run is on — no mutation was attempted")
@@ -104,10 +112,11 @@ def apply_decision(
         raise NotApprovedError(
             f"only approved decisions are eligible for apply (status={decision.status!r})"
         )
-    if decision.proposed_action not in ("archive", "digest"):
+    if decision.proposed_action not in ("archive", "digest") and not force:
         raise NotArchivableError(
             f"a {decision.proposed_action!r}-proposed decision can never be archived "
-            "(only 'archive' and 'digest' proposals may be mutated)"
+            "(only 'archive' and 'digest' proposals may be mutated; pass force=True "
+            "for a deliberate override)"
         )
 
     item = session.get(m.Item, decision.item_id)

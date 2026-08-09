@@ -216,6 +216,43 @@ export default function Dashboard() {
     }
   }, [run, dryRun, loadClusters])
 
+  const [forcingKeep, setForcingKeep] = useState(false)
+
+  // Archives everything except needs_your_call — including confidently-'keep'
+  // mail. A deliberate, explicit override of the normal "keep stays visible"
+  // rule: force:true is the ONLY way apply_decision will ever touch a 'keep'
+  // decision (see tools/actions.py). Requires dry-run off and a fresh confirm
+  // every time — this is a materially bigger action than the ordinary
+  // Approve all, on purpose.
+  const forceArchiveEverythingExceptNeedsYourCall = useCallback(async () => {
+    if (!run || dryRun) return
+    if (
+      !window.confirm(
+        'This archives EVERY thread except the ones needing your call — including mail the agent judged important (people, urgent). ' +
+          'Nothing is deleted and everything stays one-click undoable, but it will leave your inbox. Continue?',
+      )
+    ) {
+      return
+    }
+    setForcingKeep(true)
+    setApproveAllResult(null)
+    setRunError(null)
+    try {
+      await api.reviewAllClusters(run.id, 'approved')
+      const approvedItems = await api.itemsByStatus(run.id, 'approved')
+      const ids = approvedItems.map(i => i.decision_id) // every proposed_action this time
+      const results = ids.length > 0 ? await api.applyDecisions(ids, true) : []
+      const archived = results.filter(r => r.action_log_id).length
+      setApproveAllResult(`${archived} thread(s) archived in Gmail, including confidently-important mail.`)
+      void loadClusters(run.id)
+      setRefreshKey(k => k + 1)
+    } catch (e) {
+      setRunError(e)
+    } finally {
+      setForcingKeep(false)
+    }
+  }, [run, dryRun, loadClusters])
+
   const cancelRun = useCallback(async () => {
     if (!run) return
     setCancelling(true)
@@ -358,6 +395,18 @@ export default function Dashboard() {
                         className="rounded-lg bg-emerald-700 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-800 focus:ring-2 focus:ring-emerald-400 focus:outline-none disabled:opacity-50"
                       >
                         {approvingAll ? 'Approving…' : 'Approve all'}
+                      </button>
+                    ) : null}
+                    {clusters && clusters.length > 0 && run && !dryRun ? (
+                      <button
+                        type="button"
+                        data-testid="force-archive-all"
+                        title="Archives everything except Needs your call — including confidently-important mail (people, urgent). Asks for confirmation every time."
+                        onClick={() => void forceArchiveEverythingExceptNeedsYourCall()}
+                        disabled={forcingKeep || RUN_ACTIVE(run.status)}
+                        className="rounded-lg border border-orange-300 bg-orange-50 px-3 py-1 text-xs font-semibold text-orange-800 hover:bg-orange-100 focus:ring-2 focus:ring-orange-400 focus:outline-none disabled:opacity-50"
+                      >
+                        {forcingKeep ? 'Archiving…' : 'Archive everything except Needs your call'}
                       </button>
                     ) : null}
                   </div>

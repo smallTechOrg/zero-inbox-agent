@@ -124,10 +124,10 @@ export const api = {
    * (409 dry_run_violation) but the client never calls it in dry-run mode
    * either, and never for a `rejected` decision.
    */
-  applyDecisions: (decisionIds: string[]) =>
+  applyDecisions: (decisionIds: string[], force = false) =>
     request<ApplyResult[]>('/api/actions/apply', {
       method: 'POST',
-      body: JSON.stringify({ decision_ids: decisionIds }),
+      body: JSON.stringify({ decision_ids: decisionIds, force }),
     }),
 
   undoAction: (actionLogId: string) =>

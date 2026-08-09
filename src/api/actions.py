@@ -14,7 +14,7 @@ ids are always the same non-null value.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -38,6 +38,14 @@ router = APIRouter()
 
 class ApplyRequest(BaseModel):
     decision_ids: list[str]
+    force: bool = Field(
+        default=False,
+        description=(
+            "Archive even 'keep'-proposed decisions. Off by default — only set "
+            "this for a deliberate, user-initiated override; never from an "
+            "ordinary bulk-approve path."
+        ),
+    )
 
 
 def _action_log_payload(row) -> dict:
@@ -120,6 +128,7 @@ def apply_actions_route(
                 mutator=mutator,
                 label_lookup=label_lookup,
                 dry_run=False,
+                force=body.force,
             )
         except DryRunViolation as exc:
             session.rollback()

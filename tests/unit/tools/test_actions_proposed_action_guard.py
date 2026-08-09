@@ -156,6 +156,29 @@ def test_apply_decision_still_archives_an_archive_proposed_decision(seeded):
     assert mutator.archived == ["thread2"]
 
 
+def test_force_true_deliberately_overrides_the_keep_guard(seeded):
+    """The only sanctioned way to archive a 'keep' decision: an explicit,
+    per-call force=True — never the default path."""
+    from db.session import create_db_session
+    from tools.actions import apply_decision
+
+    mutator = FakeMutator()
+    with create_db_session() as session:
+        action_log = apply_decision(
+            session,
+            "u1",
+            seeded["keep_id"],
+            mutator=mutator,
+            label_lookup=FakeLabelLookup(),
+            dry_run=False,
+            force=True,
+        )
+        undo_token = action_log.undo_token
+        session.commit()
+    assert undo_token is not None
+    assert mutator.archived == ["thread1"]
+
+
 def test_the_keep_decision_status_is_unchanged_after_the_refused_apply(seeded):
     from db.models import Decision
     from db.session import create_db_session
@@ -177,3 +200,43 @@ def test_the_keep_decision_status_is_unchanged_after_the_refused_apply(seeded):
     with create_db_session() as session:
         decision = session.get(Decision, seeded["keep_id"])
         assert decision.status == "approved"  # never flipped to "applied"
+
+
+def test_force_does_not_override_needs_your_call_or_not_approved(seeded):
+    """force only ever overrides the keep-proposed check — the two other hard
+    rules (needs_your_call, not-approved) are absolute regardless of force."""
+    from db.models import Decision
+    from db.session import create_db_session
+    from tools.actions import NeedsYourCallError, NotApprovedError, apply_decision
+
+    with create_db_session() as session:
+        decision = session.get(Decision, seeded["keep_id"])
+        decision.status = "needs_your_call"
+
+    with create_db_session() as session:
+        with pytest.raises(NeedsYourCallError):
+            apply_decision(
+                session,
+                "u1",
+                seeded["keep_id"],
+                mutator=FakeMutator(),
+                label_lookup=FakeLabelLookup(),
+                dry_run=False,
+                force=True,
+            )
+
+    with create_db_session() as session:
+        decision = session.get(Decision, seeded["archive_id"])
+        decision.status = "proposed"  # not approved
+
+    with create_db_session() as session:
+        with pytest.raises(NotApprovedError):
+            apply_decision(
+                session,
+                "u1",
+                seeded["archive_id"],
+                mutator=FakeMutator(),
+                label_lookup=FakeLabelLookup(),
+                dry_run=False,
+                force=True,
+            )
