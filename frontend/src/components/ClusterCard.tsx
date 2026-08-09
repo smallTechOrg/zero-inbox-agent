@@ -15,6 +15,24 @@ function confidenceRange(cluster: Cluster) {
   return `confidence ${fmt(min)} min · ${fmt(avg)} avg`
 }
 
+/** How the cluster was grouped — category / sender / domain / mailing list. */
+function KindChip({ kind }: { kind: string }) {
+  const isCategory = kind === 'category'
+  return (
+    <span
+      data-testid="cluster-kind"
+      title={`Grouped by ${kind}`}
+      className={`inline-flex shrink-0 items-center rounded border px-1.5 py-0.5 text-[10px] font-bold tracking-wide uppercase ${
+        isCategory
+          ? 'border-teal-300 bg-teal-50 text-teal-900'
+          : 'border-gray-300 bg-gray-50 text-gray-600'
+      }`}
+    >
+      {kind.replace(/_/g, ' ')}
+    </span>
+  )
+}
+
 export function ClusterCard({ cluster }: { cluster: Cluster }) {
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<TriageItem[] | null>(null)
@@ -88,6 +106,7 @@ export function ClusterCard({ cluster }: { cluster: Cluster }) {
         >
           <span className="flex flex-wrap items-center gap-2">
             <span className="font-mono text-xs text-gray-500">{open ? '−' : '+'}</span>
+            <KindChip kind={cluster.kind} />
             <span className="text-sm font-semibold text-gray-900">{cluster.label}</span>
             <span className="rounded bg-gray-100 px-1.5 py-0.5 text-xs font-medium text-gray-700">
               {cluster.item_count} threads

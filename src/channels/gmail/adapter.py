@@ -103,13 +103,21 @@ class GmailAdapter(ChannelAdapter):
         self._account_email = email or self._account_email
         return self._account_email
 
-    def list_threads(self, *, limit: int = 200, query: str | None = None) -> list[ChannelItem]:
+    def list_threads(
+        self,
+        *,
+        limit: int = 200,
+        query: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[ChannelItem]:
         if limit < 0:
             raise ChannelError("limit must be >= 0")
-        thread_ids = self._list_thread_ids(limit=limit, query=query)
+        thread_ids = self._list_thread_ids(limit=limit, query=query, cancel_check=cancel_check)
 
         items: list[ChannelItem] = []
         for thread_id in thread_ids:
+            if cancel_check is not None and cancel_check():
+                break
             try:
                 thread = self._execute(
                     self._service.users()
@@ -130,10 +138,18 @@ class GmailAdapter(ChannelAdapter):
                 continue
         return items
 
-    def _list_thread_ids(self, *, limit: int, query: str | None) -> list[str]:
+    def _list_thread_ids(
+        self,
+        *,
+        limit: int,
+        query: str | None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[str]:
         ids: list[str] = []
         page_token: str | None = None
         while len(ids) < limit:
+            if cancel_check is not None and cancel_check():
+                break
             page = self._execute(
                 self._service.users()
                 .threads()

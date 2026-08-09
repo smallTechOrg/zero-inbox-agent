@@ -21,8 +21,13 @@ class FakeChoice:
 
 
 class FakeResponse:
-    def __init__(self, content: str | None, model: str = "vendor/fake-model") -> None:
-        self.choices = [FakeChoice(content)]
+    def __init__(
+        self,
+        content: str | None,
+        model: str = "vendor/fake-model",
+        finish_reason: str = "stop",
+    ) -> None:
+        self.choices = [FakeChoice(content, finish_reason)]
         self.model = model
         self.usage = FakeUsage(11, 7)
 

@@ -12,9 +12,10 @@ shape.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 SNIPPET_MAX_CHARS = 200
 
@@ -59,6 +60,19 @@ class ChannelItem(BaseModel):
     is_unread: bool = False
     channel_labels: list[str] = Field(default_factory=list)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def id(self) -> str:
+        """Stable identity every consumer keys on.
+
+        The triage graph, the LLM verdict map and the persistence layer all
+        address an item as `item["id"]`; adapters name their own key
+        (`external_thread_id` for Gmail). Deriving `id` here — and including it
+        in `model_dump()` — keeps that contract on the channel interface so a
+        future adapter cannot silently omit it.
+        """
+        return self.external_thread_id
+
     @field_validator("snippet_redacted")
     @classmethod
     def _cap_snippet(cls, value: str) -> str:
@@ -91,8 +105,19 @@ class ChannelAdapter(ABC):
         """The connected mailbox address, confirmed against the provider."""
 
     @abstractmethod
-    def list_threads(self, *, limit: int = 200, query: str | None = None) -> list[ChannelItem]:
-        """Most recent inbox threads, newest first, headers/snippet only."""
+    def list_threads(
+        self,
+        *,
+        limit: int = 200,
+        query: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[ChannelItem]:
+        """Most recent inbox threads, newest first, headers/snippet only.
+
+        ``cancel_check`` (optional) is polled between page/thread fetches so a
+        cancelled run can stop mid-fetch instead of draining the whole listing
+        before the graph ever notices the cancel.
+        """
 
     @abstractmethod
     def fetch_thread_body(self, external_thread_id: str) -> str:

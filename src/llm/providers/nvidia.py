@@ -6,7 +6,14 @@ NIM exposes an OpenAI-compatible chat-completions API at
 
 * a **per-call swappable model id** (never hardcoded — the default comes from
   ``AGENT_NVIDIA_DEFAULT_MODEL`` and any call may override it),
-* an explicit timeout and bounded exponential-backoff retries,
+* a **hard wall-clock deadline per attempt** (``asyncio.wait_for``) — httpx read
+  timeouts are per socket read, so a slowly-streaming reasoning model can run far
+  past a plain float timeout; the outer deadline bounds total elapsed time,
+* bounded exponential-backoff retries,
+* first-class support for reasoning models (Nemotron): ``disable_thinking=True``
+  turns chain-of-thought off via ``chat_template_kwargs``, and ``reasoning_content``
+  is only ever used as a fallback for free-text calls — **never** for JSON-schema
+  calls, where thought text is not an answer,
 * token + cost accounting returned on every call.
 """
 
@@ -17,6 +24,7 @@ import random
 import time
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -29,6 +37,7 @@ from llm.providers.base import LLMError, LLMResult, estimate_cost_usd
 
 DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_MAX_RETRIES = 3
+CONNECT_TIMEOUT_S = 10.0
 _RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
@@ -56,8 +65,13 @@ class NvidiaProvider:
         self._timeout_s = timeout_s
         self._max_retries = max_retries
         # `max_retries=0`: retries are owned here so backoff and logging are ours.
+        # The httpx.Timeout caps connect/read/write/pool individually; the true
+        # total-elapsed bound is the asyncio.wait_for deadline in _request_with_retries.
         self._client = client or AsyncOpenAI(
-            api_key=api_key, base_url=base_url, timeout=timeout_s, max_retries=0
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(timeout_s, connect=min(CONNECT_TIMEOUT_S, timeout_s)),
+            max_retries=0,
         )
 
     @property
@@ -73,8 +87,14 @@ class NvidiaProvider:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        disable_thinking: bool = False,
     ) -> LLMResult:
-        """One chat completion. ``model`` overrides the configured default."""
+        """One chat completion. ``model`` overrides the configured default.
+
+        ``disable_thinking=True`` turns off the reasoning chain on Nemotron-class
+        models (``chat_template_kwargs``) so structured-output calls spend their
+        token budget on the answer, not on thought text.
+        """
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 
@@ -95,6 +115,8 @@ class NvidiaProvider:
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": json_schema, "strict": True},
             }
+        if disable_thinking:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"thinking": False}}
 
         started = time.monotonic()
         response, attempts = await self._request_with_retries(kwargs)
@@ -102,8 +124,10 @@ class NvidiaProvider:
 
         choice = response.choices[0]
         text = choice.message.content or ""
-        if not text:
-            # Reasoning models can put everything in `reasoning_content`.
+        if not text and json_schema is None:
+            # Free-text calls only: reasoning models can put everything in
+            # `reasoning_content`. A JSON-schema call must NEVER fall back to the
+            # thought stream — chain-of-thought is not a parseable answer.
             text = getattr(choice.message, "reasoning_content", "") or ""
         usage = getattr(response, "usage", None)
         tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -124,8 +148,16 @@ class NvidiaProvider:
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
-                return await self._client.chat.completions.create(**kwargs), attempt
-            except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
+                # The wait_for deadline bounds total wall-clock per attempt. httpx's
+                # read timeout alone is per socket read, so a reasoning model that
+                # streams thought tokens slowly could otherwise run 2-3x past the
+                # configured budget (observed: 215s calls against a 90s timeout).
+                response = await asyncio.wait_for(
+                    self._client.chat.completions.create(**kwargs),
+                    timeout=self._timeout_s,
+                )
+                return response, attempt
+            except (TimeoutError, APITimeoutError, APIConnectionError, RateLimitError) as exc:
                 last_exc = exc
             except APIStatusError as exc:
                 if exc.status_code not in _RETRY_STATUS:

@@ -135,12 +135,108 @@ def _model_candidates(state: TriageState) -> list[str | None]:
     return [preferred, None] if preferred else [None]
 
 
-def _call_llm(prompt: str, *, model: str | None = None) -> tuple[str, dict]:
-    """Single completion through the shared client. Returns ``(text, usage_row)``."""
+def _call_llm(
+    prompt: str,
+    *,
+    model: str | None = None,
+    json_schema: dict | None = None,
+    max_tokens: int = 4096,
+) -> tuple[str, list[dict]]:
+    """Single completion through the shared client. Returns ``(text, usage_rows)``.
+
+    JSON calls get the schema as a real ``response_format`` with thinking disabled
+    (reasoning models otherwise burn the budget on chain-of-thought). A reply cut
+    off at the token limit is never parsed — it is re-issued once with double the
+    budget. Every call's spend is returned, parse outcome notwithstanding.
+    """
     from llm.client import get_llm_client
 
-    result = _run_async(get_llm_client().call_model(prompt, model=model))
-    return result.text, _usage_row(result, "deep_read", 1)
+    client = get_llm_client()
+    rows: list[dict] = []
+    result = _run_async(
+        client.call_model(
+            prompt,
+            model=model,
+            json_schema=json_schema,
+            disable_thinking=json_schema is not None,
+            max_tokens=max_tokens,
+        )
+    )
+    rows.append(_usage_row(result, "deep_read", 1))
+    if json_schema is not None and getattr(result, "finish_reason", None) == "length":
+        result = _run_async(
+            client.call_model(
+                prompt,
+                model=model,
+                json_schema=json_schema,
+                disable_thinking=True,
+                max_tokens=max_tokens * 2,
+            )
+        )
+        rows.append(_usage_row(result, "deep_read", 1))
+    return result.text, rows
+
+
+def _run_is_cancelled(run_id: str | None) -> bool:
+    """True iff the user cancelled this run (persisted flag on the run row)."""
+    if not run_id:
+        return False
+    try:
+        from db.session import create_db_session
+        from graph.persistence import model_for
+
+        run_cls = model_for("triage_runs")
+        if run_cls is None:
+            return False
+        with create_db_session() as session:
+            row = session.get(run_cls, run_id)
+            return row is not None and getattr(row, "status", None) == "cancelled"
+    except Exception as exc:  # pragma: no cover - a broken check must not kill a run
+        log.warning("triage.cancel_check_failed", run_id=run_id, error=str(exc))
+        return False
+
+
+def _record_progress(
+    run_id: str | None,
+    *,
+    items_total: int | None = None,
+    items_decided: int | None = None,
+    decided_delta: int | None = None,
+) -> None:
+    """Short-transaction progress write so the 1s poll sees live numbers.
+
+    ``decided_delta`` uses an atomic column-expression UPDATE — parallel batch
+    branches may increment concurrently.
+    """
+    if not run_id:
+        return
+    try:
+        from sqlalchemy import update as sa_update
+
+        from db.session import create_db_session
+        from graph.persistence import model_for
+
+        run_cls = model_for("triage_runs")
+        if run_cls is None:
+            return
+        with create_db_session() as session:
+            values: dict = {}
+            if items_total is not None:
+                values["items_total"] = items_total
+            if items_decided is not None:
+                values["items_decided"] = items_decided
+            if values:
+                session.execute(
+                    sa_update(run_cls).where(run_cls.id == run_id).values(**values)
+                )
+            if decided_delta:
+                session.execute(
+                    sa_update(run_cls)
+                    .where(run_cls.id == run_id)
+                    .values(items_decided=run_cls.items_decided + decided_delta)
+                )
+    except Exception as exc:  # pragma: no cover - progress must never fail a run
+        log.warning("triage.progress_write_failed", run_id=run_id, error=str(exc))
 
 
 _FENCE_RE = re.compile(r"```(?:json)?", re.IGNORECASE)
@@ -278,17 +374,26 @@ def load_context(state: TriageState) -> dict:
 def fetch_items(state: TriageState) -> dict:
     """Normalised items, headers + subject + <=200 char snippet only."""
     if state.get("items"):
-        return {"items": list(state["items"]), "error": None}
+        items = list(state["items"])
+        _record_progress(state.get("run_id"), items_total=len(items))
+        return {"items": items, "error": None}
     try:
         from channels import get_adapter  # provided by the gmail-adapter slice
 
         adapter = get_adapter(
             user_id=state["user_id"], channel_account_id=state["channel_account_id"]
         )
+        run_id = state.get("run_id")
         items = [
             i if isinstance(i, dict) else i.model_dump()
-            for i in adapter.list_threads(limit=state.get("limit", 200))
+            for i in adapter.list_threads(
+                limit=state.get("limit", 200),
+                cancel_check=(lambda: _run_is_cancelled(run_id)) if run_id else None,
+            )
         ]
+        # The progress bar's denominator, written the moment the total is known —
+        # not at the end of the run (spec/api.md: GET /api/runs is polled at 1s).
+        _record_progress(state.get("run_id"), items_total=len(items))
         return {"items": items, "error": None}
     except Exception as exc:
         return {"error": f"fetch_items failed: {exc}"}
@@ -324,6 +429,10 @@ def apply_sender_history(state: TriageState) -> dict:
 
 def prepare_llm_batches(state: TriageState) -> dict:
     batches = _chunk(state.get("llm_queue") or [])
+    # Tiers 1-2 are done by now: surface their progress before the LLM starts.
+    _record_progress(
+        state.get("run_id"), items_decided=len(state.get("resolved") or [])
+    )
     log.info(
         "triage.batches", run_id=state.get("run_id"), batches=len(batches),
         items=len(state.get("llm_queue") or []),
@@ -337,6 +446,20 @@ def llm_classify_batch(state: TriageState) -> dict:
     if not batch:
         return {}
 
+    run_id = state.get("run_id")
+    if _run_is_cancelled(run_id):
+        # The cancel flag is persisted by POST /api/runs/{id}/cancel; honour it
+        # between batches by spending no further tokens. A cancelled run must
+        # never synthesize decisions for undecided threads — those rows would
+        # persist as decided_by="error" and bury the user's real results. This
+        # batch is simply dropped: no decision, no cluster, nothing archived.
+        log.info("triage.batch_skipped_cancelled", run_id=run_id, batch_size=len(batch))
+        return {
+            "llm_decisions": [],
+            "deep_queue": [],
+            "llm_calls": [],
+        }
+
     categories = state.get("categories") or []
     category_keys = {c["key"] for c in categories}
     by_id = {i["id"]: i for i in batch}
@@ -347,6 +470,7 @@ def llm_classify_batch(state: TriageState) -> dict:
 
     result = None
     last_error = "unknown error"
+    failed_calls: list[dict] = []
     for model in _model_candidates(state):
         try:
             result = _run_async(
@@ -362,6 +486,11 @@ def llm_classify_batch(state: TriageState) -> dict:
             break
         except Exception as exc:
             last_error = str(exc)
+            # Tokens burnt by a failed batch are still real spend — keep them for
+            # the audit trail (spec/capabilities/decision-audit-trail.md).
+            failed_usage = getattr(exc, "usage", None)
+            if failed_usage is not None:
+                failed_calls.append(_usage_row(failed_usage, "classify_failed", len(batch)))
             log.warning(
                 "triage.tier3_model_failed",
                 run_id=state.get("run_id"),
@@ -374,7 +503,7 @@ def llm_classify_batch(state: TriageState) -> dict:
         return {
             "llm_decisions": _degraded(batch, last_error),
             "deep_queue": [],
-            "llm_calls": [],
+            "llm_calls": failed_calls,
         }
 
     decisions: list[dict] = []
@@ -389,7 +518,11 @@ def llm_classify_batch(state: TriageState) -> dict:
             decisions.append(_normalise_verdict(raw, item, category_keys))
 
     deep = [by_id[d["item_id"]] for d in decisions if d.get("unsure")]
-    calls = [_usage_row(result.usage, "classify", len(batch))] if result.usage else []
+    calls = failed_calls + (
+        [_usage_row(result.usage, "classify", len(batch))] if result.usage else []
+    )
+    # Live progress: this batch is decided — bump the numerator atomically.
+    _record_progress(run_id, decided_delta=len(batch))
     log.info(
         "triage.tier3",
         run_id=state.get("run_id"),
@@ -412,8 +545,10 @@ def deep_read_escalation(state: TriageState) -> dict:
     if not queue:
         return {}
 
+    run_id = state.get("run_id")
     categories = state.get("categories") or []
     category_keys = {c["key"] for c in categories}
+    schema = _verdict_schema(sorted(category_keys))
     template = _prompt("deep_read.md")
     candidates = _model_candidates(state)
     sender_stats = state.get("sender_stats") or {}
@@ -421,6 +556,15 @@ def deep_read_escalation(state: TriageState) -> dict:
     decisions: list[dict] = []
     calls: list[dict] = []
     for item in queue:
+        if _run_is_cancelled(run_id):
+            # Remaining deep reads are skipped; each keeps its low-confidence batch
+            # verdict, which lands below the floor -> needs_your_call. Never archived.
+            log.info(
+                "triage.deep_reads_skipped_cancelled",
+                run_id=run_id,
+                remaining=len(queue) - len(decisions),
+            )
+            break
         stats = sender_stats.get((item.get("from_email") or "").lower()) or {}
         history = (
             json.dumps(
@@ -442,7 +586,9 @@ def deep_read_escalation(state: TriageState) -> dict:
         )
         for model in candidates:
             try:
-                text, meta = _call_llm(prompt, model=model)
+                text, metas = _call_llm(prompt, model=model, json_schema=schema)
+                # Spend is recorded even if the parse below fails — the tokens are real.
+                calls.extend(metas)
                 raw = _extract_json(text, array=False)
                 if not isinstance(raw, dict):
                     raise ValueError("expected a JSON object")
@@ -450,7 +596,10 @@ def deep_read_escalation(state: TriageState) -> dict:
                 verdict["decided_by"] = "llm_deep"
                 verdict["unsure"] = False
                 decisions.append(verdict)
-                calls.append(meta)
+                # Deep reads land one item at a time (unlike a batch, which lands
+                # all at once) — the progress bar's numerator advances with each
+                # one instead of waiting for the whole queue to finish.
+                _record_progress(run_id, decided_delta=1)
                 break
             except Exception as exc:
                 # The batch verdict stands: low confidence -> needs_your_call, never archive.
@@ -466,8 +615,14 @@ def deep_read_escalation(state: TriageState) -> dict:
 _TIER_PRECEDENCE = {"error": 0, "rule": 1, "sender_history": 1, "llm": 2, "llm_deep": 3}
 
 
-def _merge_decisions(state: TriageState) -> list[dict]:
-    """One decision per item; the deepest tier wins. Undecided items degrade to keep."""
+def _merge_decisions(state: TriageState, *, cancelled: bool = False) -> list[dict]:
+    """One decision per item; the deepest tier wins. Undecided items degrade to keep.
+
+    A cancelled run is the one exception: items with no decision yet are left
+    out entirely rather than synthesized as degraded ``decided_by="error"``
+    rows, so cancelling never persists placeholder decisions that bury the
+    user's real, already-decided threads.
+    """
     best: dict[str, dict] = {}
     for decision in list(state.get("resolved") or []) + list(state.get("llm_decisions") or []):
         current = best.get(decision["item_id"])
@@ -476,9 +631,10 @@ def _merge_decisions(state: TriageState) -> list[dict]:
         ) >= _TIER_PRECEDENCE.get(current["decided_by"], 0):
             best[decision["item_id"]] = decision
 
-    for item in state.get("items") or []:
-        if item["id"] not in best:
-            best[item["id"]] = _degraded([item], "no verdict was produced")[0]
+    if not cancelled:
+        for item in state.get("items") or []:
+            if item["id"] not in best:
+                best[item["id"]] = _degraded([item], "no verdict was produced")[0]
 
     order = {item["id"]: n for n, item in enumerate(state.get("items") or [])}
     return sorted(best.values(), key=lambda d: order.get(d["item_id"], 0))
@@ -489,7 +645,8 @@ def cluster_decisions(state: TriageState) -> dict:
         floor = float(
             (state.get("settings") or {}).get("confidence_floor", DEFAULT_CONFIDENCE_FLOOR)
         )
-        decisions = apply_confidence_floor(_merge_decisions(state), floor)
+        cancelled = _run_is_cancelled(state.get("run_id"))
+        decisions = apply_confidence_floor(_merge_decisions(state, cancelled=cancelled), floor)
         clusters = clustering.cluster(
             decisions, state.get("items") or [], categories=state.get("categories") or []
         )
@@ -612,6 +769,12 @@ def finalize(state: TriageState) -> dict:
             )
     except Exception as exc:  # pragma: no cover
         log.error("triage.finalize_persist_failed", error=str(exc))
+
+    # A user cancel is terminal — update_run above refused to overwrite it, and
+    # the returned state must agree with the run row.
+    if _run_is_cancelled(state.get("run_id")):
+        log.info("triage.finished_cancelled", run_id=state.get("run_id"))
+        return {"status": "cancelled", "counts": counts, "cost": cost}
 
     log.info(
         "triage.completed",

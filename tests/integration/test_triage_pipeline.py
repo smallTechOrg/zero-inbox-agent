@@ -4,6 +4,10 @@ endpoint, using the key from `.env`.
 Nothing here is stubbed: tiers 1-2 run for real, the remainder is really classified by
 the model in batches of 20-50, and everything is really persisted to the production
 SQLAlchemy driver.
+
+Marked ``slow`` and excluded from the default run (see pyproject.toml). The fast
+per-commit gate over the same pipeline is tests/integration/test_triage_small.py.
+Run this file with: ``uv run pytest -m slow tests/integration/test_triage_pipeline.py``.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import pytest
 from sqlalchemy import select
 
 from graph.runner import execute_triage
+
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 from _threads_fixture import (
     ACCOUNT_ID,
@@ -156,7 +162,9 @@ class TestCostTiering:
             assert calls
             assert all(c.model for c in calls)
             assert all(c.tokens_in > 0 for c in calls)
-            assert all(c.purpose in {"classify", "deep_read"} for c in calls)
+            assert all(
+                c.purpose in {"classify", "classify_failed", "deep_read"} for c in calls
+            )
 
 
 class TestNeverMissInvariants:

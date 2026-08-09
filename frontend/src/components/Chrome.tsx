@@ -8,9 +8,18 @@ export function DryRunBanner() {
     <div
       role="status"
       data-testid="dry-run-banner"
-      className="sticky top-0 z-50 w-full border-b-2 border-red-800 bg-red-600 px-4 py-2 text-center text-sm font-bold tracking-wide text-white uppercase"
+      className="sticky top-0 z-50 w-full border-b-4 border-red-900 bg-red-600 px-4 py-2 text-center text-white shadow-md"
     >
-      Dry run — nothing in your Gmail has been changed
+      <p className="text-sm font-bold tracking-wide uppercase">
+        <span aria-hidden="true" className="mr-1.5">
+          ●
+        </span>
+        Dry run — nothing in your Gmail has been changed
+      </p>
+      <p className="text-[11px] font-medium text-red-100">
+        Phase 1 records your approvals and rejections in the database only. No message is
+        archived, labelled, deleted or moved.
+      </p>
     </div>
   )
 }

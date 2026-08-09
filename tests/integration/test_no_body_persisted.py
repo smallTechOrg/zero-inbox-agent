@@ -14,7 +14,10 @@ from graph.runner import execute_triage
 
 from _threads_fixture import ACCOUNT_ID, BODY_MARKER, USER_ID, build_threads, seed_user
 
-SUBSET = 60  # two real LLM batches - enough to exercise every persisted table
+SUBSET = 50  # one real LLM batch (<= MAX_BATCH) - still spans every persisted table.
+# D13: was 60, which crossed the 50-item MAX_BATCH boundary and forced a second
+# real LLM round-trip for no additional coverage — that's the single biggest
+# redundant cost center in the default (non-slow) integration gate.
 
 
 _RUN: dict = {}
@@ -51,7 +54,7 @@ def completed_run(monkeypatch, tmp_path_factory):
 
         threads = build_threads()
         # A slice spanning newsletters, notifications, the LLM tail and secret-bearing mail.
-        items = threads[:20] + threads[62:72] + threads[150:170] + threads[202:212]
+        items = threads[:20] + threads[62:72] + threads[150:160] + threads[202:212]
         assert len(items) == SUBSET
         assert all(BODY_MARKER in item["body"] for item in items)
 

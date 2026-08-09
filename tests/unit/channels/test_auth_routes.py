@@ -45,11 +45,13 @@ class FakeExchanger:
         self.refresh_token = refresh_token
         self.email = email
         self.codes: list[str] = []
+        self.verifiers: list[str | None] = []
 
-    def __call__(self, code, state):
+    def __call__(self, code, state, code_verifier=None):
         from channels.gmail.oauth import OAuthResult
 
         self.codes.append(code)
+        self.verifiers.append(code_verifier)
         return OAuthResult(
             refresh_token=self.refresh_token,
             access_token="ya29.access",
@@ -97,9 +99,8 @@ def client(google_env, store, exchanger):
 # --- happy path ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/auth/google/start", "/auth/google/login"])
-def test_start_redirects_to_the_real_google_consent_screen(client, path):
-    response = client.get(path, follow_redirects=False)
+def test_start_redirects_to_the_real_google_consent_screen(client):
+    response = client.get("/auth/google/start", follow_redirects=False)
 
     assert response.status_code == 302
     location = urlparse(response.headers["location"])
@@ -109,6 +110,13 @@ def test_start_redirects_to_the_real_google_consent_screen(client, path):
     assert query["prompt"] == ["consent"]
     assert "gmail.readonly" in query["scope"][0]
     assert "gmail.compose" in query["scope"][0]
+
+
+def test_the_undocumented_login_alias_is_removed(client):
+    """Regression: /auth/google/login was an alias absent from spec/api.md.
+
+    The spec is law — only /auth/google/start exists."""
+    assert client.get("/auth/google/login", follow_redirects=False).status_code == 404
 
 
 def test_start_sets_a_signed_csrf_state_cookie_matching_the_state_parameter(client):
@@ -271,7 +279,7 @@ def test_a_failed_token_exchange_persists_nothing_and_reports_a_provider_error(
 ):
     from api import auth
 
-    def boom(code, state):
+    def boom(code, state, code_verifier=None):
         raise auth.OAuthExchangeError("token endpoint said no")
 
     app = FastAPI()
@@ -297,3 +305,39 @@ def test_read_session_rejects_a_tampered_cookie(google_env):
     assert read_session_user_id(good) == "user-1"
     assert read_session_user_id(good[:-3] + "aaa") is None
     assert read_session_user_id("") is None
+
+
+def test_the_pkce_verifier_from_start_reaches_the_token_exchange(client, exchanger):
+    """Regression: the callback builds a fresh Flow, so the verifier generated at
+    /start must travel in the signed state cookie. Without it Google rejects the
+    exchange with `invalid_grant: Missing code verifier`."""
+    start = client.get("/auth/google/start", follow_redirects=False)
+    query = parse_qs(urlparse(start.headers["location"]).query)
+    state = query["state"][0]
+
+    # Google receives only the challenge; the verifier stays on our side.
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["code_challenge"][0]
+
+    client.get(f"/auth/google/callback?code=authcode&state={state}", follow_redirects=False)
+
+    assert exchanger.verifiers, "the exchanger was never called"
+    assert exchanger.verifiers[0], "no PKCE verifier reached the token exchange"
+
+
+def test_the_callback_cookie_is_readable_by_the_api_session_guard(client, exchanger):
+    """Regression: auth.py wrote the session cookie with its own salt and a
+    `user_id` payload while api/session.py read it with a different salt and a
+    `uid` payload. Every signature check failed, so a user who had genuinely
+    connected Gmail still got 401 from /api/me. Pin the two halves together."""
+    from api.session import read_session_token
+
+    start = client.get("/auth/google/start", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/auth/google/callback?code=authcode&state={state}", follow_redirects=False
+    )
+
+    raw = callback.cookies.get("zi_session") or client.cookies.get("zi_session")
+    assert raw, "the callback set no session cookie"
+    assert read_session_token(raw), "the session guard cannot read the cookie auth.py wrote"

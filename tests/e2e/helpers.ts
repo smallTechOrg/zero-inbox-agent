@@ -2,6 +2,51 @@ import { expect, type Page, type Locator } from '@playwright/test';
 
 export const APP_URL = 'http://localhost:8001/app/';
 
+/**
+ * Pre-seed the signed `zi_session` cookie from the ZI_SESSION env var so the full
+ * triage journey can run headlessly against an already-connected mailbox:
+ *
+ *   ZI_SESSION=<cookie value> npx playwright test tests/e2e/
+ *
+ * Get the value by connecting Gmail once at http://localhost:8001/app/ and copying
+ * the `zi_session` cookie from the browser's devtools (Application → Cookies).
+ * When ZI_SESSION is unset the suite runs anonymously and the connected-mailbox
+ * journey skips with a loud reason — never a silent pass.
+ */
+export function sessionStorageState():
+  | {
+      cookies: {
+        name: string;
+        value: string;
+        domain: string;
+        path: string;
+        expires: number;
+        httpOnly: boolean;
+        secure: boolean;
+        sameSite: 'Lax';
+      }[];
+      origins: never[];
+    }
+  | undefined {
+  const token = process.env.ZI_SESSION;
+  if (!token) return undefined;
+  return {
+    cookies: [
+      {
+        name: 'zi_session',
+        value: token,
+        domain: 'localhost',
+        path: '/',
+        expires: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
+        httpOnly: true,
+        secure: false,
+        sameSite: 'Lax',
+      },
+    ],
+    origins: [],
+  };
+}
+
 /** Open the dashboard and wait for the client bundle to hydrate. */
 export async function openApp(page: Page): Promise<void> {
   await page.goto(APP_URL, { waitUntil: 'domcontentloaded' });

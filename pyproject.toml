@@ -35,4 +35,10 @@ packages = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
-markers = ["integration: hits a real external API using keys from .env"]
+# `slow` is excluded by default so the per-commit gate stays fast. The full
+# 220-thread real-LLM run is opt-in: `uv run pytest -m slow tests/integration`.
+addopts = "-m 'not slow'"
+markers = [
+    "integration: hits a real external API using keys from .env",
+    "slow: the full 220-thread real-LLM gate (minutes); excluded by default, run with -m slow",
+]

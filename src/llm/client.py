@@ -83,6 +83,7 @@ class LLMClient:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        disable_thinking: bool = False,
     ) -> LLMResult:
         """One completion. Returns text plus token/cost/latency accounting."""
         return await self._provider.call_model(
@@ -92,6 +93,7 @@ class LLMClient:
             json_schema=json_schema,
             temperature=temperature,
             max_tokens=max_tokens,
+            disable_thinking=disable_thinking,
         )
 
     def call_model_sync(self, prompt: str, **kwargs: Any) -> LLMResult:
@@ -128,6 +130,12 @@ class LLMClient:
         schema-conformant results; anything the model omitted or malformed is
         reported via ``missing_ids`` / ``invalid`` so the caller can degrade it
         safely (never silently guess).
+
+        Reasoning-model discipline (Nemotron): every call sends the JSON schema as
+        a real ``response_format`` and disables thinking; a ``finish_reason ==
+        "length"`` reply is truncated, so it is **never** parse-and-retried — a
+        multi-item batch is split in half and re-issued, and a single item gets a
+        doubled token budget instead.
         """
         if not items:
             return BatchClassification(id_field=id_field)
@@ -139,6 +147,7 @@ class LLMClient:
         validator = Draft202012Validator(dict(item_schema))
         model_id = model or self._default_model
         prompt = _build_batch_prompt(items, instructions, item_schema, id_field, expected_ids)
+        items_by_id = {str(item[id_field]): item for item in items}
 
         results: dict[str, dict[str, Any]] = {}
         invalid: list[dict[str, Any]] = []
@@ -146,6 +155,7 @@ class LLMClient:
         attempts = 0
         last_error: Exception | None = None
         actual_model = model_id
+        budget = max_tokens
 
         for attempt in range(1, max_attempts + 1):
             missing = [i for i in expected_ids if i not in results]
@@ -157,13 +167,61 @@ class LLMClient:
                 attempt_prompt,
                 system=system or _BATCH_SYSTEM,
                 model=model_id,
+                json_schema=_batch_schema(item_schema),
+                disable_thinking=True,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=budget,
             )
             tokens_in += result.tokens_in
             tokens_out += result.tokens_out
             latency_ms += result.latency_ms
             actual_model = result.model
+
+            if getattr(result, "finish_reason", None) == "length":
+                # The reply hit the token ceiling and is truncated (often empty for
+                # reasoning models). Re-sending the same oversized request would burn
+                # the same budget again — split the work instead.
+                if len(missing) > 1:
+                    half = len(missing) // 2
+                    for chunk_ids in (missing[:half], missing[half:]):
+                        chunk = [items_by_id[i] for i in chunk_ids]
+                        try:
+                            sub = await self.classify_batch(
+                                chunk,
+                                instructions=instructions,
+                                item_schema=item_schema,
+                                id_field=id_field,
+                                model=model,
+                                system=system,
+                                max_attempts=max_attempts,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                            )
+                        except LLMSchemaError as exc:
+                            last_error = exc
+                            sub_usage = exc.usage
+                            if sub_usage is not None:
+                                tokens_in += sub_usage.tokens_in
+                                tokens_out += sub_usage.tokens_out
+                                latency_ms += sub_usage.latency_ms
+                                attempts += sub_usage.attempts
+                            continue
+                        for entry in sub.results:
+                            results[str(entry[id_field])] = entry
+                        invalid.extend(sub.invalid)
+                        if sub.usage is not None:
+                            tokens_in += sub.usage.tokens_in
+                            tokens_out += sub.usage.tokens_out
+                            latency_ms += sub.usage.latency_ms
+                            attempts += sub.usage.attempts
+                    break
+                # A single item that still truncates needs budget, not repetition.
+                budget *= 2
+                last_error = LLMSchemaError(
+                    "response truncated at the token limit (finish_reason=length)"
+                )
+                continue
+
             try:
                 parsed = _extract_results(result.text)
             except LLMSchemaError as exc:
@@ -184,11 +242,6 @@ class LLMClient:
                 results[entry_id] = entry
 
         missing_ids = [i for i in expected_ids if i not in results]
-        if not results and last_error is not None:
-            raise LLMSchemaError(
-                f"no parsable results after {attempts} attempt(s): {last_error}"
-            ) from last_error
-
         usage = LLMResult(
             text="",
             model=actual_model,
@@ -198,6 +251,14 @@ class LLMClient:
             usd=estimate_cost_usd(model_id, tokens_in, tokens_out),
             attempts=attempts,
         )
+        if not results and last_error is not None:
+            # The accumulated usage rides on the error so the caller can persist
+            # the spend of a failed batch (purpose="classify_failed").
+            raise LLMSchemaError(
+                f"no parsable results after {attempts} attempt(s): {last_error}",
+                usage=usage,
+            ) from last_error
+
         return BatchClassification(
             results=[results[i] for i in expected_ids if i in results],
             missing_ids=missing_ids,
@@ -208,6 +269,16 @@ class LLMClient:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _batch_schema(item_schema: Mapping[str, Any]) -> dict[str, Any]:
+    """The wire-level ``response_format`` schema: ``{"results": [<item>, ...]}``."""
+    return {
+        "type": "object",
+        "required": ["results"],
+        "properties": {"results": {"type": "array", "items": dict(item_schema)}},
+        "additionalProperties": False,
+    }
 
 
 def _require_id(item: Mapping[str, Any], id_field: str, index: int) -> Any:

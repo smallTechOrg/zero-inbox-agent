@@ -65,7 +65,11 @@ def start_triage(
         started_at=datetime.now(timezone.utc),
     )
     session.add(run)
-    session.flush()
+    # Commit before returning, not at dependency teardown: teardown happens after
+    # the response is sent, so the client could poll GET /api/runs/{id} — and the
+    # background task could open its own session — before the row was durable,
+    # and both would see a 404 for a run that was just created.
+    session.commit()
     run_id = run.id
 
     background_tasks.add_task(

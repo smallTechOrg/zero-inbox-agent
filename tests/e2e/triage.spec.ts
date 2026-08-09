@@ -24,14 +24,22 @@ test.describe('Phase 1 — clustered triage queue', () => {
     const connected = await isMailboxConnected(page);
     test.skip(
       !connected,
-      'NO MAILBOX CONNECTED — click "Connect Gmail" at http://localhost:8001/app/ and re-run. ' +
-        'This journey is unverified, not passing.',
+      'NO MAILBOX CONNECTED — click "Connect Gmail" at http://localhost:8001/app/ and re-run, ' +
+        'or export ZI_SESSION=<zi_session cookie value> to seed the session headlessly ' +
+        '(see tests/e2e/helpers.ts). This journey is unverified, not passing.',
     );
   });
 
   test('launching a run shows the progress bar and populates the clustered queue', async ({
     page,
   }) => {
+    // D14: this is the one test in the file that actually triggers a fresh live
+    // triage run (a real ~80s LLM cascade) and waits for it to land — every other
+    // test in this file reuses that same completed run via GET /api/triage/clusters
+    // defaulting to "latest". The global 60s project timeout is deliberately left
+    // sane for the rest of the suite; only this real end-to-end test gets more room.
+    test.slow();
+
     const runButton = page
       .getByRole('button', { name: /Run triage/i })
       .or(page.locator('[data-testid="run-triage"]'))

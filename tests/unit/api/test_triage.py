@@ -106,6 +106,69 @@ def test_items_require_a_session(client, seed):
     assert res.status_code == 401
 
 
+def test_a_cancelled_run_never_becomes_the_default_view_over_a_completed_one(
+    client, db, seed, sign_in
+):
+    """D11(b): a cancelled run started after a completed run must never bury
+    the completed run's decisions behind the default (no run_id) view."""
+    from datetime import timedelta
+
+    from db.models import TriageRun
+
+    completed_run = seed["alice"]["run"]
+    cancelled_run = TriageRun(
+        id="run-alice-cancelled",
+        user_id="user-alice",
+        channel_account_id=seed["alice"]["account"].id,
+        status="cancelled",
+        dry_run=True,
+        items_total=50,
+        items_decided=0,
+        counts={},
+        started_at=completed_run.started_at + timedelta(minutes=10),
+        finished_at=completed_run.started_at + timedelta(minutes=11),
+    )
+    db.add(cancelled_run)
+    db.commit()
+
+    sign_in("user-alice")
+    res = client.get("/api/triage/items")
+    assert res.status_code == 200
+    items = res.json()["data"]
+    # Still the completed run's 3 decisions, none from the (empty) cancelled run.
+    assert len(items) == 3
+    assert all(i["decision_id"].startswith("dec-alice-") for i in items)
+
+
+def test_a_running_run_can_still_be_the_default_view(client, db, seed, sign_in):
+    """A user actively watching a run in progress should still see it, not the
+    stale prior completed run."""
+    from datetime import timedelta
+
+    from db.models import TriageRun
+
+    completed_run = seed["alice"]["run"]
+    running_run = TriageRun(
+        id="run-alice-running",
+        user_id="user-alice",
+        channel_account_id=seed["alice"]["account"].id,
+        status="running",
+        dry_run=True,
+        items_total=10,
+        items_decided=0,
+        counts={},
+        started_at=completed_run.started_at + timedelta(minutes=10),
+    )
+    db.add(running_run)
+    db.commit()
+
+    sign_in("user-alice")
+    res = client.get("/api/triage/items")
+    assert res.status_code == 200
+    # The running run has no decisions yet, and it is correctly the default.
+    assert res.json()["data"] == []
+
+
 def test_approving_a_decision_records_intent_only(client, db, seed, sign_in):
     from db.models import ActionLog, Decision
 

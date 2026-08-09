@@ -14,6 +14,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
 from channels.base import ReauthRequired
+from observability.logging import get_logger
+
+_log = get_logger("gmail.oauth")
 
 GOOGLE_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -96,27 +99,51 @@ def google_oauth_config() -> GoogleOAuthConfig:
 
 
 def _flow(config: GoogleOAuthConfig) -> Flow:
+    # Google always grants `openid`, `email` and `profile` alongside the Gmail
+    # scopes we ask for, so the granted set never equals the requested set and
+    # oauthlib's strict equality check aborts the exchange. Relaxing it is the
+    # documented way to accept a superset; we still verify the Gmail scopes we
+    # depend on below.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
     return Flow.from_client_config(
         config.client_config(), scopes=config.scopes, redirect_uri=config.redirect_uri
     )
 
 
-def build_authorization_url(config: GoogleOAuthConfig, *, state: str) -> str:
-    url, _ = _flow(config).authorization_url(
+def build_authorization_url(config: GoogleOAuthConfig, *, state: str) -> tuple[str, str]:
+    """Return `(consent_url, code_verifier)`.
+
+    The Flow generates a PKCE verifier and sends only its challenge to Google.
+    The callback builds a *different* Flow object, so the verifier has to travel
+    with the request or Google rejects the exchange with "Missing code verifier".
+    """
+    flow = _flow(config)
+    url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
         state=state,
     )
-    return url
+    return url, flow.code_verifier or ""
 
 
-def exchange_code(config: GoogleOAuthConfig, code: str, state: str | None = None) -> OAuthResult:
+def exchange_code(
+    config: GoogleOAuthConfig,
+    code: str,
+    state: str | None = None,
+    code_verifier: str | None = None,
+) -> OAuthResult:
     """Trade the authorization code for tokens and confirm the mailbox address."""
     flow = _flow(config)
+    if code_verifier:
+        flow.code_verifier = code_verifier
     try:
         flow.fetch_token(code=code)
     except Exception as exc:  # oauthlib raises a wide family of errors
+        # The user only ever sees "please retry", so the cause has to reach the
+        # log or the next failure is undiagnosable. `repr(exc)` carries the
+        # oauthlib error class and description, never the code or a token.
+        _log.warning("gmail_oauth_exchange_failed", cause=repr(exc))
         raise OAuthExchangeError("Google rejected the authorization code") from exc
 
     credentials = flow.credentials

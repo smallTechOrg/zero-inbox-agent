@@ -83,6 +83,12 @@ def load_context(session: Session, user_id: str) -> dict:
     categories: list[dict] = []
     category_cls = model_for("categories")
     if category_cls is not None:
+        # Backfill safety net: a user whose default taxonomy was never seeded
+        # (e.g. connected before seeding existed) gets it on their next run, so
+        # decisions.category_id can always resolve. Idempotent — never duplicates.
+        from db.seed import ensure_default_taxonomy
+
+        ensure_default_taxonomy(session, user_id)
         for row in _rows(session, category_cls, user_id=user_id):
             categories.append(
                 {
@@ -240,6 +246,11 @@ def persist_run_results(
     category_ids: dict[str, str] = {}
     category_cls = model_for("categories")
     if category_cls is not None:
+        # Same backfill safety net as load_context: category_id must resolve even
+        # when items were supplied directly and load_context never ran seeding.
+        from db.seed import ensure_default_taxonomy
+
+        ensure_default_taxonomy(session, user_id)
         for row in _rows(session, category_cls, user_id=user_id):
             category_ids[row.key] = row.id
 
@@ -284,7 +295,6 @@ def persist_run_results(
                 "item_id": db_item_id,
                 "cluster_id": cluster_of_item.get(decision["item_id"]),
                 "category_id": category_ids.get(decision.get("category") or ""),
-                "category_key": decision.get("category"),
                 "proposed_action": decision["proposed_action"],
                 "confidence": float(decision["confidence"]),
                 "reasoning": decision["reasoning"],
@@ -349,8 +359,12 @@ def update_run(
     row = session.get(run_cls, run_id)
     if row is None:
         return
+    # `cancelled` is terminal: the user's cancel (written by the API) must never
+    # be overwritten by a graph still draining — not by "running", "completed"
+    # or anything else. Counts/cost are still recorded for the audit trail.
+    current_status = getattr(row, "status", None)
     values: dict[str, Any] = {}
-    if status is not None:
+    if status is not None and current_status != "cancelled":
         values["status"] = status
     if items_total is not None:
         values["items_total"] = items_total
@@ -364,7 +378,7 @@ def update_run(
         values["cost_usd"] = cost.get("usd", 0.0)
     if error is not None:
         values["error_message"] = error
-    if status in ("completed", "failed", "cancelled"):
+    if status in ("completed", "failed", "cancelled") and current_status != "cancelled":
         from datetime import datetime, timezone
 
         values["finished_at"] = datetime.now(timezone.utc)

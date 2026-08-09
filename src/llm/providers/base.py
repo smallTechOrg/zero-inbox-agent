@@ -65,7 +65,16 @@ class BatchClassification:
 
 
 class LLMError(RuntimeError):
-    """Any unrecoverable failure of the LLM layer after retries are exhausted."""
+    """Any unrecoverable failure of the LLM layer after retries are exhausted.
+
+    ``usage`` (when present) carries the token/cost accounting accumulated before
+    the failure so the caller can persist it — tokens spent on a failed batch are
+    still real spend and belong in the audit trail (spec/capabilities/decision-audit-trail.md).
+    """
+
+    def __init__(self, message: str = "", *, usage: "LLMResult | None" = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class LLMSchemaError(LLMError):
@@ -88,4 +97,5 @@ class LLMProvider(Protocol):
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        disable_thinking: bool = False,
     ) -> LLMResult: ...

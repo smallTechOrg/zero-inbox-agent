@@ -5,7 +5,7 @@ session — there is no separate login in v1.
 
 Routes
 ------
-GET  /auth/google/start     302 → Google consent (alias: /auth/google/login)
+GET  /auth/google/start     302 → Google consent
 GET  /auth/google/callback  code → tokens → connection + session → 302 /app/
 POST /auth/logout           clears the session cookie
 
@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
+from api.session import issue_session_token, read_session_token, set_session_cookie
 from channels.base import ReauthRequired
 from channels.gmail.oauth import (
     OAuthConfigError,
@@ -62,20 +63,19 @@ def _serializer(salt: str) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_secret_key() or "insecure-dev-key", salt=salt)
 
 
+# The session cookie is owned by `api/session.py` — it is the only module that
+# may mint or read it. This module used its own salt and payload key, so every
+# cookie it wrote failed the reader's signature check and /api/me 401'd for a
+# user who had in fact just connected successfully. Delegate, never re-implement.
 def issue_session_cookie(user_id: str) -> str:
-    return _serializer(SESSION_SALT).dumps({"user_id": user_id})
+    return issue_session_token(user_id)
 
 
 def read_session_user_id(cookie: str | None, *, max_age: int = SESSION_MAX_AGE) -> str | None:
     """Return the signed-in user id, or None if the cookie is absent/invalid."""
     if not cookie:
         return None
-    try:
-        payload = _serializer(SESSION_SALT).loads(cookie, max_age=max_age)
-    except (BadSignature, SignatureExpired):
-        return None
-    user_id = (payload or {}).get("user_id")
-    return user_id or None
+    return read_session_token(cookie)
 
 
 # --- dependencies ------------------------------------------------------
@@ -88,8 +88,10 @@ def get_connection_store() -> SqlConnectionStore:
 def get_code_exchanger():
     """Returns `(code, state) -> OAuthResult` against the real Google endpoint."""
 
-    def _exchange(code: str, state: str | None) -> OAuthResult:
-        return exchange_code(google_oauth_config(), code, state)
+    def _exchange(
+        code: str, state: str | None, code_verifier: str | None = None
+    ) -> OAuthResult:
+        return exchange_code(google_oauth_config(), code, state, code_verifier)
 
     return _exchange
 
@@ -112,7 +114,6 @@ def _secure_cookie(request: Request) -> bool:
 
 
 @router.get("/auth/google/start")
-@router.get("/auth/google/login")
 def google_start(request: Request):
     """Send the user to the real Google consent screen with a CSRF state."""
     try:
@@ -121,12 +122,14 @@ def google_start(request: Request):
         return _error("validation_error", str(exc), 422)
 
     state = secrets.token_urlsafe(24)
-    url = build_authorization_url(config, state=state)
+    url, code_verifier = build_authorization_url(config, state=state)
 
     response = RedirectResponse(url, status_code=302)
     response.set_cookie(
         STATE_COOKIE,
-        _serializer(STATE_SALT).dumps(state),
+        # The PKCE verifier rides along in the same signed, httponly cookie as
+        # the CSRF state — it must reach the callback to complete the exchange.
+        _serializer(STATE_SALT).dumps({"state": state, "code_verifier": code_verifier}),
         max_age=STATE_MAX_AGE,
         httponly=True,
         samesite="lax",
@@ -159,8 +162,10 @@ def google_callback(
     if not code:
         return _error("validation_error", "Missing authorization code", 422)
 
+    verifier = (_read_state_cookie(request) or {}).get("code_verifier") or None
+
     try:
-        result: OAuthResult = exchanger(code, state)
+        result: OAuthResult = exchanger(code, state, verifier)
     except ReauthRequired as exc:
         return _error("reauth_required", str(exc), 409)
     except OAuthExchangeError:
@@ -190,15 +195,7 @@ def google_callback(
     )
 
     response = RedirectResponse(DASHBOARD_URL, status_code=302)
-    response.set_cookie(
-        SESSION_COOKIE,
-        issue_session_cookie(user_id),
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        samesite="lax",
-        secure=_secure_cookie(request),
-        path="/",
-    )
+    set_session_cookie(response, user_id)
     response.delete_cookie(STATE_COOKIE, path="/")
     return response
 
@@ -211,12 +208,26 @@ def logout(request: Request):
     return response
 
 
-def _state_is_valid(request: Request, state: str | None) -> bool:
+def _read_state_cookie(request: Request) -> dict | None:
+    """Return the signed state payload, or None when absent/tampered/expired.
+
+    Older cookies stored the bare state string; accept both shapes so a sign-in
+    already in flight when this deployed does not hard-fail.
+    """
     signed = request.cookies.get(STATE_COOKIE)
-    if not signed or not state:
-        return False
+    if not signed:
+        return None
     try:
-        expected = _serializer(STATE_SALT).loads(signed, max_age=STATE_MAX_AGE)
+        payload = _serializer(STATE_SALT).loads(signed, max_age=STATE_MAX_AGE)
     except (BadSignature, SignatureExpired):
+        return None
+    if isinstance(payload, str):
+        return {"state": payload, "code_verifier": ""}
+    return payload if isinstance(payload, dict) else None
+
+
+def _state_is_valid(request: Request, state: str | None) -> bool:
+    payload = _read_state_cookie(request)
+    if not payload or not state:
         return False
-    return secrets.compare_digest(str(expected), state)
+    return secrets.compare_digest(str(payload.get("state", "")), state)

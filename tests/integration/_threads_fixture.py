@@ -236,8 +236,52 @@ def build_threads() -> list[dict]:
     return threads
 
 
-def seed_user(session) -> None:
-    """Seed the user, mailbox, taxonomy, active rules and sender history."""
+SMALL_TOTAL = 25
+
+
+def build_threads_small() -> list[dict]:
+    """A ~25-thread tiered slice of the big fixture — the fast per-commit gate.
+
+    Same shape discipline: every tier is exercised (rules, sender history, one
+    real LLM batch, potential deep reads), snippets are oversized and carry the
+    body marker so redaction/truncation stays under test.
+    """
+    threads = build_threads()
+    by_email: dict[str, list[dict]] = {}
+    for thread in threads:
+        by_email.setdefault(thread["from_email"], []).append(thread)
+
+    def take(predicate, count) -> list[dict]:
+        picked = [t for t in threads if predicate(t)][:count]
+        assert len(picked) == count, f"fixture slice short: wanted {count}"
+        return picked
+
+    small: list[dict] = []
+    # Tier 1: 6 Substack newsletters + 4 GitHub notifications.
+    small += take(lambda t: (t.get("list_id") or "").endswith("substack.com>"), 6)
+    small += take(lambda t: t["from_email"] == "notifications@github.com", 4)
+    # Tier 2: 3 bulk-archived + 3 from replied-to senders (never-miss).
+    small += take(lambda t: t["from_email"] == BULK_SENDER, 3)
+    small += [by_email[sender][0] for sender in REPLIED_SENDERS]
+    # Tier 3/4 (one real LLM batch): receipts, outreach, people, urgent, ambiguous.
+    small += take(lambda t: t["from_email"] == "receipts@stripe.com", 2)
+    small += take(lambda t: t["from_email"].startswith("talent"), 2)
+    small += take(lambda t: t["from_email"].startswith("sales"), 1)
+    small += take(lambda t: t["from_email"].startswith("person"), 2)
+    small += take(lambda t: t["from_email"] == "security@accounts.io", 1)
+    small += take(lambda t: t["from_email"].startswith("unknown"), 1)
+
+    assert len(small) == SMALL_TOTAL
+    assert len({t["id"] for t in small}) == SMALL_TOTAL
+    return small
+
+
+def seed_user(session, *, with_categories: bool = True) -> None:
+    """Seed the user, mailbox, taxonomy, active rules and sender history.
+
+    ``with_categories=False`` seeds everything EXCEPT the taxonomy, so a test can
+    prove the pipeline auto-seeds the six defaults for a user who never got them.
+    """
     from db.models import (
         Category,
         ChannelAccount,
@@ -262,20 +306,21 @@ def seed_user(session) -> None:
     )
     session.add(UserSettings(user_id=USER_ID, confidence_floor=0.75, dry_run=True))
 
-    for order, category in enumerate(DEFAULT_TAXONOMY):
-        session.add(
-            Category(
-                id=f"cat-{category['key']}",
-                user_id=USER_ID,
-                key=category["key"],
-                name=category["name"],
-                description=category["description"],
-                channel_label_name=f"ZeroInbox/{category['name']}",
-                default_action=category["default_action"],
-                is_default=True,
-                sort_order=order,
+    if with_categories:
+        for order, category in enumerate(DEFAULT_TAXONOMY):
+            session.add(
+                Category(
+                    id=f"cat-{category['key']}",
+                    user_id=USER_ID,
+                    key=category["key"],
+                    name=category["name"],
+                    description=category["description"],
+                    channel_label_name=f"ZeroInbox/{category['name']}",
+                    default_action=category["default_action"],
+                    is_default=True,
+                    sort_order=order,
+                )
             )
-        )
 
     session.add(
         Rule(

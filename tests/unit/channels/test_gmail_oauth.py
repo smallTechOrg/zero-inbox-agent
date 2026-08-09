@@ -41,7 +41,7 @@ def test_no_destructive_or_broad_scope_is_ever_requested():
 def test_authorization_url_carries_offline_access_forced_consent_and_the_state(oauth_config):
     from channels.gmail.oauth import build_authorization_url
 
-    url = build_authorization_url(oauth_config, state="csrf-123")
+    url, verifier = build_authorization_url(oauth_config, state="csrf-123")
     query = parse_qs(urlparse(url).query)
 
     assert urlparse(url).netloc == "accounts.google.com"
@@ -55,7 +55,7 @@ def test_authorization_url_carries_offline_access_forced_consent_and_the_state(o
 def test_the_client_secret_never_appears_in_the_authorization_url(oauth_config):
     from channels.gmail.oauth import build_authorization_url
 
-    url = build_authorization_url(oauth_config, state="csrf-123")
+    url, _ = build_authorization_url(oauth_config, state="csrf-123")
 
     assert "csecret" not in url
 

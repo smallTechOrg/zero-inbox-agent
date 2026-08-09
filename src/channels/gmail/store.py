@@ -94,6 +94,12 @@ class SqlConnectionStore:
             account.scopes = list(scopes)
             account.status = "connected"
             session.flush()
+
+            # A new user is seeded with the six default categories (idempotent —
+            # reconnecting or a user with an edited taxonomy adds nothing).
+            from db.seed import ensure_default_taxonomy
+
+            ensure_default_taxonomy(session, user.id)
             return user.id, account.id
 
     def load_refresh_token(self, *, user_id: str, connection_id: str) -> str:

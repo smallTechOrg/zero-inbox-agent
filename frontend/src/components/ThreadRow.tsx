@@ -68,12 +68,15 @@ export function ThreadRow({
           ) : null}
 
           {open ? (
-            <div className="mt-2 rounded border border-gray-200 bg-gray-50 p-2.5">
+            <div
+              data-testid="thread-detail"
+              className="mt-2 rounded border border-gray-200 bg-gray-50 p-2.5"
+            >
               <p className="text-[11px] font-semibold tracking-wide text-gray-500 uppercase">
                 Reasoning
               </p>
               <p
-                data-testid="thread-reasoning"
+                data-testid="decision-reasoning"
                 className="mt-1 text-sm whitespace-pre-wrap text-gray-800"
               >
                 {item.reasoning || 'No reasoning was recorded for this decision.'}
@@ -82,6 +85,10 @@ export function ThreadRow({
                 <div className="flex gap-1.5">
                   <dt className="font-medium">Decided by</dt>
                   <dd className="font-mono">{item.decided_by}</dd>
+                </div>
+                <div className="flex gap-1.5">
+                  <dt className="font-medium">Category</dt>
+                  <dd className="font-mono">{item.category ?? 'uncategorised'}</dd>
                 </div>
                 {item.rule_name ? (
                   <div className="flex gap-1.5">

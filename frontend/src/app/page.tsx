@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, AUTH_START_URL } from '@/lib/api'
-import type { Cluster, Me, Run } from '@/lib/types'
+import { isRunActive, type Cluster, type Me, type Run } from '@/lib/types'
 import { DryRunBanner, LeftRail, StatusPill } from '@/components/Chrome'
 import { ConnectCard } from '@/components/ConnectCard'
 import { ClusterCard } from '@/components/ClusterCard'
@@ -11,7 +11,8 @@ import { RunProgress } from '@/components/RunProgress'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
 import { StubButton, StubPanel } from '@/components/Stub'
 
-const RUN_ACTIVE = (s: string) => s === 'running' || s === 'queued'
+/** Anything that is not a terminal status (completed / failed / cancelled). */
+const RUN_ACTIVE = isRunActive
 
 export default function Dashboard() {
   const [me, setMe] = useState<Me | null>(null)

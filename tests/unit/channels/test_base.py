@@ -72,7 +72,18 @@ def test_snippet_longer_than_200_chars_is_truncated():
 def test_channel_item_serialises_to_the_items_column_names():
     item = _minimal_item()
 
-    assert set(item.model_dump()) == ITEMS_TABLE_FIELDS
+    # `id` is computed, not a declared field: the graph and persistence layer key
+    # every item on it, and it maps to the `items.id` column.
+    assert set(item.model_dump()) == ITEMS_TABLE_FIELDS | {"id"}
+
+
+def test_channel_item_id_is_the_key_the_triage_graph_uses():
+    """Regression: adapters exposed only `external_thread_id` while the graph and
+    the LLM verdict map addressed `item["id"]`, so every run died with KeyError."""
+    item = _minimal_item()
+
+    assert item.id == item.external_thread_id
+    assert item.model_dump()["id"] == item.external_thread_id
 
 
 def test_channel_adapter_cannot_be_instantiated_directly():

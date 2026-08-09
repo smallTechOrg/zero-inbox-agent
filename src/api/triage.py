@@ -28,12 +28,24 @@ class DecisionUpdate(BaseModel):
     status: str
 
 
+_DEFAULT_VIEW_STATUSES = ("completed", "running")
+
+
 def _latest_run_id(session: Session, user_id: str) -> str | None:
+    """The run worth showing by default.
+
+    Restricted to ``completed``/``running`` — a cancelled or failed run must
+    never silently become the default view and bury a prior good completed
+    run. A user actively watching a run in progress still sees it live.
+    """
     from db.models import TriageRun
 
     return session.execute(
         select(TriageRun.id)
-        .where(TriageRun.user_id == user_id)
+        .where(
+            TriageRun.user_id == user_id,
+            TriageRun.status.in_(_DEFAULT_VIEW_STATUSES),
+        )
         .order_by(TriageRun.started_at.desc())
         .limit(1)
     ).scalar_one_or_none()
