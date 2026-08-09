@@ -80,6 +80,13 @@ class GmailLabelManager:
                 return label
         return None
 
+    def label_count(self, label_id: str) -> int:
+        """Live thread count for one label — a single cheap Gmail call, no listing."""
+        label = self._execute(
+            self._service.users().labels().get(userId="me", id=label_id)
+        )
+        return int((label or {}).get("threadsTotal") or 0)
+
     # --- write --------------------------------------------------------
     def ensure_label(self, name: str) -> dict:
         """Idempotent: returns the existing label if present, else creates it."""

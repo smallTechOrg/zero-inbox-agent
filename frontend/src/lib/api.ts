@@ -67,6 +67,15 @@ export const api = {
   /** The most recent completed/running run, or null if none exists yet. */
   latestRun: () => request<Run | null>('/api/runs/latest'),
 
+  /** Live counts straight from Gmail: total left in inbox, plus a per-category
+   * label breakdown. Each count is one cheap labels().get() call server-side. */
+  inboxSummary: () =>
+    request<{
+      inbox_total: number
+      needs_your_call: number
+      categories: { key: string; name: string; count: number; channel_label_name: string }[]
+    }>('/api/inbox-summary'),
+
   cancelRun: (runId: string) =>
     request<{ status: string }>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
 

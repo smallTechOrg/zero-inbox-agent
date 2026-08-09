@@ -22,7 +22,7 @@ from db.session import get_session
 
 router = APIRouter()
 
-MAX_LIMIT = 500
+MAX_LIMIT = 2000
 DEFAULT_LIMIT = 200
 
 

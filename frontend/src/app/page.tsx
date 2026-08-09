@@ -9,6 +9,7 @@ import { ClusterCard, type ClusterCardHandle } from '@/components/ClusterCard'
 import SettingsPanel from '@/components/Settings'
 import { NeedsYourCall } from '@/components/NeedsYourCall'
 import { RunProgress } from '@/components/RunProgress'
+import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
 import { StubButton, StubPanel } from '@/components/Stub'
 
@@ -316,6 +317,8 @@ export default function Dashboard() {
             <ConnectCard />
           ) : (
             <>
+              <InboxSummary refreshKey={refreshKey} />
+
               {runError ? <ErrorState error={runError} onRetry={() => void startTriage()} /> : null}
 
               {run ? (

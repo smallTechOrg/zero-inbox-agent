@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api._common import VALIDATION_ERROR, api_error, not_found, ok
@@ -142,3 +143,66 @@ def sync_labels_route(
     label_manager = _label_manager_for_user(session, user_id)
     results = sync_labels(session, user_id, label_manager)
     return ok({"results": results})
+
+
+@router.get("/api/inbox-summary")
+def inbox_summary(
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Live counts, straight from Gmail — how close to zero the inbox actually
+    is right now, and how much sits under each category label.
+
+    Each count is one ``labels().get()`` call (Gmail returns ``threadsTotal``
+    directly), never a listing — cheap even with a dozen categories.
+    """
+    from db.models import Category, Decision
+
+    label_manager = _label_manager_for_user(session, user_id)
+    inbox_total = label_manager.label_count("INBOX")
+
+    categories = session.execute(
+        select(Category)
+        .where(Category.user_id == user_id)
+        .order_by(Category.sort_order, Category.name)
+    ).scalars().all()
+
+    by_category = []
+    for category in categories:
+        count = label_manager.label_count(category.channel_label_id) if category.channel_label_id else 0
+        by_category.append(
+            {
+                "key": category.key,
+                "name": category.name,
+                "count": count,
+                "channel_label_name": category.channel_label_name,
+            }
+        )
+
+    # Scoped to the latest run only — a bare `status == needs_your_call` filter
+    # counts every decision ever made across every historical run, which
+    # inflates without bound as the same inbox gets re-triaged over time.
+    from api.triage import _latest_run_id
+
+    latest_run_id = _latest_run_id(session, user_id)
+    needs_your_call = (
+        session.execute(
+            select(func.count())
+            .select_from(Decision)
+            .where(
+                Decision.user_id == user_id,
+                Decision.run_id == latest_run_id,
+                Decision.status == "needs_your_call",
+            )
+        ).scalar_one()
+        if latest_run_id
+        else 0
+    )
+
+    return ok(
+        {
+            "inbox_total": inbox_total,
+            "needs_your_call": needs_your_call,
+            "categories": by_category,
+        }
+    )
