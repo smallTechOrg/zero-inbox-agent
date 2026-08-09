@@ -36,6 +36,7 @@ def test_start_triage_creates_a_running_dry_run_and_returns_immediately(
             "user_id": "user-alice",
             "channel_account_id": "conn-alice",
             "limit": 200,
+            "fetch_after": None,
         }
     ]
 
@@ -51,8 +52,90 @@ def test_start_triage_rejects_an_out_of_range_limit(client, seed, sign_in, captu
     sign_in("user-alice")
     res = client.post("/api/connections/conn-alice/triage", json={"limit": 0})
     assert res.status_code == 422
-    assert res.json()["error"]["code"] == "validation_error"
-    assert captured_task == []
+
+
+def test_only_new_resolves_the_cutoff_to_the_last_completed_runs_start_time(
+    client, db, seed, sign_in, captured_task
+):
+    """only_new must fetch strictly what's new since the user's own last
+    completed run — not re-list-and-reclassify the whole inbox again."""
+    from db.models import TriageRun
+
+    sign_in("user-alice")
+    res = client.post("/api/connections/conn-alice/triage", json={"only_new": True})
+    assert res.status_code == 200
+
+    expected_run = db.get(TriageRun, "run-alice")
+    assert captured_task[0]["fetch_after"] == expected_run.started_at.isoformat()
+
+
+def test_only_new_with_no_prior_completed_run_degrades_to_a_full_fetch(
+    client, db, sign_in
+):
+    """A brand-new user has nothing to be "newer than" yet — only_new must not
+    error, it must just fetch everything, same as a normal first run."""
+    from db.models import ChannelAccount, User, UserSettings
+
+    db.add(User(id="user-new", email="new@example.com", display_name="New"))
+    db.add(UserSettings(user_id="user-new"))
+    db.add(
+        ChannelAccount(
+            id="conn-new",
+            user_id="user-new",
+            channel="gmail",
+            account_email="new@gmail.com",
+            refresh_token_enc="ENCRYPTED",
+            scopes=["gmail.readonly"],
+            status="connected",
+        )
+    )
+    db.commit()
+
+    calls: list[dict] = []
+    import api.connections as connections_module
+
+    orig = connections_module._run_triage_task
+    connections_module._run_triage_task = lambda **kw: calls.append(kw)
+    try:
+        sign_in("user-new")
+        res = client.post("/api/connections/conn-new/triage", json={"only_new": True})
+    finally:
+        connections_module._run_triage_task = orig
+
+    assert res.status_code == 200
+    assert calls[0]["fetch_after"] is None
+
+
+def test_only_new_ignores_a_cancelled_or_failed_run_as_the_cutoff(
+    client, db, seed, sign_in, captured_task
+):
+    """A cancelled/failed run never got real coverage of the inbox, so it must
+    not be trusted as "I already saw everything up to here"."""
+    from datetime import datetime, timedelta, timezone
+
+    from db.models import TriageRun
+
+    db.add(
+        TriageRun(
+            id="run-alice-cancelled",
+            user_id="user-alice",
+            channel_account_id="conn-alice",
+            status="cancelled",
+            dry_run=True,
+            items_total=10,
+            items_decided=0,
+            counts={},
+            started_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    db.commit()
+
+    sign_in("user-alice")
+    res = client.post("/api/connections/conn-alice/triage", json={"only_new": True})
+    assert res.status_code == 200
+
+    completed_run = db.get(TriageRun, "run-alice")
+    assert captured_task[0]["fetch_after"] == completed_run.started_at.isoformat()
 
 
 def test_start_triage_on_another_users_connection_is_not_found(

@@ -391,11 +391,25 @@ def fetch_items(state: TriageState) -> dict:
             user_id=state["user_id"], channel_account_id=state["channel_account_id"]
         )
         run_id = state.get("run_id")
+        fetch_after = state.get("fetch_after")
+        after_dt = None
+        if fetch_after:
+            from datetime import datetime, timezone
+
+            after_dt = datetime.fromisoformat(fetch_after)
+            # TriageRun.started_at round-trips through SQLite naive (no tzinfo),
+            # while ChannelItem.internal_date is always UTC-aware (Gmail's
+            # internalDate is parsed with tz=timezone.utc) — comparing the two
+            # naively raises TypeError. SQLite never stored anything but UTC
+            # here (see db/session.py / _now()), so naive-means-UTC is correct.
+            if after_dt.tzinfo is None:
+                after_dt = after_dt.replace(tzinfo=timezone.utc)
         items = [
             i if isinstance(i, dict) else i.model_dump()
             for i in adapter.list_threads(
                 limit=state.get("limit", 200),
                 cancel_check=(lambda: _run_is_cancelled(run_id)) if run_id else None,
+                after=after_dt,
             )
         ]
         # The progress bar's denominator, written the moment the total is known —

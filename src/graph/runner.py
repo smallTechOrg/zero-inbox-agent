@@ -58,11 +58,15 @@ def execute_triage(
     run_id: str | None = None,
     items: list[dict] | None = None,
     kind: str = "incremental",
+    fetch_after: str | None = None,
 ) -> TriageState:
     """Run the cascade and return the final graph state (run_id included).
 
     ``items`` lets a caller supply already-ingested threads instead of having
     ``fetch_items`` pull them from the channel adapter.
+
+    ``fetch_after`` (ISO timestamp, optional) restricts the fetch to threads
+    newer than that cutoff — an incremental "what's new" run.
     """
     resolved_run_id = _ensure_run(
         run_id=run_id,
@@ -78,6 +82,7 @@ def execute_triage(
         "channel_account_id": channel_account_id,
         "limit": limit,
         "dry_run": dry_run,
+        "fetch_after": fetch_after,
         "status": "running",
         "error": None,
         "resolved": [],
@@ -119,6 +124,7 @@ def run_triage(
     dry_run: bool = True,
     run_id: str | None = None,
     items: list[dict] | None = None,
+    fetch_after: str | None = None,
 ) -> str:
     """Creates (or resumes) a TriageRun, invokes the triage graph, returns ``run_id``."""
     final = execute_triage(
@@ -128,5 +134,6 @@ def run_triage(
         dry_run=dry_run,
         run_id=run_id,
         items=items,
+        fetch_after=fetch_after,
     )
     return final["run_id"]

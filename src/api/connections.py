@@ -28,6 +28,14 @@ DEFAULT_LIMIT = 200
 
 class TriageRequest(BaseModel):
     limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT)
+    only_new: bool = Field(
+        default=False,
+        description=(
+            "Fetch only threads newer than the connection's last completed run, "
+            "instead of re-listing and re-classifying the current top `limit` "
+            "inbox threads from scratch."
+        ),
+    )
 
 
 @router.post("/api/connections/{connection_id}/triage")
@@ -38,9 +46,12 @@ def start_triage(
     user_id: str = Depends(require_user_id),
     session: Session = Depends(get_session),
 ) -> dict:
+    from sqlalchemy import select
+
     from db.models import ChannelAccount, TriageRun
 
-    limit = (req or TriageRequest()).limit
+    body = req or TriageRequest()
+    limit = body.limit
 
     account = session.get(ChannelAccount, connection_id)
     # Scope check and existence check are the same check: another user's connection
@@ -51,6 +62,26 @@ def start_triage(
         raise api_error(REAUTH_REQUIRED, "Reconnect this Gmail account to run triage.")
     if account.status == "revoked":
         raise api_error(REAUTH_REQUIRED, "This Gmail connection was revoked. Reconnect it.")
+
+    fetch_after: str | None = None
+    if body.only_new:
+        # The cutoff is the START of the last completed run on THIS connection, not
+        # its finish time — a thread already mid-flight when that run started (and
+        # thus already seen) must not slip through just because it was decided a
+        # few minutes into the run.
+        last_started = session.execute(
+            select(TriageRun.started_at)
+            .where(
+                TriageRun.channel_account_id == account.id,
+                TriageRun.status == "completed",
+            )
+            .order_by(TriageRun.started_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if last_started is not None:
+            fetch_after = last_started.isoformat()
+        # No prior completed run: only_new degrades to a normal full fetch —
+        # there is nothing to be "newer than" yet.
 
     run = TriageRun(
         id=str(uuid4()),
@@ -78,11 +109,19 @@ def start_triage(
         user_id=user_id,
         channel_account_id=account.id,
         limit=limit,
+        fetch_after=fetch_after,
     )
     return ok({"run_id": run_id})
 
 
-def _run_triage_task(*, run_id: str, user_id: str, channel_account_id: str, limit: int) -> None:
+def _run_triage_task(
+    *,
+    run_id: str,
+    user_id: str,
+    channel_account_id: str,
+    limit: int,
+    fetch_after: str | None = None,
+) -> None:
     """Background worker. Never raises — a failure is recorded on the run row."""
     from db.session import create_db_session
 
@@ -95,6 +134,7 @@ def _run_triage_task(*, run_id: str, user_id: str, channel_account_id: str, limi
             limit=limit,
             dry_run=True,
             run_id=run_id,
+            fetch_after=fetch_after,
         )
     except Exception as exc:  # noqa: BLE001 — a crashed run must still be visible to the UI
         from db.models import TriageRun

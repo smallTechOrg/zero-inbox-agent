@@ -283,6 +283,58 @@ def test_cannot_bulk_approve_another_users_cluster(client, seed, sign_in):
     assert res.status_code == 404
 
 
+def test_review_all_approves_every_cluster_in_the_run_except_needs_your_call(
+    client, db, seed, sign_in
+):
+    """The "get to zero inbox fast" sweep: one call approves every decision
+    across every cluster in a run, same needs_your_call carve-out as the
+    per-cluster endpoint."""
+    from db.models import Decision
+
+    sign_in("user-alice")
+    res = client.post("/api/triage/runs/run-alice/review-all", json={"status": "approved"})
+    assert res.status_code == 200
+    assert res.json()["data"] == {"updated": 2, "skipped_needs_your_call": 1}
+
+    db.expire_all()
+    alice = db.query(Decision).filter(Decision.user_id == "user-alice").all()
+    by_id = {d.id: d for d in alice}
+    assert by_id["dec-alice-0"].status == "approved"
+    assert by_id["dec-alice-1"].status == "approved"
+    assert by_id["dec-alice-2"].status == "needs_your_call"
+    # Bob's decisions, in a different run, are untouched.
+    bob = db.query(Decision).filter(Decision.user_id == "user-bob").all()
+    assert {d.status for d in bob} == {"proposed", "needs_your_call"}
+
+
+def test_review_all_is_idempotent(client, seed, sign_in):
+    sign_in("user-alice")
+    client.post("/api/triage/runs/run-alice/review-all", json={"status": "approved"})
+    second = client.post(
+        "/api/triage/runs/run-alice/review-all", json={"status": "approved"}
+    )
+    assert second.json()["data"] == {"updated": 0, "skipped_needs_your_call": 1}
+
+
+def test_review_all_rejects_an_invalid_status(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/runs/run-alice/review-all", json={"status": "nope"})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "validation_error"
+
+
+def test_cannot_review_all_on_another_users_run(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/runs/run-bob/review-all", json={"status": "approved"})
+    assert res.status_code == 404
+
+
+def test_review_all_on_unknown_run_is_not_found(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/runs/no-such-run/review-all", json={"status": "approved"})
+    assert res.status_code == 404
+
+
 def test_categories_are_user_scoped(client, seed, sign_in):
     sign_in("user-alice")
     res = client.get("/api/categories")

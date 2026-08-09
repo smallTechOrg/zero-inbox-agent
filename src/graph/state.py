@@ -13,6 +13,7 @@ class TriageState(TypedDict, total=False):
     channel_account_id: str
     limit: int
     dry_run: bool
+    fetch_after: str | None  # ISO timestamp; only threads newer than this are fetched
 
     # per-user context, loaded once
     categories: list[dict]

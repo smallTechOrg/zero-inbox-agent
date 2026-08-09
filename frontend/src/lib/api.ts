@@ -56,10 +56,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   me: () => request<Me>('/api/me'),
 
-  startTriage: (connectionId: string, limit = 200) =>
+  startTriage: (connectionId: string, limit = 200, onlyNew = false) =>
     request<{ run_id: string }>(`/api/connections/${connectionId}/triage`, {
       method: 'POST',
-      body: JSON.stringify({ limit }),
+      body: JSON.stringify({ limit, only_new: onlyNew }),
     }),
 
   run: (runId: string) => request<Run>(`/api/runs/${runId}`),
@@ -86,6 +86,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status }),
     }),
+
+  /** Approve/reject every cluster in a run in one call — needs_your_call is
+   * always excluded server-side, same rule as the per-cluster endpoint. */
+  reviewAllClusters: (runId: string, status: 'approved' | 'rejected') =>
+    request<{ updated: number; skipped_needs_your_call: number }>(
+      `/api/triage/runs/${runId}/review-all`,
+      { method: 'POST', body: JSON.stringify({ status }) },
+    ),
 
   decideCluster: (clusterId: string, status: 'approved' | 'rejected') =>
     request<{ updated: number }>(`/api/triage/clusters/${clusterId}/approve`, {

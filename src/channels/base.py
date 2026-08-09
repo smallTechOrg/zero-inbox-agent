@@ -111,12 +111,17 @@ class ChannelAdapter(ABC):
         limit: int = 200,
         query: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        after: datetime | None = None,
     ) -> list[ChannelItem]:
         """Most recent inbox threads, newest first, headers/snippet only.
 
         ``cancel_check`` (optional) is polled between page/thread fetches so a
         cancelled run can stop mid-fetch instead of draining the whole listing
         before the graph ever notices the cancel.
+
+        ``after`` (optional) stops the scan once a thread's own internal date
+        reaches that cutoff — an incremental "what's new since my last run"
+        fetch, cheaper than re-listing and re-classifying the whole inbox.
         """
 
     @abstractmethod

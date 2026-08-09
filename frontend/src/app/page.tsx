@@ -86,6 +86,7 @@ export default function Dashboard() {
   }, [loadMe])
 
   const connection = me?.connections?.find(c => c.status !== 'revoked') ?? me?.connections?.[0]
+  const dryRun = me?.settings.dry_run ?? true
 
   const loadClusters = useCallback(async (runId: string) => {
     setClustersLoading(true)
@@ -145,23 +146,67 @@ export default function Dashboard() {
     }
   }, [run, loadClusters])
 
-  const startTriage = useCallback(async () => {
-    if (!connection) return
-    setStarting(true)
+  const startTriage = useCallback(
+    async (onlyNew = false) => {
+      if (!connection) return
+      setStarting(true)
+      setRunError(null)
+      try {
+        const { run_id } = await api.startTriage(connection.id, 200, onlyNew)
+        const fresh = await api.run(run_id)
+        setRun(fresh)
+        setClusters(null)
+        void loadClusters(run_id)
+        setRefreshKey(k => k + 1)
+      } catch (e) {
+        setRunError(e)
+      } finally {
+        setStarting(false)
+      }
+    },
+    [connection, loadClusters],
+  )
+
+  const [approvingAll, setApprovingAll] = useState(false)
+  const [approveAllResult, setApproveAllResult] = useState<string | null>(null)
+
+  const approveAllClusters = useCallback(async () => {
+    if (!run) return
+    setApprovingAll(true)
+    setApproveAllResult(null)
     setRunError(null)
     try {
-      const { run_id } = await api.startTriage(connection.id, 200)
-      const fresh = await api.run(run_id)
-      setRun(fresh)
-      setClusters(null)
-      void loadClusters(run_id)
+      const res = await api.reviewAllClusters(run.id, 'approved')
+      let message =
+        res.updated === 0
+          ? 'Nothing left to approve — everything visible is already decided.'
+          : dryRun
+            ? `${res.updated} thread(s) approved — recorded only, Gmail untouched (dry run is on).`
+            : `${res.updated} thread(s) approved — archiving in Gmail now…`
+      if (res.skipped_needs_your_call > 0) {
+        message += ` ${res.skipped_needs_your_call} thread(s) below the confidence floor were left for you to decide individually.`
+      }
+      if (!dryRun && res.updated > 0) {
+        // Same pattern ClusterCard uses: re-read what actually ended up
+        // approved, then apply — needs_your_call items were already excluded
+        // server-side, so nothing here can archive something below the floor.
+        const approvedItems = await api.itemsByStatus(run.id, 'approved')
+        const ids = approvedItems.map(i => i.decision_id)
+        if (ids.length > 0) {
+          const results = await api.applyDecisions(ids)
+          const archived = results.filter(r => r.action_log_id).length
+          message = `${archived} thread(s) approved and archived in Gmail.`
+        }
+      }
+      setApproveAllResult(message)
+      void loadClusters(run.id)
       setRefreshKey(k => k + 1)
     } catch (e) {
       setRunError(e)
     } finally {
-      setStarting(false)
+      setApprovingAll(false)
     }
-  }, [connection, loadClusters])
+  }, [run, dryRun, loadClusters])
 
   const cancelRun = useCallback(async () => {
     if (!run) return
@@ -175,8 +220,6 @@ export default function Dashboard() {
       setCancelling(false)
     }
   }, [run])
-
-  const dryRun = me?.settings.dry_run ?? true
 
   const statusTone = !run
     ? 'idle'
@@ -213,15 +256,29 @@ export default function Dashboard() {
           </StatusPill>
           <StubButton label="Model: auto" phase={3} />
           {connection ? (
-            <button
-              type="button"
-              data-testid="run-triage"
-              onClick={() => void startTriage()}
-              disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
-              className="rounded-lg bg-gray-900 px-3.5 py-1.5 text-sm font-semibold text-white hover:bg-gray-700 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
-            >
-              {starting ? 'Starting…' : 'Run triage (200 threads)'}
-            </button>
+            <>
+              <button
+                type="button"
+                data-testid="run-triage"
+                onClick={() => void startTriage(false)}
+                disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
+                className="rounded-lg bg-gray-900 px-3.5 py-1.5 text-sm font-semibold text-white hover:bg-gray-700 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
+              >
+                {starting ? 'Starting…' : 'Run triage (200 threads)'}
+              </button>
+              {run ? (
+                <button
+                  type="button"
+                  data-testid="run-triage-new-only"
+                  title="Only fetch and classify threads newer than your last completed run — skips re-listing mail you've already seen."
+                  onClick={() => void startTriage(true)}
+                  disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
+                  className="rounded-lg border border-gray-300 bg-white px-3.5 py-1.5 text-sm font-semibold text-gray-800 hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
+                >
+                  {starting ? 'Starting…' : 'Fetch new mail only'}
+                </button>
+              ) : null}
+            </>
           ) : (
             <a
               href={AUTH_START_URL}
@@ -270,17 +327,39 @@ export default function Dashboard() {
               ) : null}
 
               <section aria-label="Triage queue" className="space-y-2">
-                <div className="flex items-baseline justify-between gap-2">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <h2 className="text-sm font-bold tracking-wide text-gray-700 uppercase">
                     Triage queue
                   </h2>
-                  {clusters ? (
-                    <p className="text-xs text-gray-500">
-                      {clusters.length} clusters ·{' '}
-                      {clusters.reduce((n, c) => n + c.item_count, 0)} threads
-                    </p>
-                  ) : null}
+                  <div className="flex items-center gap-3">
+                    {clusters ? (
+                      <p className="text-xs text-gray-500">
+                        {clusters.length} clusters ·{' '}
+                        {clusters.reduce((n, c) => n + c.item_count, 0)} threads
+                      </p>
+                    ) : null}
+                    {clusters && clusters.length > 0 && run ? (
+                      <button
+                        type="button"
+                        data-testid="approve-all-clusters"
+                        title="Approve every proposed cluster in this run. Threads below the confidence floor stay in Needs your call for you to decide individually."
+                        onClick={() => void approveAllClusters()}
+                        disabled={approvingAll || RUN_ACTIVE(run.status)}
+                        className="rounded-lg bg-emerald-700 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-800 focus:ring-2 focus:ring-emerald-400 focus:outline-none disabled:opacity-50"
+                      >
+                        {approvingAll ? 'Approving…' : 'Approve all'}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
+                {approveAllResult ? (
+                  <p
+                    data-testid="approve-all-result"
+                    className="rounded-md bg-emerald-50 px-3 py-2 text-xs text-emerald-800"
+                  >
+                    {approveAllResult}
+                  </p>
+                ) : null}
 
                 {!run ? (
                   <EmptyState

@@ -109,45 +109,25 @@ class GmailAdapter(ChannelAdapter):
         limit: int = 200,
         query: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        after: datetime | None = None,
     ) -> list[ChannelItem]:
+        """Most recent inbox threads, newest first.
+
+        ``after`` (optional) stops paging as soon as a thread's own
+        ``internal_date`` is at or before that cutoff. Gmail's thread listing is
+        ordered by each thread's most recent message, so once we cross the
+        cutoff every remaining thread is at least as old — the scan can stop
+        rather than re-fetching metadata for threads already seen on a prior
+        run. A thread that received a genuinely new reply since ``after``
+        legitimately reappears (its internal_date moved forward), which is the
+        correct "what's new" behaviour, not a bug.
+        """
         if limit < 0:
             raise ChannelError("limit must be >= 0")
-        thread_ids = self._list_thread_ids(limit=limit, query=query, cancel_check=cancel_check)
 
         items: list[ChannelItem] = []
-        for thread_id in thread_ids:
-            if cancel_check is not None and cancel_check():
-                break
-            try:
-                thread = self._execute(
-                    self._service.users()
-                    .threads()
-                    .get(
-                        userId="me",
-                        id=thread_id,
-                        format="metadata",
-                        metadataHeaders=WANTED_HEADERS,
-                    )
-                )
-            except ChannelError:
-                # One unreadable thread must not fail the whole listing.
-                continue
-            try:
-                items.append(normalize_thread(thread, redactor=self._redactor))
-            except ChannelError:
-                continue
-        return items
-
-    def _list_thread_ids(
-        self,
-        *,
-        limit: int,
-        query: str | None,
-        cancel_check: Callable[[], bool] | None = None,
-    ) -> list[str]:
-        ids: list[str] = []
         page_token: str | None = None
-        while len(ids) < limit:
+        while len(items) < limit:
             if cancel_check is not None and cancel_check():
                 break
             page = self._execute(
@@ -156,17 +136,47 @@ class GmailAdapter(ChannelAdapter):
                 .list(
                     userId="me",
                     labelIds=["INBOX"],
-                    maxResults=min(GMAIL_PAGE_SIZE, limit - len(ids)),
+                    maxResults=min(GMAIL_PAGE_SIZE, limit - len(items)),
                     pageToken=page_token,
                     q=query,
                 )
             )
             batch = (page or {}).get("threads") or []
-            ids.extend(t["id"] for t in batch if t.get("id"))
-            page_token = (page or {}).get("nextPageToken")
-            if not page_token or not batch:
+            if not batch:
                 break
-        return ids[:limit]
+            for entry in batch:
+                if cancel_check is not None and cancel_check():
+                    return items
+                thread_id = entry.get("id")
+                if not thread_id:
+                    continue
+                try:
+                    thread = self._execute(
+                        self._service.users()
+                        .threads()
+                        .get(
+                            userId="me",
+                            id=thread_id,
+                            format="metadata",
+                            metadataHeaders=WANTED_HEADERS,
+                        )
+                    )
+                except ChannelError:
+                    # One unreadable thread must not fail the whole listing.
+                    continue
+                try:
+                    item = normalize_thread(thread, redactor=self._redactor)
+                except ChannelError:
+                    continue
+                if after is not None and item.internal_date <= after:
+                    return items
+                items.append(item)
+                if len(items) >= limit:
+                    break
+            page_token = (page or {}).get("nextPageToken")
+            if not page_token:
+                break
+        return items[:limit]
 
     def fetch_thread_body(self, external_thread_id: str) -> str:
         """Full thread text, in memory only — the caller must never persist it."""

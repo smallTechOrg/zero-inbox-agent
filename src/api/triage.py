@@ -196,6 +196,29 @@ def review_decision(
     return ok(_decision_payload(decision, item, category, rule))
 
 
+def _bulk_review(decisions, new_status: str) -> dict:
+    """Shared by the per-cluster and run-wide bulk endpoints.
+
+    "Needs your call" decisions are never bulk-acted on: the spec
+    (spec/capabilities/triage-queue-review.md) requires each member to receive
+    an individual decision, so bulk approval silently skips them rather than
+    stalling the rest of the batch. They remain visible in the queue.
+    """
+    now = datetime.now(timezone.utc)
+    updated = 0
+    skipped = 0
+    for decision in decisions:
+        if decision.status == "needs_your_call":
+            skipped += 1  # never bulk-acted — user must decide individually
+            continue
+        if decision.status == new_status:
+            continue
+        decision.status = new_status
+        decision.decided_at = now
+        updated += 1
+    return {"updated": updated, "skipped_needs_your_call": skipped}
+
+
 @router.post("/api/triage/clusters/{cluster_id}/approve")
 def review_cluster(
     cluster_id: str,
@@ -217,23 +240,31 @@ def review_cluster(
         )
     ).scalars().all()
 
-    # "Needs your call" decisions are never bulk-approved: the spec
-    # (spec/capabilities/triage-queue-review.md) requires each member to receive
-    # an individual decision, so bulk approval silently skips them rather than
-    # stalling the rest of the cluster. They remain visible in the queue.
-    now = datetime.now(timezone.utc)
-    updated = 0
-    skipped = 0
-    for decision in decisions:
-        if decision.status == "needs_your_call":
-            skipped += 1  # never bulk-acted — user must decide individually
-            continue
-        if decision.status == new_status:
-            continue
-        decision.status = new_status
-        decision.decided_at = now
-        updated += 1
-    return ok({"updated": updated, "skipped_needs_your_call": skipped})
+    return ok(_bulk_review(decisions, new_status))
+
+
+@router.post("/api/triage/runs/{run_id}/review-all")
+def review_all_clusters(
+    run_id: str,
+    body: DecisionUpdate,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Approve or reject every cluster in one run in a single call — the "get to
+    zero inbox fast" sweep, instead of clicking Approve on each cluster."""
+    from db.models import Decision, TriageRun
+
+    new_status = _validate_review_status(body.status)
+
+    run = session.get(TriageRun, run_id)
+    if run is None or run.user_id != user_id:
+        raise not_found("Run")
+
+    decisions = session.execute(
+        select(Decision).where(Decision.user_id == user_id, Decision.run_id == run_id)
+    ).scalars().all()
+
+    return ok(_bulk_review(decisions, new_status))
 
 
 @router.get("/api/categories")

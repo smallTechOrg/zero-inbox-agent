@@ -294,26 +294,110 @@ class TestCancellation:
 # --- default-view exclusion of cancelled/failed runs (D11b) ----------------
 
 
+class TestFetchAfterCutoff:
+    def test_a_naive_iso_cutoff_from_sqlite_does_not_crash_the_tz_aware_comparison(
+        self, monkeypatch
+    ):
+        """Regression: TriageRun.started_at round-trips through SQLite naive (no
+        tzinfo), while ChannelItem.internal_date is always UTC-aware — comparing
+        them raised `TypeError: can't compare offset-naive and offset-aware
+        datetimes`, so every only_new run failed outright."""
+        import channels
+
+        captured: dict = {}
+
+        class FakeAdapter:
+            def list_threads(self, *, limit, cancel_check=None, after=None):
+                captured["after"] = after
+                return []
+
+            def sender_history(self, *, limit=500):
+                return {}
+
+        monkeypatch.setattr(channels, "get_adapter", lambda **kw: FakeAdapter())
+
+        naive_cutoff = datetime(2026, 8, 9, 12, 0, 0)  # no tzinfo, as SQLite returns it
+        out = nodes.fetch_items(
+            _state(items=[], fetch_after=naive_cutoff.isoformat())
+        )
+
+        assert out["error"] is None
+        assert captured["after"].tzinfo is not None
+        assert captured["after"] == naive_cutoff.replace(tzinfo=timezone.utc)
+
+    def test_an_already_aware_cutoff_passes_through_unchanged(self, monkeypatch):
+        import channels
+
+        captured: dict = {}
+
+        class FakeAdapter:
+            def list_threads(self, *, limit, cancel_check=None, after=None):
+                captured["after"] = after
+                return []
+
+            def sender_history(self, *, limit=500):
+                return {}
+
+        monkeypatch.setattr(channels, "get_adapter", lambda **kw: FakeAdapter())
+
+        aware_cutoff = datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc)
+        out = nodes.fetch_items(_state(items=[], fetch_after=aware_cutoff.isoformat()))
+
+        assert out["error"] is None
+        assert captured["after"] == aware_cutoff
+
+
 class TestFetchCancelDuringPagination:
     def test_cancel_check_stops_gmail_thread_id_pagination_early(self):
         """D12: cancellation must be observed inside the fetch/pagination loop,
-        not only at batch boundaries after the whole listing has drained."""
+        not only at batch boundaries after the whole listing has drained.
+
+        list_threads() now merges listing + per-thread metadata fetch into one
+        loop (needed for the `after` early-exit cutoff), so the fake service
+        must also answer threads().get(), not just threads().list()."""
+        from datetime import datetime, timezone
+
         from channels.gmail.adapter import GmailAdapter
 
-        calls = {"n": 0}
+        calls = {"list": 0, "get": 0}
+
+        def _thread_payload(n: int) -> dict:
+            return {
+                "id": f"t{n}",
+                "messages": [
+                    {
+                        "id": f"m{n}",
+                        "labelIds": ["INBOX"],
+                        "internalDate": str(1_700_000_000_000 + n),
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": f"thread {n}"},
+                                {"name": "From", "value": "sender@example.com"},
+                            ]
+                        },
+                        "snippet": "hi",
+                    }
+                ],
+            }
 
         class FakeExecutor:
             def __call__(self, request):
-                calls["n"] += 1
-                # Each page returns one thread and a next-page token forever.
-                return {"threads": [{"id": f"t{calls['n']}"}], "nextPageToken": "tok"}
+                if request.get("kind") == "list":
+                    calls["list"] += 1
+                    return {"threads": [{"id": f"t{calls['list']}"}], "nextPageToken": "tok"}
+                calls["get"] += 1
+                return _thread_payload(request["id_num"])
 
         adapter = object.__new__(GmailAdapter)
         adapter._execute = FakeExecutor()
+        adapter._redactor = None
 
         class FakeThreadsResource:
             def list(self, **kwargs):
-                return object()
+                return {"kind": "list"}
+
+            def get(self, *, id, **kwargs):
+                return {"kind": "get", "id_num": int(id[1:])}
 
         class FakeUsers:
             def threads(self):
@@ -331,10 +415,82 @@ class TestFetchCancelDuringPagination:
             seen["n"] += 1
             return seen["n"] > 2
 
-        ids = adapter._list_thread_ids(limit=1000, query=None, cancel_check=cancel_after_two)
-        # Cancellation kicks in after a couple of pages, well short of `limit`.
-        assert len(ids) < 1000
-        assert calls["n"] <= 3
+        items = adapter.list_threads(limit=1000, cancel_check=cancel_after_two)
+        # Cancellation kicks in after a couple of items, well short of `limit`.
+        assert len(items) < 1000
+        assert calls["list"] <= 3
+
+    def test_after_cutoff_stops_the_scan_without_refetching_older_threads(self):
+        """A second run passing `after=` should stop as soon as it reaches a
+        thread at or before the cutoff, instead of re-fetching the whole 200.
+
+        The boundary thread's metadata must still be fetched once — its date
+        can't be known without fetching it — but nothing *beyond* the boundary
+        (t0, even older) should ever be requested. That's where the real
+        savings are on a large inbox."""
+        from datetime import datetime, timezone
+
+        from channels.gmail.adapter import GmailAdapter
+
+        # Four threads, newest (t3) first — matches Gmail's real ordering.
+        dates_ms = {"t3": 3_000, "t2": 2_000, "t1": 1_000, "t0": 500}
+        order = ["t3", "t2", "t1", "t0"]
+        fetched = []
+
+        class FakeExecutor:
+            def __call__(self, request):
+                if request.get("kind") == "list":
+                    return {"threads": [{"id": tid} for tid in order]}
+                tid = request["id"]
+                fetched.append(tid)
+                return {
+                    "id": tid,
+                    "messages": [
+                        {
+                            "id": f"m-{tid}",
+                            "labelIds": ["INBOX"],
+                            "internalDate": str(dates_ms[tid]),
+                            "payload": {
+                                "headers": [
+                                    {"name": "Subject", "value": tid},
+                                    {"name": "From", "value": "sender@example.com"},
+                                ]
+                            },
+                            "snippet": "hi",
+                        }
+                    ],
+                }
+
+        adapter = object.__new__(GmailAdapter)
+        adapter._execute = FakeExecutor()
+        adapter._redactor = None
+
+        class FakeThreadsResource:
+            def list(self, **kwargs):
+                return {"kind": "list"}
+
+            def get(self, *, id, **kwargs):
+                return {"kind": "get", "id": id}
+
+        class FakeUsers:
+            def threads(self):
+                return FakeThreadsResource()
+
+        class FakeService:
+            def users(self):
+                return FakeUsers()
+
+        adapter._service = FakeService()
+
+        # Cutoff between t2 (2000ms) and t1 (1000ms): only t3 and t2 are newer.
+        cutoff = datetime.fromtimestamp(1.5, tz=timezone.utc)
+        items = adapter.list_threads(limit=200, after=cutoff)
+
+        assert [i.external_thread_id for i in items] == ["t3", "t2"]
+        # t1 (the boundary) is fetched once to learn its date, then excluded;
+        # t0, strictly beyond the boundary, is never requested at all.
+        assert fetched == ["t3", "t2", "t1"]
+        assert "t0" not in fetched
 
 
 # --- failed-batch spend persistence (defect 5) -----------------------------
