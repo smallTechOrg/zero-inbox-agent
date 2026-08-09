@@ -99,7 +99,7 @@ and 429 (backoff + resume). A failed LLM batch does not fail the run: its items 
 | Dependency management | `uv` (Python), `pnpm` (frontend) |
 | Agent framework | LangGraph (`StateGraph`, `Send` fan-out) — graph in [`agent.md`](agent.md) |
 | LLM provider | **NVIDIA NIM** via its OpenAI-compatible endpoint, `https://integrate.api.nvidia.com/v1` |
-| LLM default model | `zai-org/glm-4.6` (env: `AGENT_NVIDIA_DEFAULT_MODEL`), overridable per user |
+| LLM default model | `nvidia/nemotron-3-nano-30b-a3b` (env: `AGENT_NVIDIA_DEFAULT_MODEL`), overridable per user |
 | LLM client | `openai` Python SDK pointed at the NIM `base_url` — a thin OpenAI-compatible client with a swappable model id; **never a hardcoded model** |
 | Backend | FastAPI + Uvicorn, port **8001** |
 | Database | SQLite via SQLAlchemy 2.0 declarative + Alembic |
@@ -136,7 +136,7 @@ per-user model preference (Phase 3) requires no code change. The existing `anthr
 | `database_url` | `AGENT_DATABASE_URL` | `sqlite:///./data/agent.db` |
 | `nvidia_api_key` | `AGENT_NVIDIA_API_KEY` | required |
 | `nvidia_base_url` | `AGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` |
-| `nvidia_default_model` | `AGENT_NVIDIA_DEFAULT_MODEL` | `zai-org/glm-4.6` |
+| `nvidia_default_model` | `AGENT_NVIDIA_DEFAULT_MODEL` | `nvidia/nemotron-3-nano-30b-a3b` |
 | `google_client_id` | `AGENT_GOOGLE_CLIENT_ID` | required |
 | `google_client_secret` | `AGENT_GOOGLE_CLIENT_SECRET` | required |
 | `google_redirect_uri` | `AGENT_GOOGLE_REDIRECT_URI` | `http://localhost:8001/auth/google/callback` |

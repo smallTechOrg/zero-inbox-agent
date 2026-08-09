@@ -6,6 +6,9 @@ __pycache__/
 venv/
 node_modules/
 .next/
+test-results/
+playwright-report/
+blob-report/
 dist/
 build/
 *.egg-info/

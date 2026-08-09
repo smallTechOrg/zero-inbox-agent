@@ -1,9 +1,41 @@
-from typing import TypedDict
+from __future__ import annotations
+
+import operator
+from typing import Annotated, TypedDict
 
 
-class AgentState(TypedDict, total=False):
+class TriageState(TypedDict, total=False):
+    """State of one cost-tiered triage run. See spec/agent.md."""
+
+    # identity / scope
     run_id: str
-    input_text: str
-    output_text: str
+    user_id: str
+    channel_account_id: str
+    limit: int
+    dry_run: bool
+
+    # per-user context, loaded once
+    categories: list[dict]
+    rules: list[dict]
+    sender_stats: dict[str, dict]
+    settings: dict
+
+    # working set
+    items: list[dict]
+    resolved: Annotated[list[dict], operator.add]
+    llm_queue: list[dict]
+    deep_queue: Annotated[list[dict], operator.add]
+    batches: list[list[dict]]
+    batch: list[dict]
+    llm_decisions: Annotated[list[dict], operator.add]
+    llm_calls: Annotated[list[dict], operator.add]
+
+    # outputs
+    decisions: list[dict]
+    clusters: list[dict]
+    counts: dict
+    cost: dict
+
+    # control
     error: str | None
-    messages: list          # [{role: "user"|"assistant", content: str}, ...] — chat-turn history
+    status: str

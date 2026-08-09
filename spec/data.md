@@ -175,7 +175,7 @@ Unique on `(run_id, item_id)` — makes resume idempotent.
 | `auto_act_threshold` | float | `0.95` |
 | `confidence_floor` | float | `0.75` — below this the agent never archives |
 | `dry_run` | bool | `true` (Phase 1: forced true) |
-| `llm_model` | str | `zai-org/glm-4.6` |
+| `llm_model` | str | `nvidia/nemotron-3-nano-30b-a3b` |
 | `digest_hour_local` | int | `8` |
 | `timezone` | str | `UTC` |
 

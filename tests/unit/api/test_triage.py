@@ -1,0 +1,218 @@
+"""The clustered triage queue: clusters, threads, approve/reject (dry-run, intent only)."""
+
+
+def test_clusters_for_the_latest_run_when_no_run_id_given(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get("/api/triage/clusters")
+    assert res.status_code == 200
+    clusters = res.json()["data"]
+
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert cluster["id"] == "cluster-alice"
+    assert cluster["kind"] == "list"
+    assert cluster["label"] == "Substack newsletters"
+    assert cluster["item_count"] == 3
+    assert cluster["suggested_action"] == "archive"
+    assert cluster["min_confidence"] == 0.6
+    assert cluster["avg_confidence"] == 0.85
+    assert len(cluster["sample_subjects"]) == 3
+    assert all(s.startswith("alice ") for s in cluster["sample_subjects"])
+
+
+def test_clusters_are_scoped_to_the_signed_in_user(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get("/api/triage/clusters", params={"run_id": "run-bob"})
+    assert res.status_code == 200
+    assert res.json()["data"] == []
+
+
+def test_clusters_are_empty_before_any_run(client, db, seed, sign_in):
+    from db.models import Cluster, Decision, TriageRun
+
+    db.query(Decision).delete()
+    db.query(Cluster).delete()
+    db.query(TriageRun).delete()
+    db.commit()
+
+    sign_in("user-alice")
+    res = client.get("/api/triage/clusters")
+    assert res.status_code == 200
+    assert res.json()["data"] == []
+
+
+def test_items_in_a_cluster_carry_category_confidence_reasoning_and_tier(
+    client, seed, sign_in
+):
+    sign_in("user-alice")
+    res = client.get("/api/triage/items", params={"cluster_id": "cluster-alice"})
+    assert res.status_code == 200
+    items = res.json()["data"]
+    assert len(items) == 3
+
+    rule_row = next(i for i in items if i["decided_by"] == "rule")
+    assert rule_row["category"] == "Newsletters"
+    assert rule_row["confidence"] == 0.93
+    assert rule_row["reasoning"] == "reasoning for alice 0"
+    assert rule_row["rule_id"] == "rule-alice"
+    assert rule_row["rule_name"] == "Substack list"
+    assert rule_row["status"] == "proposed"
+    assert rule_row["time_sensitive"] is False
+    assert rule_row["item"]["subject"] == "alice subject 0"
+    assert rule_row["item"]["from_email"] == "sender@substack.com"
+    assert rule_row["item"]["snippet_redacted"] == "redacted snippet 0"
+    assert rule_row["item"]["is_unread"] is True
+    assert rule_row["item"]["internal_date"]
+
+    llm_row = next(i for i in items if i["decided_by"] == "llm")
+    assert llm_row["rule_id"] is None
+    assert llm_row["rule_name"] is None
+
+
+def test_items_can_be_filtered_to_the_needs_your_call_bucket(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get(
+        "/api/triage/items", params={"run_id": "run-alice", "status": "needs_your_call"}
+    )
+    assert res.status_code == 200
+    items = res.json()["data"]
+    assert [i["decision_id"] for i in items] == ["dec-alice-2"]
+    assert items[0]["confidence"] == 0.6
+
+
+def test_items_are_ordered_newest_first(client, seed, sign_in):
+    sign_in("user-alice")
+    items = client.get("/api/triage/items", params={"run_id": "run-alice"}).json()["data"]
+    dates = [i["item"]["internal_date"] for i in items]
+    assert dates == sorted(dates, reverse=True)
+
+
+def test_items_of_another_users_cluster_are_not_found(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get("/api/triage/items", params={"cluster_id": "cluster-bob"})
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "not_found"
+
+
+def test_items_of_another_users_run_are_empty(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get("/api/triage/items", params={"run_id": "run-bob"})
+    assert res.status_code == 200
+    assert res.json()["data"] == []
+
+
+def test_items_require_a_session(client, seed):
+    res = client.get("/api/triage/items", params={"run_id": "run-alice"})
+    assert res.status_code == 401
+
+
+def test_approving_a_decision_records_intent_only(client, db, seed, sign_in):
+    from db.models import ActionLog, Decision
+
+    sign_in("user-alice")
+    res = client.post("/api/triage/decisions/dec-alice-1", json={"status": "approved"})
+    assert res.status_code == 200
+    body = res.json()["data"]
+    assert body["decision_id"] == "dec-alice-1"
+    assert body["status"] == "approved"
+
+    db.expire_all()
+    decision = db.get(Decision, "dec-alice-1")
+    assert decision.status == "approved"
+    assert decision.decided_at is not None
+    # Phase 1 writes nothing to Gmail: no mutation is logged.
+    assert db.query(ActionLog).count() == 0
+
+
+def test_rejecting_a_decision_is_recorded(client, db, seed, sign_in):
+    from db.models import Decision
+
+    sign_in("user-alice")
+    res = client.post("/api/triage/decisions/dec-alice-1", json={"status": "rejected"})
+    assert res.status_code == 200
+    db.expire_all()
+    assert db.get(Decision, "dec-alice-1").status == "rejected"
+
+
+def test_decision_status_must_be_approved_or_rejected(client, db, seed, sign_in):
+    from db.models import Decision
+
+    sign_in("user-alice")
+    res = client.post("/api/triage/decisions/dec-alice-1", json={"status": "applied"})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "validation_error"
+
+    db.expire_all()
+    assert db.get(Decision, "dec-alice-1").status == "proposed"
+
+
+def test_decision_body_is_required(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/decisions/dec-alice-1", json={})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "validation_error"
+
+
+def test_cannot_review_another_users_decision(client, db, seed, sign_in):
+    from db.models import Decision
+
+    sign_in("user-alice")
+    res = client.post("/api/triage/decisions/dec-bob-1", json={"status": "approved"})
+    assert res.status_code == 404
+
+    db.expire_all()
+    assert db.get(Decision, "dec-bob-1").status == "proposed"
+
+
+def test_bulk_approving_a_cluster_sweeps_only_that_cluster(client, db, seed, sign_in):
+    from db.models import ActionLog, Decision
+
+    sign_in("user-alice")
+    res = client.post(
+        "/api/triage/clusters/cluster-alice/approve", json={"status": "approved"}
+    )
+    assert res.status_code == 200
+    assert res.json()["data"] == {"updated": 3}
+
+    db.expire_all()
+    alice = db.query(Decision).filter(Decision.user_id == "user-alice").all()
+    assert {d.status for d in alice} == {"approved"}
+    bob = db.query(Decision).filter(Decision.user_id == "user-bob").all()
+    assert {d.status for d in bob} == {"proposed", "needs_your_call"}
+    assert db.query(ActionLog).count() == 0
+
+
+def test_bulk_approve_is_idempotent(client, seed, sign_in):
+    sign_in("user-alice")
+    client.post("/api/triage/clusters/cluster-alice/approve", json={"status": "approved"})
+    second = client.post(
+        "/api/triage/clusters/cluster-alice/approve", json={"status": "approved"}
+    )
+    assert second.json()["data"] == {"updated": 0}
+
+
+def test_bulk_approve_rejects_an_invalid_status(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/clusters/cluster-alice/approve", json={"status": "nope"})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "validation_error"
+
+
+def test_cannot_bulk_approve_another_users_cluster(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.post("/api/triage/clusters/cluster-bob/approve", json={"status": "approved"})
+    assert res.status_code == 404
+
+
+def test_categories_are_user_scoped(client, seed, sign_in):
+    sign_in("user-alice")
+    res = client.get("/api/categories")
+    assert res.status_code == 200
+    categories = res.json()["data"]
+    assert [c["id"] for c in categories] == ["cat-alice"]
+    assert categories[0]["name"] == "Newsletters"
+    assert categories[0]["default_action"] == "archive"
+
+
+def test_categories_require_a_session(client, seed):
+    assert client.get("/api/categories").status_code == 401

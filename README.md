@@ -1,176 +1,240 @@
-# Zero Shot SDD Harness for Building Agents
+# Zero Inbox Agent
 
-Give it a one-line idea. Walk away with a working, tested, phased agent.
+Reads your Gmail, categorises every **thread** (never individual messages), groups the result into
+**clusters** so a few hundred threads collapse into ~30 decisions, and shows you exactly why each
+decision was made — category, confidence, full reasoning, and which tier decided it.
 
-A lean, Claude-Code-native harness for building agentic software **spec-first**. One person with an idea and one API key can drive a real, production-shaped agent into existence — and a senior engineer opening the result finds a conventional, reviewable stack, not generated mush.
+**Phase 1 is strictly dry-run: nothing in your Gmail is ever changed.**
 
----
-
-## The Spirit
-
-Six convictions the whole repo is built around:
-
-1. **Spec is the source of truth.** The spec is written before the code, always. When spec and code disagree, the spec wins and the code is fixed (`/zero-shot-sync`). Every AI session reads the same requirements instead of re-deriving them.
-2. **Built for two audiences at once.** A non-coder drives it with a single sentence; a senior engineer inherits a clean FastAPI + LangGraph stack they can read, review, and own. Neither audience is an afterthought.
-3. **Lean harness, not a framework.** `harness/` is engineering *mindfulness* — rules and patterns that keep every session consistent — deliberately Claude-Code-only and kept small. The product runtime stays provider-agnostic; the harness does not.
-4. **Smallest first-time-right win, phase by phase.** Each phase ships the smallest increment a human can actually test, and it must work the *first* time they test it — real on the tested path, with clearly-labelled stubs for everything still to come. No rough edges on the path you're handed.
-5. **A human gates every phase.** The build is autonomous *within* a phase and stops at each boundary for you to test the increment. You stay in control of what "done" means.
-6. **Real LLM/API or it doesn't count.** Gates, tests, and evals run against the real model with keys from `.env`. A stubbed pass is not a pass.
+Built spec-first — the specification in [`spec/`](spec/) is the source of truth. Start with
+[`spec/roadmap.md`](spec/roadmap.md).
 
 ---
 
-## What This Is
+## The overriding guardrail
 
-A starting point for building AI agents spec-first. The repo ships with:
+**An important email must never be missed.** Every trade-off resolves toward keeping mail visible.
+Permanent safety invariants:
 
-- A working **baseline agent** in `src/` (FastAPI + LangGraph + SQLite, provider-agnostic LLM — Anthropic or Gemini, `transform_text` as the capability slot) — tests pass out of the box
-- A **spec template** in `spec/` covering roadmap, architecture, capabilities, data model, API, UI, and agent graph
-- Three **zero-shot skills** (`/zero-shot-build`, `/zero-shot-fix`, `/zero-shot-sync`)
-- A four-agent **team** — agent-builder orchestrates (plans, fans out, owns git/PR); spec-writer is the single design authority; code-generator implements one slice per instance (parallelised); qa-auditor reviews and gates
-- Engineering rules and patterns in `harness/` so every Claude Code session is consistent
-- **Human testing gate between phases** — autonomous within a phase, you test each increment before the next starts
+- **Never delete anything, ever.** No trash, no spam-report. Archive + label only (Phase 2+).
+- **Nothing acts without approval** until you explicitly promote a rule to automatic.
+- **Full undo** for every mutation (Phase 2).
+- **Email bodies are never persisted** to the database — only headers, identifiers, decisions and
+  reasoning. Secrets (OTPs, API keys, card numbers, passwords) are redacted *before* anything leaves
+  your machine.
 
 ---
 
-## How to Use This
+## Requirements
 
-### Step 1 — Clone
+| Tool | Version |
+|------|---------|
+| Python | 3.12+ |
+| [`uv`](https://docs.astral.sh/uv/) | latest |
+| Node | 20+ |
+| `pnpm` | 9+ |
+
+You also need:
+
+1. An **NVIDIA NIM API key** (free tier) from <https://build.nvidia.com/> — the LLM provider.
+2. A **Google Cloud OAuth client** of your own (see below).
+
+---
+
+## Setup
+
+### 1. Install dependencies
 
 ```bash
-git clone https://github.com/smallTechOrg/zero-shot-sdd-harness.git my-agent
-cd my-agent
+uv sync
+cd frontend && pnpm install && cd ..
+pnpm install                       # root: Playwright for the E2E suite
+npx playwright install --with-deps chromium
 ```
 
-### Step 2 — Open in Claude Code
+### 2. Create your Google Cloud OAuth client (test mode)
 
-```bash
-claude
-```
+1. Open <https://console.cloud.google.com/> → create (or pick) a project.
+2. **APIs & Services → Library → Gmail API → Enable.**
+3. **APIs & Services → OAuth consent screen** → User type **External** → keep the app in
+   **Testing** mode → add *your own* Google address under **Test users**.
+   (Testing mode is intentional: this is a personal single-user install, so no Google verification
+   review is required. Refresh tokens in test mode expire after 7 days — reconnect when prompted.)
+4. Add these **scopes**:
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.modify`
+   - `https://www.googleapis.com/auth/gmail.settings.basic`
+   - `https://www.googleapis.com/auth/gmail.compose`
 
-### Step 3 — Build
+   Phase 1 only ever issues **read** calls; the write scopes are requested once now so Phase 2 does
+   not force a second consent round.
+5. **Credentials → Create credentials → OAuth client ID → Web application.**
+   Authorised redirect URI: `http://localhost:8001/auth/google/callback`
+6. Copy the **Client ID** and **Client secret**.
 
-```
-/zero-shot-build An agent that monitors my Shopify store for low-inventory products and drafts restock emails to suppliers
-```
-
-One intake round (scope, stack, API keys → fill `.env`), then the agent builds phase by phase and stops at each boundary for you to test.
-
----
-
-## What Happens (Intake → Phase by Phase)
-
-```
-Your idea
-    ↓
-INTAKE — scope, stack, LLM provider, constraints; fill .env with the required API key
-    ↓
-[spec-writer]  → Full spec: architecture + agent-graph + phased plan (self-reviewed)
-    ↓
-[agent-builder] → Feature branch + PR, scaffold
-    ↓
-per phase — all slices concurrently:
-    [code-generator: slice-a]  ──→  [qa-auditor: slice-a]  ─┐
-    [code-generator: slice-b]  ──→  [qa-auditor: slice-b]  ─┤→  commit + push
-    [code-generator: slice-c]  ──→  [qa-auditor: slice-c]  ─┘
-    ↓
-HUMAN TESTING GATE — exact run commands + expected result; you confirm before next phase
-    ↓
-(issue → qa-auditor classifies SPEC-vs-CODE → code-generator fixes → re-gate)
-    ↓
-repeat per phase → SHIP
-```
-
-Phase 1 is the smallest first-time-right win — real on the tested path, with labelled stubs for everything coming later. Each later phase wires one more stub into real functionality.
-
----
-
-## Repo Layout
-
-```
-src/                ← baseline agent (FastAPI + LangGraph + SQLite, Anthropic/Gemini)
-  api/              ← FastAPI routers (create_app, health, runs)
-  config/           ← Pydantic BaseSettings
-  db/               ← SQLAlchemy models + session
-  domain/           ← Pydantic request/response models
-  graph/            ← LangGraph nodes, edges, state, runner  ← CAPABILITY SLOT
-  llm/              ← LLM client + providers/ (anthropic, gemini)
-  prompts/          ← prompt templates (.md)
-  observability/
-frontend/           ← Next.js static export (served by FastAPI at /app)
-tests/
-  unit/             ← passes with no API key
-  integration/      ← requires real key in .env
-spec/               ← your spec: roadmap, architecture, capabilities/, data, api, ui, agent
-harness/
-  rules/            ← ai-agents, git, secret-hygiene
-  patterns/         ← spec-driven, phases, project-layout, tech-stack, code, test-driven, ui-ux, agentic-ai, engineering-practices
-.claude/
-  skills/           ← /zero-shot-build, /zero-shot-fix, /zero-shot-sync
-  agents/           ← agent-builder, spec-writer, code-generator, qa-auditor
-CLAUDE.md
-pyproject.toml
-alembic.ini        ← Alembic migrations (alembic/)
-agent.py            ← verify setup (default); --run to start the server
-.env.example
-```
-
-**Capability slot** — the three files to replace for your agent:
-- `src/graph/nodes.py` — replace `transform_text` with your logic
-- `src/prompts/transform.md` — replace with your system prompt
-- `frontend/src/app/page.tsx` — replace the transform form with your UI
-
-Everything else (graph wiring, API, DB, settings, tests) is already working.
-
----
-
-## Running the Baseline
+### 3. Configure `.env`
 
 ```bash
 cp .env.example .env
-# edit .env: set exactly ONE provider key —
-#   AGENT_ANTHROPIC_API_KEY=<your key>   or   AGENT_GEMINI_API_KEY=<your key>
-# the provider is auto-detected from whichever key is set
-uv sync
-python agent.py                        # verify tools, .env, deps, tests (default)
-python agent.py --run                  # migrations + frontend build + start server
 ```
 
-Once running:
+Then fill it in. `.env` is git-ignored and **must never be committed**.
 
-| URL | What |
-|-----|------|
-| `http://localhost:8001/app/` | **UI** — transform form (the capability slot) |
-| `http://localhost:8001/health` | API health check |
-| `http://localhost:8001/docs` | Interactive API docs (Swagger) |
+| Variable | Meaning |
+|----------|---------|
+| `AGENT_DATABASE_URL` | SQLite path, e.g. `sqlite:///./data/agent.db` |
+| `AGENT_NVIDIA_API_KEY` | your NVIDIA NIM key |
+| `AGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` |
+| `AGENT_NVIDIA_DEFAULT_MODEL` | `nvidia/nemotron-3-nano-30b-a3b` |
+| `AGENT_GOOGLE_CLIENT_ID` | from step 2 |
+| `AGENT_GOOGLE_CLIENT_SECRET` | from step 2 |
+| `AGENT_GOOGLE_REDIRECT_URI` | `http://localhost:8001/auth/google/callback` |
+| `AGENT_SECRET_KEY` | signs sessions + encrypts stored refresh tokens (see below) |
+| `PORT` | `8001` |
+| `AGENT_LOG_LEVEL` | `INFO` |
+| `LANGCHAIN_API_KEY` | *optional* — enables LangSmith tracing when present |
 
-Tests:
+Generate a secret key:
 
 ```bash
-uv run pytest tests/unit/ -v          # no key needed
-uv run pytest tests/ -v               # requires real key in .env
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 ---
 
-## Rules AI Agents Follow
+## Run it
 
-Full rules in `harness/rules/ai-agents.md`. Summary:
+```bash
+uv run alembic upgrade head          # create / migrate the SQLite database
+cd frontend && pnpm build && cd ..   # static export into frontend/out
+uv run python -m src                 # FastAPI + the static frontend on port 8001
+```
 
-- Read the full spec before writing any code
-- Never skip a phase; commit every logical unit
-- Tests run against the real LLM/API using keys from `.env` — stubbed runs do not count as passing
-- Each phase is tested by the human before the next phase starts
-- The build record is git history + the PR + the per-phase test-handoffs
+Open **<http://localhost:8001/app/>** — note the port, the `/app/`, and the **trailing slash**.
+
+Then:
+
+1. Click **Connect Gmail** → the real Google consent screen → approve → you are returned to the
+   dashboard showing your connected address.
+2. Click **Run triage (200 threads)** → a live progress bar counts threads as they are decided.
+3. Sweep the queue: expand a cluster to see its threads; expand a thread to read the full reasoning
+   and see the tier badge (`RULE` / `SENDER HISTORY` / `LLM`). Approve or reject a whole cluster.
+4. The red **"DRY RUN — nothing in your Gmail has been changed"** banner stays pinned at the top.
+   Check Gmail: nothing has moved.
 
 ---
 
-## FAQ
+## What Phase 1 does — and does not — do
 
-**What if I already have a stack in mind?**
-State it in the idea: `/zero-shot-build [idea] — use Python + FastAPI + PostgreSQL`. Stack choices are binding.
+**Real in Phase 1**
 
-**What if something breaks?**
-Run `/zero-shot-fix [what's broken]` — qa-auditor classifies the problem (SPEC vs CODE), the right generator fixes it, qa-auditor re-gates.
+- Google OAuth connection to your own mailbox (the OAuth login *is* the dashboard session)
+- Thread ingestion of your most recent ~200 inbox threads (headers + a redacted ~200-char snippet)
+- Cost-tiered triage: deterministic rules → sender history → batched LLM
+- Clustering into ~30 reviewable decisions
+- Category, confidence, full reasoning and a **which-tier-fired** badge on every thread
+- The **Needs your call** bucket for everything below the confidence floor
+- Live run progress; approve / reject recorded in the database
+- Structured JSON logging on stdout, plus LangSmith tracing when a key is present
 
-**What if spec and code drift?**
-Run `/zero-shot-sync` — qa-auditor classifies each divergence, generators fix, spec wins.
+**Not in Phase 1 (labelled `COMING SOON` stubs in the UI — greyed and disabled, never broken)**
+
+Rules view · Chat · Daily digest · Backlog cleanup · VIP list editor · Priorities profile editor ·
+Cost panel · Model dropdown · Undo · "Create Gmail filter" · "Draft reply" · Unsubscribe suggestions ·
+Stale threads.
+
+**Explicitly not done in Phase 1:** *any* write to Gmail. The Gmail adapter exposes read operations
+only; its mutation methods raise `DryRunViolation` if called. Approving a cluster changes a row in
+your local database and nothing else.
+
+Phase 2 adds the never-miss safeguards, real archive/label actions and one-click undo. Phase 3 adds
+rules, chat, digest, backlog cleanup and the cost panel. See [`spec/roadmap.md`](spec/roadmap.md).
+
+---
+
+## Observability
+
+- **Structured logging is unconditional.** `src/observability/logging.py` configures `structlog` to
+  emit one JSON object per event to stdout (timestamp, level, event, latency_ms, and the event's
+  fields). Two privacy rules are enforced *in the logging pipeline*, not at call sites: secret-shaped
+  fields (`api_key`, `refresh_token`, `client_secret`, cookies, OAuth `code`/`state`, …) render as
+  `[REDACTED]`, and email content fields (`body`, `snippet`, …) render as `[OMITTED:body]`. Values
+  that *look* like keys (`nvapi-…`, `sk-…`, `ghp_…`, `AKIA…`, `ya29.…`, `lsv2_…`, `GOCSPX-…`) are
+  scrubbed even inside free text.
+- **LangSmith tracing is opt-in by key presence.** `configure_tracing()` turns tracing on only when
+  `LANGCHAIN_API_KEY` is set, sets `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_PROJECT`, and logs the
+  fact — never the key. With no key it disables tracing and says so. `trace_config(run_name, …)`
+  produces the `RunnableConfig` fragment (run name, tags, metadata) passed into the LangGraph run.
+- One-call startup hook: `from observability import setup_observability`.
+
+---
+
+## Tests
+
+Tests and evals run against the **real** NVIDIA NIM endpoint and the **real** Gmail API using the keys
+in `.env`, and against the same SQLite driver used in production. Nothing is stubbed at the
+integration or E2E level.
+
+### The full Phase 1 gate
+
+```bash
+uv run alembic upgrade head && uv run alembic current
+uv run pytest tests/unit tests/integration -q
+cd frontend && pnpm install && pnpm build && cd ..
+uv run python -m src &            # serves http://localhost:8001
+npx playwright test tests/e2e/ --reporter=line
+```
+
+All commands must exit 0, and `alembic current` must print a revision hash rather than a blank line.
+
+### Notes on the suites
+
+- `tests/integration/test_triage_pipeline.py` triages a fixture of **220 real-shaped threads** against
+  the live NVIDIA NIM endpoint and asserts all 220 have persisted decisions and that cluster
+  item-counts sum to 220 — deliberately larger than any plausible sample size.
+- `tests/integration/test_gmail_adapter.py` hits the **real Gmail API** with your stored refresh
+  token, and **skips loudly (unverified, not passing)** if no mailbox is connected.
+- `tests/integration/test_no_body_persisted.py` asserts no `Item`, `Decision` or log row holds body
+  text.
+- `tests/e2e/` (Playwright, chromium) runs against the **live app on port 8001**. `playwright.config.ts`
+  reuses a server already listening on 8001 and otherwise starts `uv run python -m src` itself, so
+  the E2E suite needs the database migrated and `frontend/out` built first. The triage journey
+  (`tests/e2e/triage.spec.ts`) requires a **connected Gmail account** — Google's consent screen cannot
+  be automated — and skips with an explicit reason when none is connected.
+
+Run a single suite:
+
+```bash
+uv run pytest tests/unit -q
+uv run pytest tests/unit/observability -q
+npx playwright test tests/e2e/smoke.spec.ts --reporter=line
+```
+
+---
+
+## Layout
+
+```
+src/
+  api/            FastAPI routes, session cookie, {data,error} envelope
+  channels/       ChannelAdapter interface + the Gmail adapter (only impl in v1)
+  graph/          LangGraph triage cascade (see spec/agent.md)
+  tools/          pure functions: redact, rules, clustering, …
+  llm/            LLMClient + the NVIDIA NIM provider
+  db/             SQLAlchemy 2.0 models + session factory
+  domain/         Pydantic domain models
+  security/       Fernet encryption of stored refresh tokens
+  observability/  structlog JSON logging + LangSmith tracing
+frontend/         Next.js 15 static export, mounted by FastAPI at /app
+tests/            unit · integration (real APIs) · e2e (Playwright)
+spec/             the source of truth
+```
+
+---
+
+## Security
+
+- Secrets live only in `.env`, which is git-ignored. Never hard-code or commit a key.
+- OAuth refresh tokens are encrypted at rest with Fernet, keyed from `AGENT_SECRET_KEY`.
+- Every `/api/*` route is scoped to the session's `user_id`; returning another user's row is a defect.
+- If you rotate `AGENT_SECRET_KEY`, existing stored tokens become undecryptable — reconnect Gmail.

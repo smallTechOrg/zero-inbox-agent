@@ -28,11 +28,10 @@ def _isolated_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def _require_llm_key():
-    """Skip if no LLM provider key is set — works for Anthropic or Gemini."""
+    """Fail loudly if the NVIDIA NIM key is missing — real-key tests never silently skip."""
     from config.settings import get_settings
-    s = get_settings()
-    if not s.anthropic_api_key and not s.gemini_api_key:
-        pytest.skip("No LLM key set in .env (AGENT_ANTHROPIC_API_KEY or AGENT_GEMINI_API_KEY)")
+    if not get_settings().has_nvidia_key:
+        pytest.fail("AGENT_NVIDIA_API_KEY is not set in .env — real-key tests cannot run.")
 
 
 @pytest.fixture

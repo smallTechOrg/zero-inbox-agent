@@ -1,0 +1,81 @@
+'use client'
+
+import type { Run } from '@/lib/types'
+
+/** Real progress only — the numbers come straight from GET /api/runs/{id}. */
+export function RunProgress({
+  run,
+  onCancel,
+  cancelling,
+}: {
+  run: Run
+  onCancel: () => void
+  cancelling: boolean
+}) {
+  const total = run.items_total ?? 0
+  const decided = run.items_decided ?? 0
+  const pct = total > 0 ? Math.min(100, (decided / total) * 100) : 0
+  const active = run.status === 'running' || run.status === 'queued'
+  const counts = Object.entries(run.counts ?? {})
+
+  return (
+    <section
+      data-testid="run-progress"
+      aria-label="Triage run progress"
+      className="rounded-lg border border-blue-200 bg-blue-50 p-3"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-sm font-semibold text-blue-950">
+          {active ? 'Triage running' : `Run ${run.status}`} — {decided} of {total || '?'} threads
+          decided
+        </p>
+        {active ? (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={cancelling}
+            className="rounded border border-blue-300 bg-white px-2.5 py-1 text-xs font-semibold text-blue-900 hover:bg-blue-100 focus:ring-2 focus:ring-blue-400 focus:outline-none disabled:opacity-50"
+          >
+            {cancelling ? 'Cancelling…' : 'Cancel run'}
+          </button>
+        ) : null}
+      </div>
+
+      <div
+        role="progressbar"
+        aria-valuenow={Math.round(pct)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label="Threads decided"
+        className="mt-2 h-2 w-full overflow-hidden rounded-full bg-blue-200"
+      >
+        <div
+          className="h-full bg-blue-600 transition-[width] duration-300 motion-reduce:transition-none"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+
+      {counts.length > 0 ? (
+        <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-blue-900">
+          {counts.map(([k, v]) => (
+            <li key={k}>
+              <span className="font-medium">{k.replace(/_/g, ' ')}</span>{' '}
+              <span className="font-mono">{v}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {run.status === 'failed' ? (
+        <p
+          role="alert"
+          className="mt-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-900"
+        >
+          This run failed partway — undecided threads were kept in your inbox and moved to Needs
+          your call.
+          {run.error_message ? ` (${run.error_message})` : ''}
+        </p>
+      ) : null}
+    </section>
+  )
+}
