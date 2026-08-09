@@ -1,218 +1,223 @@
-# Agent
+# Agent Graph
 
-> Required when the project uses an agent framework. Delete this file if your project has no agent framework.
->
-> If your project has no agent framework (e.g., a simple script or single-LLM API call), delete this file.
->
+Framework: **LangGraph** (`StateGraph`). Two graphs exist: the **triage graph** (Phase 1, extended in
+Phase 2) and the **chat-to-rules graph** (Phase 3).
 
----
+## Patterns Used
 
-## Agent Architecture Pattern
+From [`harness/patterns/agentic-ai.md`](../harness/patterns/agentic-ai.md):
 
-<!-- FILL IN: Which pattern does this agent follow? Choose one and describe why. -->
+| Pattern | Where |
+|---------|-------|
+| #16 Resource-Aware Optimization | The cost-tiered cascade: tiers 1–2 are free, the LLM sees only the remainder, batched 20–50 items/call |
+| #2 Routing | `route_after_history` sends each item to `resolved`, `llm_batch`, or `deep_read` |
+| #3 Parallelization | LLM batches fan out via `Send` at max concurrency 4 |
+| #4 Reflection | `second_pass_reviewer` audits every archive proposal for false negatives (Phase 2) |
+| #13 Human-in-the-Loop | Confidence floor → `needs_your_call`; no mutation without approval or a promoted rule |
+| #18 Guardrails | Redaction before egress; JSON-schema validation of every LLM response; `DryRunViolation` on any mutation while dry-run is on |
+| #12 Exception Handling | Retries/backoff on Gmail + NIM; a failed batch degrades to `needs_your_call`, never to "archive" |
+| #8 Memory Management | Per-user sender history, corrections, VIP list, priorities profile injected as evidence (Phase 2); chat turn history (Phase 3) |
+| #9 Learning and Adaptation | Corrections update sender importance and seed rule proposals |
+| #19 Evaluation and Monitoring | structlog + LangSmith traces + per-call token/cost rows |
 
-| Pattern | Use when |
-|---------|----------|
-| **Single-agent loop** | One LLM drives a deterministic tool-call loop. No branches, no handoffs. |
-| **Graph (LangGraph)** | Multi-step pipeline with conditional edges, checkpointing, or parallel nodes. |
-| **Multi-agent** | Specialised sub-agents with distinct roles; orchestrator routes between them. |
-| **Supervisor** | One supervisor LLM dispatches to worker agents based on task type. |
-| **Human-in-the-loop** | Execution pauses at defined checkpoints for user review or approval. |
-
-**Chosen:** <!-- state pattern + one-sentence rationale -->
-
----
-
-## LLM Provider & Model
-
-<!-- FILL IN: Which model drives each agent/node? State provider, model ID, and why. -->
-
-| Agent / Node | Provider | Model ID | Rationale |
-|-------------|----------|----------|-----------|
-| <!-- node --> | Anthropic | <!-- e.g. claude-sonnet-4-6 --> | <!-- latency vs. quality trade-off --> |
-
-**Fallback behaviour:** <!-- Production resilience only: retry/backoff, degraded mode, or a surfaced error if the LLM API is unavailable or rate-limited. NOT a test/offline stub path — tests call the real API with keys from `.env`. -->
-
-**Prompt strategy:** <!-- System/user split, few-shot examples, structured output (tool_use / JSON mode)? -->
+**Not used:** multi-agent collaboration, planning, RAG, MCP, tree-of-thought. The task is a
+classification cascade, not open-ended exploration — adding them would be gold-plating.
 
 ---
 
-## Tools & Tool Calling
-
-<!-- FILL IN: Every tool the agent can call. -->
-
-| Tool name | Description | Inputs | Output | Side-effects |
-|-----------|-------------|--------|--------|--------------|
-| <!-- name --> | <!-- what it does --> | <!-- params --> | <!-- return type --> | <!-- DB write, API call, file write, etc. --> |
-
-**Tool selection strategy:** <!-- How does the agent decide which tool to call? (LLM choice, rule-based routing, forced single tool) -->
-
-**Tool failure handling:** <!-- retry, fallback, abort — per tool or global policy? -->
-
----
-
-## Agent State
-
-<!-- FILL IN: The full state type. Every field must be named, typed, and annotated with what populates it. -->
+## State
 
 ```python
-class AgentState(TypedDict):
-    # Identity
-    run_id: int                          # set at initialisation
+# src/graph/state.py
+from typing import Annotated, TypedDict
+import operator
 
-    # Input
-    # ...                                # fields populated from the trigger
+class TriageState(TypedDict, total=False):
+    # identity / scope
+    run_id: str
+    user_id: str
+    channel_account_id: str
+    limit: int                      # threads to pull (Phase 1: 200)
+    dry_run: bool                   # Phase 1: always True
 
-    # Pipeline data (populated progressively by nodes)
-    # ...
+    # per-user context loaded once
+    categories: list[dict]          # taxonomy
+    rules: list[dict]               # active deterministic rules
+    sender_stats: dict[str, dict]   # sender_email -> {received, replied, archived, ever_replied}
+    vip: dict                       # {emails: [], domains: [], keywords: []}   (Phase 2)
+    priorities_profile: str         # plain-English profile               (Phase 2)
+    settings: dict                  # {auto_act_threshold, confidence_floor, model}
 
-    # Output
-    # ...                                # final result fields
+    # working set
+    items: list[dict]               # normalized Item dicts (redacted snippet, no body)
+    resolved: Annotated[list[dict], operator.add]    # decisions from tiers 1-2
+    llm_queue: list[dict]           # items needing an LLM verdict
+    deep_queue: list[dict]          # borderline items needing full-thread read
+    llm_decisions: Annotated[list[dict], operator.add]   # reducer — batches fan in here
 
-    # Control
-    error: str | None                    # set by any node on fatal failure
-    checkpoint: str | None              # last completed node (for resume)
+    # outputs
+    decisions: list[dict]
+    clusters: list[dict]
+    counts: dict                    # {total, by_tier, by_category, needs_your_call}
+    cost: dict                      # {tokens_in, tokens_out, usd, llm_calls}
+
+    # control
+    error: str | None
+    status: str                     # running | completed | failed | cancelled
 ```
 
----
-
-## Nodes / Steps
-
-<!-- FILL IN: One section per node. For single-agent loops, describe each "step" or "tool call phase." -->
-
-### `node_[name]`
-
-**Reads from state:** <!-- field names -->
-
-**Writes to state:** <!-- field names -->
-
-**LLM call:** <!-- yes/no; if yes: prompt template summary, model used, output format -->
-
-**External calls:**
-
-| System | Operation | On Failure |
-|--------|-----------|------------|
-| <!-- system --> | <!-- what it calls --> | <!-- fatal (set error) / partial (log + continue) / retry --> |
-
-**Behaviour:** <!-- One paragraph. What decision or transformation does this node perform? -->
+`llm_decisions` and `resolved` use `operator.add` reducers so parallel `Send` branches merge without
+clobbering each other. Everything else is last-write-wins (written by exactly one node).
 
 ---
 
-## Graph / Flow Topology
+## Nodes
 
-<!-- FILL IN: ASCII diagram of node flow. Show ALL conditional edges explicitly. -->
+| Node | Phase | Does |
+|------|-------|------|
+| `load_context` | 1 | Loads the user's categories, active rules, sender stats, settings (Phase 2: VIP list + priorities profile) from the DB into state |
+| `fetch_items` | 1 | `ChannelAdapter.list_threads(limit)` → normalized `Item` dicts; headers + subject + ≤200-char snippet only |
+| `redact_items` | 1 | Runs `tools.redact()` over every subject/snippet **in place**. Single egress chokepoint — nothing reaches an LLM unredacted |
+| `apply_deterministic_rules` | 1 | Tier 1. Matches each item against active rules (sender, domain, `List-Id`, subject regex, has-attachment). Match → decision with `decided_by="rule"`, `confidence=rule.confidence`, `rule_id` set. Appends to `resolved` |
+| `apply_sender_history` | 1 | Tier 2. Unresolved items only. Strong prior from `sender_stats`: ever-replied → keep at high confidence; never-opened bulk sender with ≥N archived → archive proposal. `decided_by="sender_history"` |
+| `prepare_llm_batches` | 1 | Chunks `llm_queue` into batches of 20–50 by token budget; emits one `Send("llm_classify_batch", …)` per batch |
+| `llm_classify_batch` | 1 | Tier 3. One LLM call per batch. Prompt: `prompts/classify.md` + taxonomy + (Phase 2) priorities profile. Returns strict JSON array `[{item_id, category, action, confidence, reasoning, time_sensitive}]`, schema-validated. `decided_by="llm"`. Items it marks `unsure` go to `deep_queue` |
+| `deep_read_escalation` | 1 | Tier 4. For each borderline item, fetches the full thread + the user's past replies to that sender **in memory**, redacts, and makes a single-item LLM call. `decided_by="llm_deep"` |
+| `second_pass_reviewer` | **2** | Reflection. Takes every decision proposing archive and asks a reviewer prompt (`prompts/reviewer.md`) one question only: *is this a false negative — something the user would be upset to miss?* Any flip becomes `keep` with `decided_by="reviewer"` and the reviewer's reasoning appended. Batched 20–50 |
+| `apply_never_miss_floor` | **2** | Enforces: (a) confidence < `confidence_floor` → `needs_your_call`; (b) sender in VIP or `ever_replied` and no explicit override → force `keep`; (c) `time_sensitive` true → force `keep` unless a user-promoted rule explicitly says otherwise |
+| `cluster_decisions` | 1 | `tools.clustering.cluster()` groups decisions by mailing-list id → sender → domain → category, emitting `Cluster` rows with counts, a suggested bulk action and the minimum confidence in the cluster |
+| `persist_decisions` | 1 | Writes `Decision`, `Cluster`, `LlmCall` rows; updates `TriageRun` counts/cost. Idempotent on `(run_id, item_id)` so a resumed run never double-decides |
+| `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible |
+| `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event |
+
+In Phase 1 `second_pass_reviewer` and `apply_never_miss_floor` are **not in the graph** (the graph is
+rewired in Phase 2 slice 1). Phase 1 applies a simple floor inside `persist_decisions`: confidence <
+0.75 → `needs_your_call`. Phase 1 is dry-run, so no mutation depends on them.
+
+---
+
+## Edges
 
 ```
-START
-  │
-  ▼
-node_a ──(error)──► node_handle_error ──► END
-  │
-  ▼
-node_b ──(condition)──► node_c
-  │                         │
-  │                         ▼
-  └──────────────────► node_finalize
-                             │
-                             ▼
-                            END
+START → load_context
+load_context        → fetch_items                    | error → handle_error
+fetch_items         → redact_items                   | error → handle_error
+redact_items        → apply_deterministic_rules
+apply_deterministic_rules → apply_sender_history
+apply_sender_history → route_after_history:
+        "llm"       → prepare_llm_batches
+        "skip_llm"  → cluster_decisions              (everything resolved by tiers 1-2)
+prepare_llm_batches → Send(*) → llm_classify_batch   (fan-out, max concurrency 4)
+llm_classify_batch  → route_after_llm:
+        "deep"      → deep_read_escalation
+        "done"      → second_pass_reviewer           (Phase 1: → cluster_decisions)
+deep_read_escalation → second_pass_reviewer          (Phase 1: → cluster_decisions)
+second_pass_reviewer → apply_never_miss_floor        (Phase 2+)
+apply_never_miss_floor → cluster_decisions           (Phase 2+)
+cluster_decisions   → persist_decisions              | error → handle_error
+persist_decisions   → finalize
+finalize            → END
+handle_error        → END
 ```
 
-**Conditional edges:**
+Routing functions (`src/graph/edges.py`):
 
-| Source node | Condition | Target |
-|-------------|-----------|--------|
-| <!-- node --> | <!-- e.g. state["error"] is not None --> | <!-- target node --> |
-
----
-
-## Memory & Context
-
-<!-- FILL IN: How does the agent remember things across turns, steps, or runs? -->
-
-| Scope | Mechanism | What is stored |
-|-------|-----------|----------------|
-| **Within a run** | LangGraph state | All in-progress data |
-| **Across runs** | <!-- DB / vector store / none --> | <!-- e.g. past results, user prefs --> |
-| **Conversation** | <!-- message history / summary / none --> | <!-- if chat-style --> |
-
-**Context window management:** <!-- How is the prompt kept within limits? (summary, sliding window, RAG retrieval) -->
+- `route_after_history(state) -> "llm" | "skip_llm"` — `"llm"` iff `state["llm_queue"]` is non-empty.
+- `route_after_llm(state) -> "deep" | "done"` — `"deep"` iff `state["deep_queue"]` is non-empty.
+- Every node-level edge is guarded: if `state.get("error")` is set, route to `handle_error`.
 
 ---
 
-## Human-in-the-Loop Checkpoints
+## Concurrency
 
-<!-- FILL IN: Where does execution pause for human input? Delete section if not applicable. -->
+- LLM batch fan-out via `Send`, **max 4 concurrent batches** (`config={"max_concurrency": 4}`).
+- Batch size 20–50 items, chosen by an estimated-token budget of ~12k input tokens per call.
+- `deep_read_escalation` is capped at **25 items per run**; overflow goes straight to
+  `needs_your_call` rather than blowing the budget or silently archiving.
+- Only `persist_decisions` writes to the DB, in one transaction per run — no write contention between
+  parallel branches.
 
-| Checkpoint | What is shown to the user | Expected user action | Timeout / default |
-|------------|--------------------------|----------------------|-------------------|
-| <!-- name --> | <!-- what the agent surfaces --> | <!-- approve / edit / abort --> | <!-- timeout action --> |
+## Error Handler
 
----
+`handle_error` never fails the user's mail. It: records `TriageRun.status="failed"` and the error
+message, marks every item without a decision as `needs_your_call`, emits a structlog `error` event
+with `run_id`, and ends. A partial run is always resumable — `persist_decisions` is idempotent on
+`(run_id, item_id)`.
 
-## Error Handling & Recovery
+## Finalize
 
-<!-- FILL IN: How the agent handles failures at each level. -->
+`finalize` writes `status="completed"`, the per-tier counts, the token/cost totals, and emits a single
+structlog event: `run_id`, `total`, `by_tier`, `needs_your_call`, `llm_calls`, `usd`, `duration_ms`.
+That event is the source for the Phase 3 cost panel.
 
-**Node-level:** <!-- Each node catches its own exceptions; fatal errors set state["error"] and route to handle_error node. -->
-
-**Graph-level (handle_error node):**
-- Reads: `state.error`, `state.run_id`
-- Updates DB: run status → "failed", `error_message`, `completed_at`
-- Logs error with `run_id` context
-- Terminates graph
-
-**Resume / retry strategy:** <!-- Can a failed run be resumed from its last checkpoint? How? -->
-
-**Partial failure:** <!-- If a non-critical step fails, does the agent degrade gracefully or abort? -->
-
----
-
-## Observability
-
-<!-- FILL IN: What is logged, traced, and measured? -->
-
-| Signal | What | Where |
-|--------|------|-------|
-| **Trace** | One trace per run, one span per node | <!-- OpenTelemetry / LangSmith / stdout --> |
-| **LLM calls** | Prompt tokens, completion tokens, latency, model | <!-- LangSmith / structured log --> |
-| **Tool calls** | Tool name, inputs, success/error, latency | Structured log |
-| **Run outcome** | Status, total duration, error if any | DB + structured log |
-
----
-
-## Concurrency Model
-
-<!-- FILL IN: How concurrent agent runs are handled. -->
-
-- **Run isolation:** <!-- one-at-a-time (API returns 409) / queue / parallel with run_id scoping -->
-- **Parallel nodes within a run:** <!-- which nodes run in parallel and why -->
-- **Checkpointing:** <!-- none / SqliteSaver / PostgresSaver — required if human-in-the-loop or long-running -->
-
----
-
-## Graph Assembly (`agent/graph.py`)
-
-<!-- FILL IN: Pseudocode showing how nodes and edges are wired. Must be ≤ 60 lines in the real file. -->
+## Graph Assembly (pseudocode)
 
 ```python
-graph = StateGraph(AgentState)
+# src/graph/agent.py
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+from graph.state import TriageState
+from graph import nodes, edges
 
-graph.add_node("node_a", node_a)
-graph.add_node("node_b", node_b)
-graph.add_node("finalize", node_finalize)
-graph.add_node("handle_error", node_handle_error)
+def _build_triage_graph():
+    g = StateGraph(TriageState)
+    for name in ("load_context", "fetch_items", "redact_items",
+                 "apply_deterministic_rules", "apply_sender_history",
+                 "prepare_llm_batches", "llm_classify_batch",
+                 "deep_read_escalation", "cluster_decisions",
+                 "persist_decisions", "handle_error", "finalize"):
+        g.add_node(name, getattr(nodes, name))
+    # Phase 2 adds:
+    # g.add_node("second_pass_reviewer", nodes_review.second_pass_reviewer)
+    # g.add_node("apply_never_miss_floor", nodes_review.apply_never_miss_floor)
 
-graph.set_entry_point("node_a")
+    g.add_edge(START, "load_context")
+    g.add_conditional_edges("load_context", edges.guard("fetch_items"),
+                            {"fetch_items": "fetch_items", "handle_error": "handle_error"})
+    g.add_conditional_edges("fetch_items", edges.guard("redact_items"),
+                            {"redact_items": "redact_items", "handle_error": "handle_error"})
+    g.add_edge("redact_items", "apply_deterministic_rules")
+    g.add_edge("apply_deterministic_rules", "apply_sender_history")
+    g.add_conditional_edges("apply_sender_history", edges.route_after_history,
+                            {"llm": "prepare_llm_batches", "skip_llm": "cluster_decisions"})
+    g.add_conditional_edges("prepare_llm_batches",
+                            lambda s: [Send("llm_classify_batch", {**s, "batch": b})
+                                       for b in s["batches"]],
+                            ["llm_classify_batch"])
+    g.add_conditional_edges("llm_classify_batch", edges.route_after_llm,
+                            {"deep": "deep_read_escalation", "done": "cluster_decisions"})
+    g.add_edge("deep_read_escalation", "cluster_decisions")
+    g.add_conditional_edges("cluster_decisions", edges.guard("persist_decisions"),
+                            {"persist_decisions": "persist_decisions", "handle_error": "handle_error"})
+    g.add_edge("persist_decisions", "finalize")
+    g.add_edge("finalize", END)
+    g.add_edge("handle_error", END)
+    return g.compile()
 
-graph.add_conditional_edges(
-    "node_a",
-    lambda s: "handle_error" if s.get("error") else "node_b",
-)
-
-graph.add_edge("node_b", "finalize")
-graph.add_edge("finalize", END)
-graph.add_edge("handle_error", END)
-
-compiled_graph = graph.compile()
+triage_graph = _build_triage_graph()
 ```
+
+`src/graph/runner.py` exposes the entry point used by the API and by tests:
+
+```python
+def run_triage(*, user_id: str, channel_account_id: str, limit: int = 200,
+               dry_run: bool = True, run_id: str | None = None) -> str:
+    """Creates (or resumes) a TriageRun, invokes triage_graph, returns run_id."""
+```
+
+## Chat-to-Rules Graph (Phase 3)
+
+A small separate graph in `src/graph/chat_graph.py`:
+
+```
+START → load_chat_history → interpret_intent → (route)
+            "rule"    → draft_rule → simulate_dry_run → respond → END
+            "question"→ answer_from_state → respond → END
+            "amend"   → load_prior_rule → draft_rule → simulate_dry_run → respond → END
+```
+
+`ChatState` carries `messages: Annotated[list, operator.add]` — the full prior turn history for that
+user is loaded from the `chat_messages` table on every turn, so "actually make that only for weekends"
+correctly amends the rule from the previous turn. Conversation memory is a **required** part of this
+capability, not an enhancement. Every drafted rule is simulated in dry-run before the user is shown
+the "Apply" button.

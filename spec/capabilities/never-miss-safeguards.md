@@ -1,0 +1,60 @@
+# Capability: Never-Miss Safeguards
+
+## What It Does
+Enforces the product's overriding guarantee — an important email must never be missed — through three
+independent mechanisms: a second-pass reviewer hunting only for false negatives, a confidence floor
+below which nothing is ever archived, and a reply-history signal that protects anyone the user has
+ever replied to.
+
+**All three must be live and tested before any phase performs a real mailbox mutation.**
+
+## Inputs
+| Input | Type | Source | Required |
+|-------|------|--------|----------|
+| Archive proposals | `Decision[]` | cost-tiered triage | Yes |
+| Confidence floor | float | `user_settings` | Yes |
+| Sender reply history | `ever_replied` per sender | `sender_profiles` | Yes |
+| VIP list | entries | `vip_entries` | Yes |
+| Priorities profile | text | `priority_profiles` | No |
+
+## Outputs
+| Output | Type | Destination |
+|--------|------|-------------|
+| Flipped decisions | `Decision[]` with `decided_by="reviewer"` | `decisions` |
+| Needs-your-call queue | decisions with `status="needs_your_call"` | `decisions` |
+| Reviewer reasoning | text appended to the decision | `decisions.reasoning` |
+| Possible-missed-important flags | list | proactive surface |
+
+## External Calls
+| System | Operation | On Failure |
+|--------|-----------|------------|
+| LLM provider | second-pass review, batched 20–50 archive proposals | Retry 3×; on persistent failure **every unreviewed archive proposal becomes `needs_your_call`** — the run never proceeds to archive un-reviewed mail |
+
+## Business Rules
+- **Mechanism A — second-pass reviewer.** A separate prompt and a separate call see only the archive
+  proposals and answer one question: *would the user be upset to miss this?* A flip becomes `keep`
+  with `decided_by="reviewer"` and the reviewer's reasoning appended to the original reasoning. The
+  reviewer can only flip archive→keep, never keep→archive.
+- **Mechanism B — confidence floor.** Any archive proposal with confidence below
+  `user_settings.confidence_floor` (default 0.75) becomes `needs_your_call` and stays in the inbox. The
+  floor is user-adjustable but cannot be set to 0.
+- **Mechanism C — reply-history signal.** A sender with `ever_replied = true` is important: their
+  threads are forced to `keep` unless the user has created an explicit override rule naming that
+  sender. This is checked after the reviewer, so it cannot be argued away by the model.
+- VIP entries (email, domain, keyword) can never be archived automatically, at any confidence.
+- `time_sensitive` threads (deadlines, invoices, legal, security alerts) are forced to `keep` unless a
+  user-promoted automatic rule explicitly covers them.
+- Degradation always errs visible: any error, timeout, or unparseable response results in the mail
+  staying in the inbox.
+- The order is fixed: reviewer → floor → reply-history/VIP/time-sensitive overrides. Later stages can
+  only make an outcome *more* conservative.
+
+## Success Criteria
+- [ ] Over the 220-thread fixture, zero threads from `ever_replied` senders are proposed for archive.
+- [ ] Every archive proposal below the configured floor has `status = needs_your_call` and no mutation.
+- [ ] The reviewer flips the seeded false-negative bait thread (an important thread disguised as a
+      newsletter) from archive to keep, and the flip is visible in the reasoning with
+      `decided_by="reviewer"`.
+- [ ] A VIP-listed domain is never archived even when the classifier assigns 0.99 confidence to archive.
+- [ ] A forced reviewer failure leaves 100% of archive proposals in `needs_your_call` — none applied.
+- [ ] Setting the confidence floor to 0 is rejected with a validation error.
