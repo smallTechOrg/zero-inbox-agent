@@ -15,7 +15,6 @@ export function RunProgress({
   const total = run.items_total ?? 0
   const decided = run.items_decided ?? 0
   const active = isRunActive(run.status)
-  const counts = Object.entries(run.counts ?? {})
 
   // `items_total` is written early in the run, but there is a brief window at
   // the start where the mailbox has not been listed yet. That window is shown
@@ -79,15 +78,21 @@ export function RunProgress({
         )}
       </div>
 
-      {counts.length > 0 ? (
+      {run.counts && run.counts.by_tier ? (
         <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-blue-900">
-          {counts.map(([k, v]) => (
-            <li key={k}>
-              <span className="font-medium">{k.replace(/_/g, ' ')}</span>{' '}
-              <span className="font-mono">{v}</span>
+          {Object.entries(run.counts.by_tier).map(([tier, count]) => (
+            <li key={tier} className="flex items-center gap-1">
+              <span className="font-medium">{tier.replace(/_/g, ' ')}</span>
+              <span className="font-mono">{count}</span>
             </li>
           ))}
         </ul>
+      ) : null}
+
+      {run.counts && run.counts.needs_your_call ? (
+        <p className="mt-1 text-xs text-amber-800">
+          {run.counts.needs_your_call} need your call
+        </p>
       ) : null}
 
       {run.status === 'failed' ? (
