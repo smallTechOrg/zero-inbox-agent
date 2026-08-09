@@ -99,6 +99,27 @@ export default function Dashboard() {
     }
   }, [])
 
+  // Resume the last completed/running run on load — a triage pass already paid
+  // for should be visible on refresh, not thrown away and re-run from scratch.
+  useEffect(() => {
+    if (!connection || run) return
+    let cancelled = false
+    void api.latestRun().then(latest => {
+      if (cancelled || !latest) return
+      setRun(latest)
+      // A resumed *completed* run never enters the active-run polling effect
+      // below (it only fires for RUN_ACTIVE statuses), so its clusters must be
+      // fetched here explicitly or the queue stays empty after a refresh.
+      if (!RUN_ACTIVE(latest.status)) void loadClusters(latest.id)
+    }).catch(() => {
+      // No prior run yet, or it couldn't be loaded — the empty state below
+      // (Start Triage) is the correct fallback, so this is silently ignored.
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [connection, run, loadClusters])
+
   // Poll run progress every 1s while active; results stream in as they land.
   useEffect(() => {
     if (!run || !RUN_ACTIVE(run.status)) return

@@ -44,6 +44,25 @@ def load_run(session: Session, run_id: str, user_id: str):
     return run
 
 
+@router.get("/api/runs/latest")
+def get_latest_run(
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """The run worth showing on dashboard load — completed or running only.
+
+    Registered ahead of ``/api/runs/{run_id}`` so the literal path ``latest``
+    is matched here rather than treated as a run id (Starlette matches routes
+    in registration order, not by specificity).
+    """
+    from api.triage import _latest_run_id
+
+    run_id = _latest_run_id(session, user_id)
+    if run_id is None:
+        return ok(None)
+    return ok(run_payload(load_run(session, run_id, user_id)))
+
+
 @router.get("/api/runs/{run_id}")
 def get_run(
     run_id: str,

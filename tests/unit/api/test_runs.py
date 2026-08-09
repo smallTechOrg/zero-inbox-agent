@@ -135,6 +135,65 @@ def test_get_run_returns_the_persisted_progress_payload(client, seed, sign_in):
     assert data["started_at"] and data["finished_at"]
 
 
+def test_latest_run_resumes_the_last_completed_run_without_retriaging(
+    client, seed, sign_in
+):
+    """Regression: the dashboard only fetched /api/me on load and never asked for
+    a prior run, so a completed triage pass a user already paid for vanished on
+    refresh until they clicked Start Triage again."""
+    sign_in("user-alice")
+    res = client.get("/api/runs/latest")
+    assert res.status_code == 200
+    data = res.json()["data"]
+
+    assert data["id"] == "run-alice"
+    assert data["status"] == "completed"
+
+
+def test_latest_run_is_null_when_the_user_has_never_run_triage(
+    client, db, sign_in
+):
+    from db.models import ChannelAccount, User, UserSettings
+
+    db.add(User(id="user-new", email="new@example.com", display_name="New"))
+    db.add(UserSettings(user_id="user-new"))
+    db.commit()
+
+    sign_in("user-new")
+    res = client.get("/api/runs/latest")
+    assert res.status_code == 200
+    assert res.json()["data"] is None
+
+
+def test_latest_run_ignores_a_cancelled_run_behind_a_completed_one(
+    client, db, seed, sign_in
+):
+    """A cancelled/failed run must never bury a prior good completed run —
+    same guarantee GET /api/triage/clusters already relies on."""
+    from datetime import datetime, timedelta, timezone
+
+    from db.models import TriageRun
+
+    db.add(
+        TriageRun(
+            id="run-alice-cancelled",
+            user_id="user-alice",
+            channel_account_id="conn-alice",
+            status="cancelled",
+            dry_run=True,
+            items_total=10,
+            items_decided=0,
+            counts={},
+            started_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    db.commit()
+
+    sign_in("user-alice")
+    res = client.get("/api/runs/latest")
+    assert res.json()["data"]["id"] == "run-alice"
+
+
 def test_get_another_users_run_is_not_found(client, seed, sign_in):
     sign_in("user-alice")
     res = client.get("/api/runs/run-bob")

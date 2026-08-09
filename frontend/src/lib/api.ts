@@ -58,6 +58,9 @@ export const api = {
 
   run: (runId: string) => request<Run>(`/api/runs/${runId}`),
 
+  /** The most recent completed/running run, or null if none exists yet. */
+  latestRun: () => request<Run | null>('/api/runs/latest'),
+
   cancelRun: (runId: string) =>
     request<{ status: string }>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
 
