@@ -133,9 +133,18 @@ export const ClusterCard = forwardRef<ClusterCardHandle, { cluster: Cluster; dry
             // expanded (e.g. the keyboard shortcut `A`) — load its threads
             // first if they are not already in state.
             const list = items ?? (await api.clusterItems(cluster.id))
-            const ids = list.map(i => i.decision_id)
+            // A cluster's suggested_action is only a hint, not a guarantee every
+            // member shares it (e.g. a mixed "Time-sensitive" cluster) —
+            // approving 'keep' members must never reach a real mutation.
+            const ids = list
+              .filter(i => i.proposed_action === 'archive' || i.proposed_action === 'digest')
+              .map(i => i.decision_id)
             await applyApproved(ids)
-            setBulkResult(`${res.updated} thread(s) approved and archived in Gmail.`)
+            setBulkResult(
+              ids.length > 0
+                ? `${res.updated} thread(s) approved; ${ids.length} archived in Gmail.`
+                : `${res.updated} thread(s) approved — nothing here was eligible to archive.`,
+            )
           }
         } catch (e) {
           setError(e)

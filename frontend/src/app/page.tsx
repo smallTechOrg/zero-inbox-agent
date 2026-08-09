@@ -192,7 +192,14 @@ export default function Dashboard() {
         // approved, then apply — needs_your_call items were already excluded
         // server-side, so nothing here can archive something below the floor.
         const approvedItems = await api.itemsByStatus(run.id, 'approved')
-        const ids = approvedItems.map(i => i.decision_id)
+        // Approving a 'keep' proposal means "yes, this stays in my inbox" —
+        // it is never eligible for a real mutation. Only archive/digest
+        // proposals may reach /api/actions/apply (the backend now enforces
+        // this too, via NotArchivableError, but filtering here avoids a wall
+        // of harmless-but-noisy per-id errors on a bulk approve-all).
+        const ids = approvedItems
+          .filter(i => i.proposed_action === 'archive' || i.proposed_action === 'digest')
+          .map(i => i.decision_id)
         if (ids.length > 0) {
           const results = await api.applyDecisions(ids)
           const archived = results.filter(r => r.action_log_id).length

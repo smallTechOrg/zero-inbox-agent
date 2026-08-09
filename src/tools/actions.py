@@ -43,6 +43,17 @@ class NotApprovedError(ActionsError):
     """Only ``approved`` decisions are eligible for ``POST /api/actions/apply``."""
 
 
+class NotArchivableError(ActionsError):
+    """A ``keep``-proposed decision can never reach a Gmail mutation.
+
+    Approving a ``keep`` proposal means "yes, this belongs in my inbox" — a
+    confirmation, not an instruction to archive it. Only ``archive`` and
+    ``digest`` proposals may ever be mutated; this is the enforcement point
+    for that, independent of whatever a caller (bulk-approve, a UI bug, a
+    future integration) marked ``approved``.
+    """
+
+
 class Mutator(Protocol):
     def archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict: ...
     def undo_archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict: ...
@@ -92,6 +103,11 @@ def apply_decision(
     if decision.status != "approved":
         raise NotApprovedError(
             f"only approved decisions are eligible for apply (status={decision.status!r})"
+        )
+    if decision.proposed_action not in ("archive", "digest"):
+        raise NotArchivableError(
+            f"a {decision.proposed_action!r}-proposed decision can never be archived "
+            "(only 'archive' and 'digest' proposals may be mutated)"
         )
 
     item = session.get(m.Item, decision.item_id)
