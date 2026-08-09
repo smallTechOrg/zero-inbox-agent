@@ -1,6 +1,12 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useState,
+} from 'react'
 import { api } from '@/lib/api'
 import type { Cluster, TriageItem } from '@/lib/types'
 import { ActionChip } from './TierBadge'
@@ -33,66 +39,81 @@ function KindChip({ kind }: { kind: string }) {
   )
 }
 
-export function ClusterCard({ cluster }: { cluster: Cluster }) {
-  const [open, setOpen] = useState(false)
-  const [items, setItems] = useState<TriageItem[] | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<unknown>(null)
-  const [busy, setBusy] = useState(false)
-  const [bulkResult, setBulkResult] = useState<string | null>(null)
+export type ClusterCardHandle = {
+  approve: () => Promise<void>
+  reject: () => Promise<void>
+  approveAll: () => Promise<void>
+  toggle: () => void
+}
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setItems(await api.clusterItems(cluster.id))
-    } catch (e) {
-      setError(e)
-    } finally {
-      setLoading(false)
-    }
-  }, [cluster.id])
+export const ClusterCard = forwardRef<ClusterCardHandle, { cluster: Cluster }>(
+  function ClusterCard({ cluster }, ref) {
+    const [open, setOpen] = useState(false)
+    const [items, setItems] = useState<TriageItem[] | null>(null)
+    const [loading, setLoading] = useState(false)
+    const [error, setError] = useState<unknown>(null)
+    const [busy, setBusy] = useState(false)
+    const [bulkResult, setBulkResult] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open && items === null && !loading && !error) void load()
-  }, [open, items, loading, error, load])
-
-  const decide = useCallback(
-    async (decisionId: string, status: 'approved' | 'rejected') => {
-      setBusy(true)
+    const load = useCallback(async () => {
+      setLoading(true)
       setError(null)
       try {
-        await api.decide(decisionId, status)
-        setItems(prev =>
-          prev ? prev.map(i => (i.decision_id === decisionId ? { ...i, status } : i)) : prev,
-        )
+        setItems(await api.clusterItems(cluster.id))
       } catch (e) {
         setError(e)
       } finally {
-        setBusy(false)
+        setLoading(false)
       }
-    },
-    [],
-  )
+    }, [cluster.id])
 
-  const decideAll = useCallback(
-    async (status: 'approved' | 'rejected') => {
-      setBusy(true)
-      setError(null)
-      try {
-        const res = await api.decideCluster(cluster.id, status)
-        setBulkResult(`${res.updated} thread(s) ${status} — recorded only, Gmail untouched.`)
-        setItems(prev => (prev ? prev.map(i => ({ ...i, status })) : prev))
-      } catch (e) {
-        setError(e)
-      } finally {
-        setBusy(false)
-      }
-    },
-    [cluster.id],
-  )
+    useEffect(() => {
+      if (open && items === null && !loading && !error) void load()
+    }, [open, items, loading, error, load])
 
-  return (
+    const decide = useCallback(
+      async (decisionId: string, status: 'approved' | 'rejected') => {
+        setBusy(true)
+        setError(null)
+        try {
+          await api.decide(decisionId, status)
+          setItems(prev =>
+            prev ? prev.map(i => (i.decision_id === decisionId ? { ...i, status } : i)) : prev,
+          )
+        } catch (e) {
+          setError(e)
+        } finally {
+          setBusy(false)
+        }
+      },
+      [],
+    )
+
+    const decideAll = useCallback(
+      async (status: 'approved' | 'rejected') => {
+        setBusy(true)
+        setError(null)
+        try {
+          const res = await api.decideCluster(cluster.id, status)
+          setBulkResult(`${res.updated} thread(s) ${status} — recorded only, Gmail untouched.`)
+          setItems(prev => (prev ? prev.map(i => ({ ...i, status })) : prev))
+        } catch (e) {
+          setError(e)
+        } finally {
+          setBusy(false)
+        }
+      },
+      [cluster.id],
+    )
+
+    useImperativeHandle(ref, () => ({
+      approve: () => decideAll('approved'),
+      reject: () => decideAll('rejected'),
+      approveAll: () => decideAll('approved'),
+      toggle: () => setOpen(o => !o),
+    }))
+
+    return (
     <li
       data-testid="cluster-row"
       className="rounded-lg border border-gray-200 bg-white shadow-sm"
@@ -174,6 +195,8 @@ export function ClusterCard({ cluster }: { cluster: Cluster }) {
           )}
         </div>
       ) : null}
-    </li>
+      </li>
+    )
+    },
   )
-}
+

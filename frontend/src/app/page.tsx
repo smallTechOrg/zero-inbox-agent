@@ -5,7 +5,8 @@ import { api, AUTH_START_URL } from '@/lib/api'
 import { isRunActive, type Cluster, type Me, type Run } from '@/lib/types'
 import { DryRunBanner, LeftRail, StatusPill } from '@/components/Chrome'
 import { ConnectCard } from '@/components/ConnectCard'
-import { ClusterCard } from '@/components/ClusterCard'
+import { ClusterCard, type ClusterCardHandle } from '@/components/ClusterCard'
+import SettingsPanel from '@/components/Settings'
 import { NeedsYourCall } from '@/components/NeedsYourCall'
 import { RunProgress } from '@/components/RunProgress'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
@@ -23,11 +24,48 @@ export default function Dashboard() {
   const [runError, setRunError] = useState<unknown>(null)
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [activeView, setActiveView] = useState<'triage' | 'settings'>('triage')
 
   const [clusters, setClusters] = useState<Cluster[] | null>(null)
   const [clustersLoading, setClustersLoading] = useState(false)
   const [clustersError, setClustersError] = useState<unknown>(null)
+  const clusterRefs = useRef<Map<string, ClusterCardHandle | null>>(new Map())
+  const focusedId = useRef<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+
+  // Keyboard sweep: j/k move between clusters, a approve, x reject,
+  // A approve whole cluster, Enter expand/collapse. (spec/ui.md §2)
+  const handleKeyDown = useCallback(
+    async (e: React.KeyboardEvent<HTMLUListElement>) => {
+      if (!clusters || clusters.length === 0) return
+      const ids = clusters.map(c => c.id)
+      if (focusedId.current === null || !ids.includes(focusedId.current)) {
+        focusedId.current = ids[0]
+      }
+      const idx = ids.indexOf(focusedId.current)
+      const card = clusterRefs.current.get(focusedId.current)
+      if (e.key === 'j') {
+        e.preventDefault()
+        focusedId.current = ids[(idx + 1) % ids.length]
+      } else if (e.key === 'k') {
+        e.preventDefault()
+        focusedId.current = ids[(idx - 1 + ids.length) % ids.length]
+      } else if (e.key === 'a') {
+        e.preventDefault()
+        void card?.approve()
+      } else if (e.key === 'x') {
+        e.preventDefault()
+        void card?.reject()
+      } else if (e.key === 'A') {
+        e.preventDefault()
+        void card?.approveAll()
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        card?.toggle()
+      }
+    },
+    [clusters],
+  )
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -173,10 +211,24 @@ export default function Dashboard() {
       </header>
 
       <div className="flex items-stretch">
-        <LeftRail />
+        <LeftRail
+          onNavigate={label => setActiveView(label === 'Settings' ? 'settings' : 'triage')}
+          active={activeView === 'settings' ? 'Settings' : 'Triage'}
+        />
 
-        <main id="triage-queue" className="min-w-0 flex-1 space-y-4 p-4">
-          {meLoading ? (
+        <main
+          id={activeView === 'settings' ? 'settings-panel' : 'triage-queue'}
+          className="min-w-0 flex-1 space-y-4 p-4"
+        >
+          {activeView === 'settings' ? (
+            <SettingsPanel
+              settings={me?.settings ?? null}
+              onSettingsChange={s => {
+                /* Phase 1: optimistic client-only (save endpoint lands in Phase 2) */
+                if (me) setMe({ ...me, settings: s })
+              }}
+            />
+          ) : meLoading ? (
             <SkeletonRows rows={3} label="Loading your account…" />
           ) : meError ? (
             <ErrorState error={meError} onRetry={() => void loadMe()} />
@@ -225,9 +277,15 @@ export default function Dashboard() {
                 ) : clusters === null && clustersLoading ? (
                   <SkeletonRows rows={5} label="Loading clusters…" />
                 ) : clusters && clusters.length > 0 ? (
-                  <ul className="space-y-2">
+                  <ul className="space-y-2" onKeyDown={handleKeyDown} tabIndex={-1}>
                     {clusters.map(c => (
-                      <ClusterCard key={c.id} cluster={c} />
+                      <ClusterCard
+                        key={c.id}
+                        cluster={c}
+                        ref={node => {
+                          clusterRefs.current.set(c.id, node)
+                        }}
+                      />
                     ))}
                   </ul>
                 ) : RUN_ACTIVE(run.status) ? (

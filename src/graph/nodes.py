@@ -378,7 +378,7 @@ def fetch_items(state: TriageState) -> dict:
         _record_progress(state.get("run_id"), items_total=len(items))
         return {"items": items, "error": None}
     try:
-        from channels import get_adapter  # provided by the gmail-adapter slice
+        from channels import get_adapter
 
         adapter = get_adapter(
             user_id=state["user_id"], channel_account_id=state["channel_account_id"]
@@ -394,9 +394,55 @@ def fetch_items(state: TriageState) -> dict:
         # The progress bar's denominator, written the moment the total is known —
         # not at the end of the run (spec/api.md: GET /api/runs is polled at 1s).
         _record_progress(state.get("run_id"), items_total=len(items))
-        return {"items": items, "error": None}
+        # Harvest + persist per-sender evidence so the never-miss reply-history
+        # signal (sender_profiles.ever_replied) and the learned bulk-archive
+        # heuristic feed tier 2 of the cascade. Best-effort: a channel read
+        # failure must not fail ingestion of the threads already fetched.
+        sender_stats = _harvest_sender_stats(adapter, state["user_id"])
+        return {
+            "items": items,
+            "sender_stats": sender_stats,
+            "error": None,
+        }
     except Exception as exc:
         return {"error": f"fetch_items failed: {exc}"}
+
+
+def _harvest_sender_stats(adapter, user_id: str) -> dict[str, dict]:
+    """Pull sender evidence from the channel and persist it for this user.
+
+    Returns the in-memory ``sender_stats`` map (keyed by lowercased sender
+    email) so downstream nodes can use it without a re-read; the rows are also
+    written to ``sender_profiles`` per spec/data.md + spec/capabilities/thread-ingestion.md
+    ("Sender evidence updates → sender_profiles").
+    """
+    from db.session import create_db_session
+    from graph.persistence import persist_sender_profiles
+
+    signals = adapter.sender_history()
+    # ``sender_history`` returns ``SenderSignal`` per address the user has
+    # replied to (harvested from the SENT label). It carries reply evidence only;
+    # the received/opened/archived counts are maintained from the inbox pass
+    # elsewhere and are merged here as 0 (a sender not in the sent folder has 0
+    # reply-derived evidence yet is still tracked so it can be learned later).
+    stats = {
+        email: {
+            "received_count": 0,
+            "opened_count": 0,
+            "replied_count": sig.get("replied_count", 0) if hasattr(sig, "get") else getattr(sig, "replied_count", 0),
+            "archived_by_user_count": 0,
+            "ever_replied": bool(sig.get("ever_replied", False) if hasattr(sig, "get") else getattr(sig, "ever_replied", False)),
+            "last_replied_at": sig.get("last_replied_at") if hasattr(sig, "get") else getattr(sig, "last_replied_at", None),
+            "last_seen_at": datetime.now(timezone.utc),
+        }
+        for email, sig in (signals or {}).items()
+    }
+    try:
+        with create_db_session() as session:
+            persist_sender_profiles(session, user_id=user_id, signals=stats)
+    except Exception as exc:  # pragma: no cover - best effort, never blocks a run
+        log.warning("triage.sender_profile_persist_failed", user_id=user_id, error=str(exc))
+    return stats
 
 
 def redact_items(state: TriageState) -> dict:

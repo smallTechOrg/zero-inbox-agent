@@ -31,71 +31,70 @@ This applies to all project types — Python packages, static web apps, TypeScri
 
 The repo root **is** the agent project. There is no `<agent-slug>/` subdirectory — boilerplate files (`spec/`, `harness/`, `CLAUDE.md`) coexist with project files at the root.
 
-**One package only.** The skeleton ships `src/agent/`. If the spec needs a different package name (e.g. `xyz_agent`), **rename `src/agent/` in place** — never create a second package beside it. `src/xyz/` sitting next to `src/agent/` is always wrong: it duplicates the wired-up baseline instead of extending it, leaving dead code and two sources of truth.
+**One package only.** The skeleton baseline shipped `src/agent/` with a `transform_text`
+capability slot. Once a phase **replaces** that slot, the baseline's dead artifacts must be
+deleted so generators are never misdirected — this project's slot is the triage graph, so the
+flat layout lives directly under `src/` with no `src/agent/` subpackage:
 
 ```
 <repo root>                           ← repo root IS the agent project
 ├── src/
-│   └── <package>/                    ← Python package (snake_case matches slug)
-│       ├── __init__.py               ← __version__ = "0.1.0"
-│       ├── api/                      ← FastAPI routers
-│       │   ├── __init__.py           ← create_app() factory + lifespan
-│       │   ├── _common.py            ← ok(), api_error()
-│       │   └── <resource>.py         ← one router per domain entity
-│       ├── config/
-│       │   ├── __init__.py
-│       │   └── settings.py           ← Pydantic BaseSettings with env prefix
-│       ├── db/
-│       │   ├── __init__.py
-│       │   ├── models.py             ← SQLAlchemy 2.0 declarative (Mapped types)
-│       │   └── session.py            ← engine + sessionmaker + init_db
-│       ├── domain/
-│       │   ├── __init__.py           ← re-exports all domain models
-│       │   └── <entity>.py           ← Pydantic BaseModel per entity
-│       ├── graph/
-│       │   ├── __init__.py
-│       │   ├── agent.py              ← StateGraph compiled once at startup
-│       │   ├── nodes.py              ← node functions: (state) → state
-│       │   ├── edges.py              ← conditional routing functions
-│       │   ├── state.py              ← AgentState TypedDict
-│       │   └── runner.py             ← run_agent() entry point
-│       ├── llm/
-│       │   ├── __init__.py
-│       │   ├── client.py             ← LLMClient wrapper
-│       │   └── providers/
-│       │       ├── base.py           ← abstract LLMProvider
-│       │       ├── factory.py        ← create_llm_client()
-│       │       └── anthropic.py      ← default provider
-│       ├── tools/                    ← pure functions: (inputs) → domain models
-│       │   └── <tool>.py
-│       ├── prompts/                  ← LLM prompt templates (.md files)
-│       │   └── <name>.md
-│       └── observability/
-│           ├── __init__.py
-│           └── events.py             ← structlog configuration
+│   ├── __init__.py
+│   ├── __main__.py                   ← `uv run python -m src` entry point
+│   ├── api/                          ← FastAPI routers (app factory + routers in __init__.py)
+│   │   ├── _common.py                ← ok() / api_error() response envelope
+│   │   ├── auth.py                   ← Google OAuth web flow
+│   │   ├── connections.py            ← /api/connections/*
+│   │   ├── triage.py                 ← /api/triage/* (clusters, items, review, approve)
+│   │   ├── runs.py                   ← /api/runs/*
+│   │   ├── session.py                ← session cookie deps
+│   │   └── _common.py
+│   ├── channels/                     ← channel-adapter interface + gmail impl
+│   │   ├── base.py                   ← ChannelAdapter ABC, ChannelItem, SenderSignal
+│   │   └── gmail/                    ← oauth.py, store.py, adapter.py, normalize.py
+│   ├── config/
+│   │   └── settings.py               ← Pydantic BaseSettings (AGENT_ env prefix)
+│   ├── db/
+│   │   ├── models.py                 ← SQLAlchemy 2.0 declarative (flat, no subpackage)
+│   │   ├── session.py                ← engine + sessionmaker + create_db_session
+│   │   └── seed.py                   ← ensure_default_taxonomy
+│   ├── domain/                       ← pydantic models for the API surfaces
+│   ├── graph/
+│   │   ├── agent.py                  ← StateGraph compiled once at startup
+│   │   ├── nodes.py                  ← node functions: (state) → state
+│   │   ├── edges.py                  ← conditional routing functions
+│   │   ├── state.py                  ← TriageState TypedDict
+│   │   ├── runner.py                 ← run_triage() entry point
+│   │   └── persistence.py            ← load_context / persist_run_results / persist_sender_profiles
+│   ├── llm/
+│   │   ├── client.py                 ← get_llm_client() (NVIDIA NIM provider)
+│   │   └── providers/                ← base.py, nvidia.py (no anthropic/gemini)
+│   ├── observability/
+│   │   ├── events.py                 ← structlog + LangSmith tracing
+│   │   ├── logging.py
+│   │   └── tracing.py
+│   ├── security/
+│   │   └── crypto.py                 ← Fernet token cipher
+│   ├── tools/
+│   │   ├── rules.py                  ← Tier 1 rules + Tier 2 sender-history matchers
+│   │   ├── clustering.py             ← thread-clustering
+│   │   └── redact.py                 ← snippet/PII redactor
+│   └── prompts/
+│       ├── classify.md               ← batch classification prompt
+│       └── deep_read.md              ← single-thread deep read prompt
 ├── tests/                            ← tests at repo root, NOT inside src/
-│   ├── conftest.py                   ← settings singleton reset fixture
-│   ├── unit/
-│   │   ├── test_smoke.py             ← import pkg; assert __version__
-│   │   ├── config/test_settings.py
-│   │   ├── db/test_models.py
-│   │   ├── domain/test_models.py
-│   │   └── graph/test_agent.py       ← graph compiles without env vars
-│   ├── integration/
-│   │   └── test_pipeline.py          ← real-provider run end-to-end, one DB record, status=completed (+ edge cases / error paths)
-│   ├── e2e/                          ← full primary journey against the real LLM/API + live server
-│   └── ui/                           ← UI-only projects: rendered content + empty/loading/error states
+│   ├── conftest.py
+│   ├── unit/...
+│   ├── integration/...               ← test_triage_pipeline.py (220-thread gate), test_gmail_adapter.py, test_no_body_persisted.py
+│   └── e2e/...                       ← smoke.spec.ts, triage.spec.ts (Playwright)
 ├── alembic/
-│   ├── env.py                        ← reads DB URL from settings; sets target_metadata = Base.metadata
-│   ├── script.py.mako                ← REQUIRED — standard mako template; alembic revision fails without it
-│   └── versions/0001_initial.py      ← generated by: uv run alembic revision --autogenerate -m "initial"
-├── spec/                             ← agent spec files (preserved from boilerplate)
-├── harness/                          ← engineering harness (preserved from boilerplate)
-├── CLAUDE.md                         ← preserved from boilerplate
+├── spec/
+├── harness/
+├── CLAUDE.md
 ├── pyproject.toml
 ├── alembic.ini
 ├── .env.example
-└── README.md                         ← replaces the boilerplate README
+└── README.md
 ```
 
 **Critical:** `tests/` is at the repo root — **not** inside `src/`. The `pyproject.toml` must have `testpaths = ["tests"]` (not `["src/tests"]`).
@@ -162,7 +161,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="APP_",   # replace APP_ with your agent's prefix
+        env_prefix="AGENT_",   # this project's prefix
         env_file=".env",
         case_sensitive=False,
         extra="ignore",
@@ -171,8 +170,8 @@ class Settings(BaseSettings):
     database_url: str = Field(...)
     # Filled from .env (the single manual user step, requested at intake) and
     # required for the real-provider gate; fail fast at startup if it is absent.
-    anthropic_api_key: str = Field(default="")
-    llm_model: str = Field(default="claude-sonnet-4-6")
+    nvidia_api_key: str = Field(default="")
+    llm_model: str = Field(default="nvidia/nemotron-3-nano-30b-a3b")
     log_level: str = Field(default="INFO")
 
 _settings: Settings | None = None
@@ -183,6 +182,8 @@ def get_settings() -> Settings:
         _settings = Settings()
     return _settings
 ```
+
+> This project's package is flat — modules import as `from config.settings import get_settings`, not `<package>.config.settings`. See `src/__main__.py` / `src/api/__init__.py` for the actual entry points.
 
 ### db/session.py
 
@@ -198,7 +199,7 @@ _SessionLocal: sessionmaker | None = None
 def _get_engine() -> Engine:
     global _engine
     if _engine is None:
-        from <package>.config.settings import get_settings
+        from config.settings import get_settings
         _engine = create_engine(get_settings().database_url, echo=False)
     return _engine
 
@@ -230,7 +231,7 @@ def create_db_session() -> Generator[Session, None, None]:
             raise
 
 def init_db() -> None:
-    from <package>.db.models import Base
+    from db.models import Base
     Base.metadata.create_all(bind=_get_engine())
 ```
 
@@ -263,99 +264,66 @@ class RunRow(Base):
 ### graph/state.py
 
 ```python
-from typing import TypedDict
+from typing import Annotated, TypedDict
+import operator
 
-class AgentState(TypedDict, total=False):
+class TriageState(TypedDict, total=False):
     run_id: str
+    user_id: str
     error: str | None
-    # add domain fields here
+    # domain fields (items, sender_stats, rules, decisions, clusters, counts, cost …)
+    resolved: Annotated[list[dict], operator.add]
+    llm_decisions: Annotated[list[dict], operator.add]
 ```
 
-### graph/nodes.py (Phase 1 placeholder shape)
+### graph/nodes.py (shape)
 
 ```python
-from <package>.graph.state import AgentState
+from graph.state import TriageState
 
-STUB_RESULT = {"stub": True}  # placeholder — replaced by real provider calls before the Phase 2 gate
-
-def fetch_data(state: AgentState) -> AgentState:
-    return {**state, "data": STUB_RESULT}
-
-def process(state: AgentState) -> AgentState:
-    return {**state, "processed": True}
-
-def handle_error(state: AgentState) -> AgentState:
-    return {**state, "status": "failed"}
-
-def finalize(state: AgentState) -> AgentState:
-    return {**state, "status": "completed"}
+def fetch_items(state: TriageState) -> dict:
+    ...
 ```
 
 ### graph/edges.py
 
 ```python
-from <package>.graph.state import AgentState
+from graph.state import TriageState
 
-def after_fetch(state: AgentState) -> str:
+def after_fetch(state: TriageState) -> str:
     if state.get("error"):
         return "handle_error"
     return "process"
-
-def after_process(state: AgentState) -> str:
-    if state.get("error"):
-        return "handle_error"
-    return "finalize"
 ```
 
 ### graph/agent.py
 
 ```python
 from langgraph.graph import StateGraph, END
-from <package>.graph.state import AgentState
-from <package>.graph.nodes import fetch_data, process, handle_error, finalize
-from <package>.graph.edges import after_fetch, after_process
+from graph.state import TriageState
+from graph.nodes import fetch_items, process, handle_error, finalize
 
 def _build_graph() -> StateGraph:
-    g = StateGraph(AgentState)
-    g.add_node("fetch_data", fetch_data)
-    g.add_node("process", process)
-    g.add_node("handle_error", handle_error)
-    g.add_node("finalize", finalize)
-    g.set_entry_point("fetch_data")
-    g.add_conditional_edges("fetch_data", after_fetch, {"process": "process", "handle_error": "handle_error"})
-    g.add_conditional_edges("process", after_process, {"finalize": "finalize", "handle_error": "handle_error"})
-    g.add_edge("finalize", END)
-    g.add_edge("handle_error", END)
+    g = StateGraph(TriageState)
+    ...
     return g.compile()
 
-agentic_ai = _build_graph()
+triage_graph = _build_graph()
 ```
 
 ### graph/runner.py
 
 ```python
-from <package>.graph.agent import agentic_ai
-from <package>.graph.state import AgentState
-from <package>.db.session import create_db_session, init_db
-from <package>.db.models import RunRow
+from graph.agent import triage_graph
+from graph.state import TriageState
+from graph.persistence import update_run
+from db.session import create_db_session
 
-def run_agent() -> str:
-    init_db()
-    with create_db_session() as session:
-        run = RunRow()
-        session.add(run)
-        session.flush()
-        run_id = run.id
-
-    initial: AgentState = {"run_id": run_id, "error": None}
-    final = agentic_ai.invoke(initial)
-
-    with create_db_session() as session:
-        run = session.get(RunRow, run_id)
-        run.status = final.get("status", "completed")
-        run.error_message = final.get("error")
-
-    return run_id
+def run_triage(*, user_id: str, channel_account_id: str, limit: int = 200, ...) -> str:
+    """Creates (or resumes) a TriageRun, invokes the triage graph, returns run_id."""
+    ...
+    final = triage_graph.invoke(initial, config={"max_concurrency": 4, "recursion_limit": 100})
+    return final["run_id"]
 ```
 
 ### api/__init__.py
@@ -366,14 +334,17 @@ from fastapi import FastAPI
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    from <package>.db.session import init_db
-    init_db()
+    from db.session import create_db_session  # engine is lazily built
     yield
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="<Agent Name>", version="0.1.0", lifespan=_lifespan)
-    from <package>.api import health
-    app.include_router(health.router)
+    app = FastAPI(title="Zero Inbox Agent", version="0.1.0", lifespan=_lifespan)
+    from api.triage import router as triage_router
+    from api.runs import router as runs_router
+    from api.connections import router as connections_router
+    app.include_router(triage_router)
+    app.include_router(runs_router)
+    app.include_router(connections_router)
     return app
 
 app = create_app()
@@ -394,13 +365,15 @@ def api_error(code: str, message: str, status_code: int = 400) -> HTTPException:
 
 ### tests/conftest.py
 
+This project is flat — modules import without a package prefix. The conftest resets cached settings/singleton state per test:
+
 ```python
 import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_settings_singleton():
     """Reset cached settings so env patches take effect in every test."""
-    import importlib, <package>.config.settings as m
+    import config.settings as m
     m._settings = None
     yield
     m._settings = None
@@ -415,45 +388,8 @@ exact model prose. If a required key is genuinely absent, `pytest.skip` — neve
 fall back to a stub key as the default path. Integration tests also cover edge
 cases and error paths, not just the happy run.
 
-```python
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from <package>.config.settings import get_settings
-from <package>.db.models import Base, RunRow
-from <package>.db import session as session_module
-from <package>.graph.runner import run_agent
-
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    # Isolated copy of the production DB driver (use a temp PostgreSQL DB if prod
-    # is PostgreSQL — never substitute SQLite for a production DB).
-    engine = create_engine(f"sqlite:///{tmp_path}/test.db")
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-    monkeypatch.setattr(session_module, "_engine", engine)
-    monkeypatch.setattr(session_module, "_SessionLocal", factory)
-    monkeypatch.setattr(session_module, "init_db", lambda: None)
-    yield
-    engine.dispose()
-
-@pytest.fixture(autouse=True)
-def _real_env(monkeypatch, tmp_path):
-    # The provider key is loaded from .env via get_settings(); confirm presence
-    # only (bool) — never echo or hardcode the value. Skip (do NOT stub) if absent.
-    monkeypatch.setenv("APP_DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
-    if not get_settings().anthropic_api_key:
-        pytest.skip("real LLM/API key not set in .env — required for the real-provider run")
-
-def test_pipeline_runs_end_to_end(_isolated_db, _real_env):
-    from sqlalchemy.orm import Session
-    run_id = run_agent()  # exercises the real provider end-to-end
-    assert run_id is not None
-    with Session(session_module._engine) as s:
-        run = s.get(RunRow, run_id)
-        assert run is not None
-        assert run.status == "completed"
-```
+Key files: `tests/integration/test_triage_pipeline.py` (the 220-thread gate),
+`tests/integration/test_gmail_adapter.py`, `tests/integration/test_no_body_persisted.py`.
 
 ---
 

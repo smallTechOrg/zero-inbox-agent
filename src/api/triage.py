@@ -217,15 +217,23 @@ def review_cluster(
         )
     ).scalars().all()
 
+    # "Needs your call" decisions are never bulk-approved: the spec
+    # (spec/capabilities/triage-queue-review.md) requires each member to receive
+    # an individual decision, so bulk approval silently skips them rather than
+    # stalling the rest of the cluster. They remain visible in the queue.
     now = datetime.now(timezone.utc)
     updated = 0
+    skipped = 0
     for decision in decisions:
+        if decision.status == "needs_your_call":
+            skipped += 1  # never bulk-acted — user must decide individually
+            continue
         if decision.status == new_status:
             continue
         decision.status = new_status
         decision.decided_at = now
         updated += 1
-    return ok({"updated": updated})
+    return ok({"updated": updated, "skipped_needs_your_call": skipped})
 
 
 @router.get("/api/categories")

@@ -227,7 +227,11 @@ def test_cannot_review_another_users_decision(client, db, seed, sign_in):
     assert db.get(Decision, "dec-bob-1").status == "proposed"
 
 
-def test_bulk_approving_a_cluster_sweeps_only_that_cluster(client, db, seed, sign_in):
+def test_bulk_approving_a_cluster_sweeps_only_proposed_not_needs_your_call(
+    client, db, seed, sign_in
+):
+    """needs_your_call decisions are never bulk-approved — they require an
+    individual decision (spec/capabilities/triage-queue-review.md)."""
     from db.models import ActionLog, Decision
 
     sign_in("user-alice")
@@ -235,14 +239,26 @@ def test_bulk_approving_a_cluster_sweeps_only_that_cluster(client, db, seed, sig
         "/api/triage/clusters/cluster-alice/approve", json={"status": "approved"}
     )
     assert res.status_code == 200
-    assert res.json()["data"] == {"updated": 3}
+    # dec-alice-2 is needs_your_call — it must be skipped by bulk approve.
+    assert res.json()["data"] == {"updated": 2, "skipped_needs_your_call": 1}
 
     db.expire_all()
     alice = db.query(Decision).filter(Decision.user_id == "user-alice").all()
-    assert {d.status for d in alice} == {"approved"}
+    by_id = {d.id: d for d in alice}
+    assert by_id["dec-alice-0"].status == "approved"
+    assert by_id["dec-alice-1"].status == "approved"
+    assert by_id["dec-alice-2"].status == "needs_your_call"
     bob = db.query(Decision).filter(Decision.user_id == "user-bob").all()
     assert {d.status for d in bob} == {"proposed", "needs_your_call"}
     assert db.query(ActionLog).count() == 0
+
+    # Rejecting the cluster should also skip needs_your_call.
+    res_rej = client.post(
+        "/api/triage/clusters/cluster-alice/approve", json={"status": "rejected"}
+    )
+    assert res_rej.json()["data"] == {"updated": 2, "skipped_needs_your_call": 1}
+    db.expire_all()
+    assert db.get(Decision, "dec-alice-2").status == "needs_your_call"
 
 
 def test_bulk_approve_is_idempotent(client, seed, sign_in):
@@ -251,7 +267,7 @@ def test_bulk_approve_is_idempotent(client, seed, sign_in):
     second = client.post(
         "/api/triage/clusters/cluster-alice/approve", json={"status": "approved"}
     )
-    assert second.json()["data"] == {"updated": 0}
+    assert second.json()["data"] == {"updated": 0, "skipped_needs_your_call": 1}
 
 
 def test_bulk_approve_rejects_an_invalid_status(client, seed, sign_in):

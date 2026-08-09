@@ -11,7 +11,9 @@ raw SQL strings — so the queries stay dialect-safe.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -184,6 +186,79 @@ _ITEM_FIELDS = (
     "is_unread",
     "channel_labels",
 )
+
+
+def persist_sender_profiles(
+    session: Session, *, user_id: str, signals: dict[str, dict]
+) -> dict[str, str]:
+    """Upsert per-sender evidence harvested from the channel.
+
+    ``signals`` is keyed by lowercased sender email (the addresses the user has
+    replied to, per ``ChannelAdapter.sender_history``). Each value is a dict with
+    ``received_count``, ``opened_count``, ``replied_count``,
+    ``archived_by_user_count``, ``ever_replied`` and ``last_replied_at``.
+
+    A ``received_count`` derived from the current inbox pass is merged in so the
+    never-miss reply-history signal (``ever_replied``) and the learned bulk-archive
+    heuristic (received / opened / archived ratios) both reflect this run.
+    Idempotent on ``(user_id, sender_email)``.
+    """
+    profile_cls = model_for("sender_profiles")
+    if profile_cls is None:
+        return {}
+    existing = {
+        row.sender_email: row
+        for row in _rows(session, profile_cls, user_id=user_id)
+    }
+    id_map: dict[str, str] = {}
+    for email, stats in (signals or {}).items():
+        row = existing.get(email)
+        values = {
+            "sender_email": email,
+            "sender_domain": email.split("@")[-1] if "@" in email else "",
+            "last_seen_at": datetime.now(timezone.utc),
+        }
+        for field in (
+            "received_count",
+            "opened_count",
+            "replied_count",
+            "archived_by_user_count",
+            "ever_replied",
+            "last_replied_at",
+        ):
+            if field in stats and stats[field] is not None:
+                values[field] = stats[field]
+        # Compute the never-miss importance score when the caller hasn't supplied
+        # one. A sender the user has replied to gets a high score (they must
+        # never be auto-archived); everyone else defaults to a low score driven
+        # by their archived_by_user ratio. Real harvests from sender_history()
+        # only carry ever_replied / replied_count, so this keeps the production
+        # signal non-zero for replied-to senders.
+        if "importance_score" not in stats:
+            ever_replied = bool(stats.get("ever_replied", False))
+            replied = int(stats.get("replied_count", 0))
+            archived = int(stats.get("archived_by_user_count", 0))
+            received = int(stats.get("received_count", 0))
+            if ever_replied or replied > 0:
+                values["importance_score"] = round(
+                    0.75 + 0.20 * (1 if ever_replied else 0) + 0.05 * min(replied, 5) / 5, 3
+                )
+            elif received > 0:
+                values["importance_score"] = round(
+                    0.10 * (1 - archived / received) if received else 0.1, 3
+                )
+            else:
+                values["importance_score"] = 0.05
+        if row is None:
+            row = _new(profile_cls, values)
+            row.id = str(uuid4())
+            row.user_id = user_id
+            session.add(row)
+        else:
+            _assign(row, profile_cls, values)
+        session.flush()
+        id_map[email] = row.id
+    return id_map
 
 
 def upsert_items(

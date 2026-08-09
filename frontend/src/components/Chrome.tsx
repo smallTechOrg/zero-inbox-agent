@@ -24,49 +24,63 @@ export function DryRunBanner() {
   )
 }
 
-type RailItem = { label: string; phase?: 2 | 3; description: string }
+type NavItem = { label: string; description: string }
+type StubItem = { label: string; phase: 2 | 3; description: string }
+type RailItem = NavItem | ({ _stub: true } & StubItem)
 
 const RAIL: RailItem[] = [
   { label: 'Triage', description: 'Review clustered triage decisions' },
-  { label: 'Rules', phase: 3, description: 'Proposed filter rules ranked by coverage' },
-  { label: 'Chat', phase: 3, description: 'Turn plain English into rules' },
-  { label: 'Digest', phase: 3, description: 'Daily summary of what was hidden' },
-  { label: 'Backlog', phase: 3, description: 'Historical cleanup in dated chunks' },
-  { label: 'Cost', phase: 3, description: 'Spend and rules-vs-LLM ratio' },
-  { label: 'Settings', phase: 2, description: 'Thresholds, VIP list, priorities profile' },
+  { label: 'Settings', description: 'Thresholds, VIP list, priorities profile' },
+  { _stub: true, label: 'Rules', phase: 3, description: 'Proposed filter rules ranked by coverage' },
+  { _stub: true, label: 'Chat', phase: 3, description: 'Turn plain English into rules' },
+  { _stub: true, label: 'Digest', phase: 3, description: 'Daily summary of what was hidden' },
+  { _stub: true, label: 'Backlog', phase: 3, description: 'Historical cleanup in dated chunks' },
+  { _stub: true, label: 'Cost', phase: 3, description: 'Spend and rules-vs-LLM ratio' },
 ]
 
-export function LeftRail() {
+export function LeftRail({
+  onNavigate,
+  active,
+}: {
+  onNavigate: (label: string) => void
+  active: string
+}) {
   return (
     <nav aria-label="Main" className="w-44 shrink-0 border-r border-gray-200 bg-white p-2">
       <ul className="space-y-1">
         {RAIL.map(item => {
-          if (!item.phase) {
+          if ('_stub' in item) {
+            const tip = `${item.label} — ${item.description}. Not built yet; planned for Phase ${item.phase}.`
             return (
               <li key={item.label}>
-                <a
-                  href="#triage-queue"
-                  aria-current="page"
-                  className="block rounded bg-gray-900 px-2.5 py-1.5 text-sm font-semibold text-white focus:ring-2 focus:ring-gray-400 focus:outline-none"
+                <button
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  title={tip}
+                  aria-label={`${item.label} (coming soon, Phase ${item.phase})`}
+                  className="flex w-full cursor-not-allowed flex-col items-start gap-1 rounded px-2.5 py-1.5 text-left text-sm text-gray-600 opacity-50"
                 >
-                  {item.label}
-                </a>
+                  <span>{item.label}</span>
+                  <ComingSoonChip phase={item.phase} />
+                </button>
               </li>
             )
           }
-          const tip = `${item.label} — ${item.description}. Not built yet; planned for Phase ${item.phase}.`
+          const isActive = active === item.label
           return (
             <li key={item.label}>
               <button
                 type="button"
-                disabled
-                aria-disabled="true"
-                title={tip}
-                aria-label={`${item.label} (coming soon, Phase ${item.phase})`}
-                className="flex w-full cursor-not-allowed flex-col items-start gap-1 rounded px-2.5 py-1.5 text-left text-sm text-gray-600 opacity-50"
+                onClick={() => onNavigate(item.label)}
+                aria-current={isActive ? 'page' : undefined}
+                className={`flex w-full items-center justify-between rounded px-2.5 py-1.5 text-left text-sm font-medium focus:ring-2 focus:ring-gray-400 focus:outline-none ${
+                  isActive
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-700 hover:bg-gray-100'
+                }`}
               >
                 <span>{item.label}</span>
-                <ComingSoonChip phase={item.phase} />
               </button>
             </li>
           )

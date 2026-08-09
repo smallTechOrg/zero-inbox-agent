@@ -66,13 +66,21 @@ These are the entry points. All are manual (`disable-model-invocation: true`). E
 
 ## The skeleton in `src/`
 
-`src/` is the **opinionated baseline** — a working FastAPI + LangGraph + SQLite + Anthropic agent whose capability slot is `transform_text`. Tests pass out of the box. Generators extend this in place — they never copy or rename. The capability slot is:
+`src/` is the **opinionated baseline** this project was scaffolded from — a working
+FastAPI + LangGraph + SQLite agent. That baseline's capability slot was
+`transform_text` (the `src/graph/nodes.py:transform_text` node, `src/prompts/transform.md`,
+and a transform form in the frontend). This project has **replaced** that slot in place:
 
-- `src/graph/nodes.py` — `transform_text` node → replace with your capability logic
-- `src/prompts/transform.md` → replace with your system prompt
-- `frontend/src/app/page.tsx` → replace the transform form with your UI
+- The triage graph lives in `src/graph/` (`nodes.py`, `edges.py`, `state.py`, `agent.py`,
+  `runner.py` exposing `run_triage(...)`). There is no `src/agent/` subpackage.
+- The prompts are `src/prompts/classify.md`, `src/prompts/deep_read.md` (no `transform.md`).
+- `frontend/src/app/page.tsx` is the clustered triage queue (not a transform form).
+- The obsolete `transform_text` node, `src/prompts/transform.md` and any skeleton
+  `tests/integration/test_pipeline.py` using the old `run_agent(str)` / `POST /runs`
+  signature have been deleted — no dead skeleton artifacts remain in `src/` or `tests/`.
 
-Everything else (graph structure, runner, API, DB session, settings, test fixtures) is already wired and tested — do not change it unless the spec requires it.
+Everything else (graph structure, runner, API envelope, DB session, settings, test
+fixtures) is already wired and tested — do not change it unless the spec requires it.
 
 ## Sub-agents (the team)
 

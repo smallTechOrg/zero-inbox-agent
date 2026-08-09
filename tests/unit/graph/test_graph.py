@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from graph.agent import build_triage_graph, triage_graph
 from graph.runner import execute_triage, run_triage
+from graph.persistence import persist_sender_profiles
 
 USER = "user-1"
 ACCOUNT = "acct-1"
@@ -156,3 +157,68 @@ class TestFailurePath:
             run = session.execute(select(TriageRun)).scalars().one()
             assert run.status == "failed"
             assert run.error_message
+
+
+class TestSenderProfilePersistence:
+    """Regression for HIGH #4: sender_history() must be wired into ingestion so
+    sender_profiles rows are populated and the never-miss signal fires in real
+    mailbox runs (not just fixture seeds)."""
+
+    def test_persist_sender_profiles_upserts_rows(self, seeded):
+        from db.models import SenderProfile
+        from db.session import create_db_session
+
+        signals = {
+            "maya@northwind.io": {
+                "received_count": 12,
+                "opened_count": 10,
+                "replied_count": 5,
+                "ever_replied": True,
+                "last_replied_at": datetime.now(timezone.utc),
+                "archived_by_user_count": 0,
+            },
+            "promo@dealsdaily.com": {
+                "received_count": 64,
+                "opened_count": 0,
+                "replied_count": 0,
+                "ever_replied": False,
+                "last_replied_at": None,
+                "archived_by_user_count": 51,
+            },
+        }
+
+        with create_db_session() as session:
+            upserted = persist_sender_profiles(
+                session, user_id=USER, signals=signals
+            )
+            assert len(upserted) == 2
+            rows = list(session.execute(select(SenderProfile)).scalars().all())
+            by_email = {r.sender_email: r for r in rows}
+            assert by_email["maya@northwind.io"].ever_replied is True
+            assert by_email["maya@northwind.io"].replied_count == 5
+            assert by_email["maya@northwind.io"].importance_score > 0
+            assert by_email["promo@dealsdaily.com"].ever_replied is False
+            # Non-replied senders get a low score (not the never-miss band).
+            assert by_email["promo@dealsdaily.com"].importance_score < 0.2
+
+    def test_persist_sender_profiles_is_idempotent(self, seeded):
+        from db.models import SenderProfile
+        from db.session import create_db_session
+
+        signal = {
+            "dev@arcstack.dev": {
+                "received_count": 3,
+                "opened_count": 2,
+                "replied_count": 1,
+                "ever_replied": True,
+                "last_replied_at": datetime.now(timezone.utc),
+                "archived_by_user_count": 0,
+            }
+        }
+
+        with create_db_session() as session:
+            persist_sender_profiles(session, user_id=USER, signals=signal)
+            persist_sender_profiles(session, user_id=USER, signals=signal)
+            rows = list(session.execute(select(SenderProfile)).scalars().all())
+            assert len(rows) == 1
+
