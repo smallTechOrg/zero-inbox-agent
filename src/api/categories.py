@@ -145,6 +145,98 @@ def sync_labels_route(
     return ok({"results": results})
 
 
+@router.post("/api/categories/propose")
+def propose_taxonomy(
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """LLM-proposed taxonomy improvements based on the user's actual mail patterns."""
+    import json
+
+    from db.models import Category, Decision, Item
+    from llm.client import get_llm_client
+
+    # Current taxonomy
+    categories = session.execute(
+        select(Category)
+        .where(Category.user_id == user_id)
+        .order_by(Category.sort_order, Category.name)
+    ).scalars().all()
+
+    # Sample of recent decisions with their categories + subjects (last 200)
+    rows = session.execute(
+        select(Decision, Item, Category)
+        .join(Item, Item.id == Decision.item_id)
+        .outerjoin(Category, Category.id == Decision.category_id)
+        .where(Decision.user_id == user_id)
+        .order_by(Item.internal_date.desc())
+        .limit(200)
+    ).all()
+
+    # Build prompt context
+    taxonomy_text = "\n".join(
+        f"- {c.name} ({c.key}): {c.description or 'no description'}"
+        for c in categories
+    )
+    sample_lines = []
+    for decision, item, category in rows[:50]:  # cap at 50 for prompt length
+        cat_name = category.name if category else "uncategorized"
+        sample_lines.append(f"  [{cat_name}] {item.subject[:80]}")
+    sample_text = "\n".join(sample_lines) or "(no decisions yet)"
+
+    prompt = f"""You are helping a user improve their email inbox taxonomy.
+
+Current categories:
+{taxonomy_text or "(none defined)"}
+
+Sample of recently triaged emails (category → subject):
+{sample_text}
+
+Propose improvements to this taxonomy. You may suggest:
+- New categories to add (if you see uncovered patterns)
+- Categories to merge (if two are redundant)
+- Better names or descriptions for existing categories
+- Categories to remove (if they seem unused or too granular)
+
+Respond with a JSON array of proposals. Each proposal has:
+- "action": "add" | "rename" | "merge" | "remove" | "redescribe"
+- "key": short_snake_case_key (for the category)
+- "name": display name
+- "description": one-sentence purpose
+- "reasoning": why you suggest this (1-2 sentences)
+- "merge_keys": [list of keys to merge] (only for "merge" action)
+
+Return ONLY the JSON array, no prose."""
+
+    client = get_llm_client()
+    result = client.call_model_sync(
+        prompt,
+        system="You are a helpful assistant that analyzes email patterns and proposes inbox taxonomy improvements. Respond only with valid JSON.",
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["action", "key", "name", "description", "reasoning"],
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "rename", "merge", "remove", "redescribe"]},
+                    "key": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "reasoning": {"type": "string"},
+                    "merge_keys": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    )
+
+    try:
+        proposals = json.loads(result.text)
+    except (json.JSONDecodeError, TypeError):
+        proposals = []
+
+    return ok({"proposals": proposals, "model": result.model, "tokens": result.tokens_in + result.tokens_out})
+
+
 @router.get("/api/inbox-summary")
 def inbox_summary(
     user_id: str = Depends(require_user_id),

@@ -109,6 +109,55 @@ class TestReplyHistoryGuard:
         assert out[0]["proposed_action"] == "archive"
 
 
+# -------------------------------------------------------------- VIP guard
+
+
+class TestVipGuard:
+    def test_email_vip_match_forces_archive_to_keep(self):
+        decisions = [_decision()]
+        items = [_item(from_email="vip@example.com")]
+        vip = {"emails": ["vip@example.com"], "domains": [], "keywords": []}
+        out = never_miss.apply_vip_guard(decisions, vip, items)
+        assert out[0]["proposed_action"] == "keep"
+        assert "VIP list" in out[0]["reasoning"]
+
+    def test_domain_vip_match_forces_archive_to_keep(self):
+        decisions = [_decision()]
+        items = [_item(from_email="anyone@partner.io")]
+        vip = {"emails": [], "domains": ["partner.io"], "keywords": []}
+        out = never_miss.apply_vip_guard(decisions, vip, items)
+        assert out[0]["proposed_action"] == "keep"
+
+    def test_keyword_vip_match_in_subject_forces_archive_to_keep(self):
+        decisions = [_decision()]
+        items = [_item(subject="Urgent: board meeting agenda")]
+        vip = {"emails": [], "domains": [], "keywords": ["board meeting"]}
+        out = never_miss.apply_vip_guard(decisions, vip, items)
+        assert out[0]["proposed_action"] == "keep"
+
+    def test_no_match_leaves_archive_decision_unchanged(self):
+        decisions = [_decision()]
+        items = [_item()]
+        vip = {"emails": ["other@example.com"], "domains": ["other.io"], "keywords": ["investor"]}
+        out = never_miss.apply_vip_guard(decisions, vip, items)
+        assert out[0]["proposed_action"] == "archive"
+
+    def test_empty_vip_dict_is_a_no_op(self):
+        decisions = [_decision()]
+        items = [_item()]
+        out = never_miss.apply_vip_guard(decisions, {}, items)
+        assert out[0]["proposed_action"] == "archive"
+
+    def test_keep_decisions_are_untouched_even_on_vip_match(self):
+        decisions = [_decision(proposed_action="keep")]
+        items = [_item(from_email="vip@example.com")]
+        vip = {"emails": ["vip@example.com"], "domains": [], "keywords": []}
+        out = never_miss.apply_vip_guard(decisions, vip, items)
+        # proposed_action stays keep but no reasoning is appended
+        assert out[0]["proposed_action"] == "keep"
+        assert "VIP list" not in out[0]["reasoning"]
+
+
 # --------------------------------------------------------------- Mechanism A
 
 

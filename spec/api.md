@@ -19,13 +19,14 @@ The frontend static export is mounted at `/app` (canonical entry: `http://localh
 | `GET` | `/auth/google/start` | 302 to Google consent (`gmail.readonly`, `gmail.modify`, `gmail.settings.basic`, `gmail.compose`; `access_type=offline`, `prompt=consent`) with a CSRF `state` |
 | `GET` | `/auth/google/callback` | Exchanges the code, upserts `users` + `channel_accounts` (refresh token encrypted), sets `zi_session`, 302 to `/app/` |
 | `POST` | `/auth/logout` | Clears the cookie |
-| `GET` | `/api/me` | `{user: {id, email, display_name}, connections: [{id, account_email, status, connected_at}], settings: {...}}` |
+| `GET` | `/api/me` | `{user: {id, email, display_name}, connections: [{id, account_email, channel, status, connected_at}], settings: {...}}` |
 
 ### Triage
 | Method | Path | Body / Query | Returns |
 |--------|------|--------------|---------|
-| `POST` | `/api/connections/{connection_id}/triage` | `{limit: 200}` | `{run_id}` — starts the run in the background, returns immediately |
+| `POST` | `/api/connections/{connection_id}/triage` | `{limit: 200, only_new: bool}` | `{run_id}` — starts the run in the background, returns immediately. `only_new=true` fetches only threads newer than the last completed run's start time (cheaper incremental re-triage). |
 | `GET` | `/api/runs/{run_id}` | | `{id, status, dry_run, items_total, items_decided, counts, cost, error_message, started_at, finished_at}` — polled every 1s for the progress bar |
+| `GET` | `/api/runs/latest` | | Same shape as `/api/runs/{run_id}` but returns the most recent `completed` or `running` run for the session user — used by the frontend to auto-resume display on page load without a known run-id |
 | `POST` | `/api/runs/{run_id}/cancel` | | `{status: "cancelled"}` |
 | `GET` | `/api/triage/clusters` | `?run_id=` | `[{id, kind, label, item_count, suggested_action, min_confidence, avg_confidence, sample_subjects: [3]}]` |
 | `GET` | `/api/triage/items` | `?cluster_id=` or `?run_id=&status=` | `[{decision_id, item: {subject, from_name, from_email, snippet_redacted, internal_date, message_count, is_unread}, category, proposed_action, confidence, reasoning, decided_by, rule_id, rule_name, time_sensitive, status}]` |
@@ -53,6 +54,8 @@ Phase 1 forces `dry_run=true` server-side; the client cannot turn it off.
 | `GET`/`PUT` | `/api/profile` | the plain-English priorities profile |
 | `GET`/`POST` | `/api/corrections` | corrections recorded as training signal |
 | `GET` | `/api/triage/needs-your-call` | the below-the-floor queue |
+| `POST` | `/api/triage/runs/{run_id}/review-all` | `{status: "approved"\|"rejected"}` — bulk approve or reject every non-`needs_your_call` decision in a run in one call; the "get to zero inbox fast" sweep. `needs_your_call` decisions are silently skipped (they require individual review). Returns `{updated, skipped_needs_your_call}`. |
+| `GET` | `/api/inbox-summary` | Live Gmail thread counts: `{inbox_total, needs_your_call, categories: [{key, name, count, channel_label_name}]}`. Each count is one `labels().get()` call (no thread listing). Used by the inbox summary panel to show how close to zero the mailbox actually is. |
 
 ---
 

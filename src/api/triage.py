@@ -97,6 +97,35 @@ def list_clusters(
     return ok(payload)
 
 
+@router.get("/api/triage/needs-your-call")
+def needs_your_call(
+    run_id: str | None = Query(default=None),
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """The below-the-floor queue: decisions the agent declined to decide on its own."""
+    from db.models import Category, Decision, Item, Rule
+
+    effective_run_id = _resolve_run_id(session, user_id, run_id)
+    if effective_run_id is None:
+        return ok([])
+
+    rows = session.execute(
+        select(Decision, Item, Category, Rule)
+        .join(Item, Item.id == Decision.item_id)
+        .outerjoin(Category, Category.id == Decision.category_id)
+        .outerjoin(Rule, Rule.id == Decision.rule_id)
+        .where(
+            Decision.user_id == user_id,
+            Decision.run_id == effective_run_id,
+            Decision.status == "needs_your_call",
+        )
+        .order_by(Item.internal_date.desc())
+    ).all()
+
+    return ok([_decision_payload(d, i, c, r) for d, i, c, r in rows])
+
+
 @router.get("/api/triage/items")
 def list_items(
     cluster_id: str | None = Query(default=None),

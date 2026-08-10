@@ -118,16 +118,29 @@ and 429 (backoff + resume). A failed LLM batch does not fail the run: its items 
 ```python
 # src/llm/providers/base.py
 class LLMProvider(Protocol):
-    def call_model(self, prompt: str, *, system: str | None = None,
-                   model: str | None = None, json_schema: dict | None = None) -> LLMResult: ...
+    async def call_model(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        model: str | None = None,
+        json_schema: dict | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        disable_thinking: bool = False,
+    ) -> LLMResult: ...
 
-# LLMResult: text: str, model: str, tokens_in: int, tokens_out: int, latency_ms: int
+# LLMResult: text: str, model: str, tokens_in: int, tokens_out: int,
+#             latency_ms: int, usd: float, attempts: int, finish_reason: str
 ```
 
-`src/llm/providers/nvidia.py` implements it against the OpenAI SDK with
-`base_url=settings.nvidia_base_url`. The `model` argument overrides the default per call, so the
-per-user model preference (Phase 3) requires no code change. The existing `anthropic.py` and
-`gemini.py` providers are removed — NVIDIA NIM is the only provider in v1.
+`call_model` is **async**; `LLMClient` wraps it and also exposes `call_model_sync` for
+use from synchronous FastAPI routes. The `model` argument overrides the default per call, so the
+per-user model preference (Phase 3) requires no code change. `disable_thinking` suppresses
+chain-of-thought tokens for providers that support it (reduces latency + cost on simple
+classification calls). `src/llm/providers/nvidia.py` implements this against the OpenAI SDK with
+`base_url=settings.nvidia_base_url`. The existing `anthropic.py` and `gemini.py` providers are
+removed — NVIDIA NIM is the only provider in v1.
 
 ### Settings (`src/config/settings.py`, env prefix `AGENT_`)
 

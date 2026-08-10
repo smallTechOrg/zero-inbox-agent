@@ -195,7 +195,8 @@ def test_a_negative_limit_is_refused(adapter):
 # --- Phase 1 dry-run guarantee against the real mailbox -----------------
 
 
-def test_no_mutation_reaches_the_real_mailbox_in_phase_1(adapter):
+def test_create_stubs_refuse_in_phase_1(adapter):
+    """create_label, create_filter, create_draft still raise DryRunViolation."""
     from channels.base import DryRunViolation
 
     before = adapter.list_threads(limit=5)
@@ -203,9 +204,6 @@ def test_no_mutation_reaches_the_real_mailbox_in_phase_1(adapter):
     thread_id = before[0].external_thread_id
 
     for call in (
-        lambda: adapter.archive_thread(thread_id),
-        lambda: adapter.add_labels(thread_id, ["INBOX"]),
-        lambda: adapter.remove_labels(thread_id, ["INBOX"]),
         lambda: adapter.create_label("ZeroInbox/ShouldNeverExist"),
         lambda: adapter.create_filter({"from": "a@b.com"}, {"addLabelIds": ["INBOX"]}),
         lambda: adapter.create_draft(thread_id, "should never be created"),
@@ -213,9 +211,15 @@ def test_no_mutation_reaches_the_real_mailbox_in_phase_1(adapter):
         with pytest.raises(DryRunViolation):
             call()
 
-    after = adapter.list_threads(limit=5)
-    assert [i.external_thread_id for i in after] == [i.external_thread_id for i in before]
-    assert "INBOX" in after[0].channel_labels
     assert "ZeroInbox/ShouldNeverExist" not in {
         label["name"] for label in adapter.list_labels()
     }
+
+
+def test_adapter_exposes_archive_and_label_and_undo_not_old_stubs(adapter):
+    """Regression D1: adapter must expose the two spec-mandated mutation methods."""
+    assert hasattr(adapter, "archive_and_label")
+    assert hasattr(adapter, "undo_archive_and_label")
+    assert not hasattr(type(adapter), "archive_thread")
+    assert not hasattr(type(adapter), "add_labels")
+    assert not hasattr(type(adapter), "remove_labels")

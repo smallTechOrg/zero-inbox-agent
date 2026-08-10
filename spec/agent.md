@@ -90,9 +90,9 @@ clobbering each other. Everything else is last-write-wins (written by exactly on
 | `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible |
 | `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event |
 
-In Phase 1 `second_pass_reviewer` and `apply_never_miss_floor` are **not in the graph** (the graph is
-rewired in Phase 2 slice 1). Phase 1 applies a simple floor inside `persist_decisions`: confidence <
-0.75 → `needs_your_call`. Phase 1 is dry-run, so no mutation depends on them.
+`second_pass_reviewer` and `apply_never_miss_floor` are wired in Phase 2. Phase 1 applied a simple
+floor inside `persist_decisions` (confidence < 0.75 → `needs_your_call`) which Phase 2 replaces with
+the full reviewer + floor + VIP-guard cascade.
 
 ---
 
@@ -123,7 +123,10 @@ handle_error        → END
 Routing functions (`src/graph/edges.py`):
 
 - `route_after_history(state) -> "llm" | "skip_llm"` — `"llm"` iff `state["llm_queue"]` is non-empty.
-- `route_after_llm(state) -> "deep" | "done"` — `"deep"` iff `state["deep_queue"]` is non-empty.
+- `route_after_llm(state) -> "deep"` — always routes to `deep_read_escalation`; when `deep_queue` is
+  empty, `deep_read_escalation` becomes a passthrough (no LLM calls, items pass through unchanged).
+  This keeps the LangGraph fan-in depth uniform across all branches, preventing Send/join shape
+  mismatches when some batches produce no deep items.
 - Every node-level edge is guarded: if `state.get("error")` is set, route to `handle_error`.
 
 ---

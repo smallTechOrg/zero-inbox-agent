@@ -158,31 +158,33 @@ def load_context(session: Session, user_id: str) -> dict:
                 }
             )
 
-    vip_entries: list[dict] = []
+    vip: dict = {"emails": [], "domains": [], "keywords": []}
     vip_cls = model_for("vip_entries")
     if vip_cls is not None:
         for row in _rows(session, vip_cls, user_id=user_id):
-            vip_entries.append(
-                {
-                    "kind": getattr(row, "kind", ""),
-                    "value": getattr(row, "value", ""),
-                }
-            )
+            kind = getattr(row, "kind", "")
+            value = getattr(row, "value", "")
+            if kind == "email" and value:
+                vip["emails"].append(value)
+            elif kind == "domain" and value:
+                vip["domains"].append(value)
+            elif kind == "keyword" and value:
+                vip["keywords"].append(value)
 
-    priority_profile = ""
+    priorities_profile = ""
     profile_cls = model_for("priority_profiles")
     if profile_cls is not None:
         row = session.get(profile_cls, user_id)
         if row is not None:
-            priority_profile = getattr(row, "text", "") or ""
+            priorities_profile = getattr(row, "text", "") or ""
 
     return {
         "categories": categories,
         "rules": rules,
         "sender_stats": sender_stats,
         "settings": settings,
-        "vip_entries": vip_entries,
-        "priority_profile": priority_profile,
+        "vip": vip,
+        "priorities_profile": priorities_profile,
     }
 
 

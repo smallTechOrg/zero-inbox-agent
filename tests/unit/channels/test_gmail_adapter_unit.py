@@ -190,27 +190,86 @@ def test_a_persistent_429_eventually_raises_rate_limited():
         _adapter(service, backoff_seconds=0).account_email()
 
 
-# --- Phase 1 dry-run guarantee -----------------------------------------
+# --- Phase 2 mutation methods ------------------------------------------
+
+
+def test_archive_and_label_calls_modify_with_category_labels_and_removes_inbox():
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    adapter = _adapter(service)
+
+    result = adapter.archive_and_label("t1", ["L_CATEGORY"])
+
+    assert len(service.thread_modify_calls) == 1
+    call = service.thread_modify_calls[0]
+    assert call["id"] == "t1"
+    assert "L_CATEGORY" in call["add"]
+    assert "INBOX" in call["remove"]
+    assert result["thread_id"] == "t1"
+
+
+def test_archive_and_label_with_remove_inbox_false_does_not_remove_inbox():
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    adapter = _adapter(service)
+
+    adapter.archive_and_label("t1", ["L_CATEGORY"], remove_inbox=False)
+
+    call = service.thread_modify_calls[0]
+    assert "INBOX" not in call["remove"]
+    assert "L_CATEGORY" in call["add"]
+
+
+def test_undo_archive_and_label_restores_inbox_and_removes_category_labels():
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    adapter = _adapter(service)
+
+    result = adapter.undo_archive_and_label("t1", ["L_CATEGORY"])
+
+    assert len(service.thread_modify_calls) == 1
+    call = service.thread_modify_calls[0]
+    assert call["id"] == "t1"
+    assert "INBOX" in call["add"]
+    assert "L_CATEGORY" in call["remove"]
+    assert result["thread_id"] == "t1"
+
+
+def test_archive_and_label_supports_multiple_label_ids():
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    adapter = _adapter(service)
+
+    adapter.archive_and_label("t1", ["L1", "L2"])
+
+    call = service.thread_modify_calls[0]
+    assert "L1" in call["add"]
+    assert "L2" in call["add"]
+    assert "INBOX" in call["remove"]
+
+
+# --- dry-run guarantee for remaining Phase 1 mutation stubs ------------
 
 
 @pytest.mark.parametrize(
     "method,args",
     [
-        ("archive_thread", ("t1",)),
-        ("add_labels", ("t1", ["L1"])),
-        ("remove_labels", ("t1", ["L1"])),
         ("create_label", ("ZeroInbox/News",)),
         ("create_filter", ({"from": "a@b.com"}, {"addLabelIds": ["L1"]})),
         ("create_draft", ("t1", "body text")),
     ],
 )
-def test_every_mutation_method_exists_but_raises_dry_run_violation_in_phase_1(method, args):
+def test_create_mutation_stubs_raise_dry_run_violation_in_phase_1(method, args):
     from channels.base import DryRunViolation
 
     adapter = _adapter(FakeGmailService())
 
     with pytest.raises(DryRunViolation):
         getattr(adapter, method)(*args)
+
+
+def test_gmail_adapter_does_not_expose_old_archive_thread_or_add_remove_labels():
+    from channels.gmail.adapter import GmailAdapter
+
+    assert not hasattr(GmailAdapter, "archive_thread")
+    assert not hasattr(GmailAdapter, "add_labels")
+    assert not hasattr(GmailAdapter, "remove_labels")
 
 
 def test_the_adapter_exposes_no_delete_or_trash_operation_ever():

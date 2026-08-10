@@ -220,15 +220,24 @@ class GmailAdapter(ChannelAdapter):
             for label in (listing or {}).get("labels") or []
         ]
 
-    # --- mutate: Phase 2. Phase 1 refuses. ----------------------------
-    def archive_thread(self, external_thread_id: str) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+    # --- mutate -------------------------------------------------------
+    def archive_and_label(
+        self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
+    ) -> dict:
+        from channels.gmail.mutations import GmailMutator
 
-    def add_labels(self, external_thread_id: str, label_ids: list[str]) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+        mutator = GmailMutator(self._service)
+        if remove_inbox:
+            return mutator._modify(thread_id, add_label_ids=add_label_ids, remove_label_ids=["INBOX"])
+        return mutator._modify(thread_id, add_label_ids=add_label_ids, remove_label_ids=[])
 
-    def remove_labels(self, external_thread_id: str, label_ids: list[str]) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+    def undo_archive_and_label(
+        self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
+    ) -> dict:
+        from channels.gmail.mutations import GmailMutator
+
+        mutator = GmailMutator(self._service)
+        return mutator._modify(thread_id, add_label_ids=["INBOX"], remove_label_ids=add_label_ids)
 
     def create_label(self, name: str) -> dict:
         raise DryRunViolation(DRY_RUN_MESSAGE)

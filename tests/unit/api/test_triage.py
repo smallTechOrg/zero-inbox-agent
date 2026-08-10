@@ -335,6 +335,45 @@ def test_review_all_on_unknown_run_is_not_found(client, seed, sign_in):
     assert res.status_code == 404
 
 
+def test_needs_your_call_returns_only_needs_your_call_decisions(client, seed, sign_in):
+    """GET /api/triage/needs-your-call returns only needs_your_call status items."""
+    sign_in("user-alice")
+    response = client.get("/api/triage/needs-your-call")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) > 0
+    assert all(item["status"] == "needs_your_call" for item in data)
+
+
+def test_needs_your_call_is_scoped_to_the_signed_in_user(client, seed, sign_in):
+    """GET /api/triage/needs-your-call must not leak another user's items."""
+    sign_in("user-alice")
+    response = client.get("/api/triage/needs-your-call")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert all(item["decision_id"].startswith("dec-alice-") for item in data)
+
+
+def test_needs_your_call_requires_a_session(client, seed):
+    """Unauthenticated requests must be rejected."""
+    assert client.get("/api/triage/needs-your-call").status_code == 401
+
+
+def test_needs_your_call_returns_empty_before_any_run(client, db, seed, sign_in):
+    """When no completed/running run exists the endpoint returns an empty list."""
+    from db.models import Cluster, Decision, TriageRun
+
+    db.query(Decision).delete()
+    db.query(Cluster).delete()
+    db.query(TriageRun).delete()
+    db.commit()
+
+    sign_in("user-alice")
+    response = client.get("/api/triage/needs-your-call")
+    assert response.status_code == 200
+    assert response.json()["data"] == []
+
+
 def test_categories_are_user_scoped(client, seed, sign_in):
     sign_in("user-alice")
     res = client.get("/api/categories")

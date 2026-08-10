@@ -49,6 +49,18 @@ class _Threads:
             return _Request(None, errors=[self._s.thread_errors[id]])
         return _Request(self._s.threads[id])
 
+    def modify(self, *, userId, id, body):
+        call = {
+            "id": id,
+            "add": list(body.get("addLabelIds") or []),
+            "remove": list(body.get("removeLabelIds") or []),
+        }
+        self._s.thread_modify_calls.append(call)
+        current = set((self._s.threads.get(id) or {}).get("labelIds") or [])
+        current.update(call["add"])
+        current.difference_update(call["remove"])
+        return _Request({"id": id, "labelIds": sorted(current)})
+
 
 class _Messages:
     def __init__(self, service: "FakeGmailService"):
@@ -113,6 +125,7 @@ class FakeGmailService:
         self.profile_errors: list[HttpError] = []
         self.thread_list_calls: list[dict] = []
         self.thread_get_calls: list[dict] = []
+        self.thread_modify_calls: list[dict] = []
         self.message_list_calls: list[dict] = []
         self._page_index = 0
 

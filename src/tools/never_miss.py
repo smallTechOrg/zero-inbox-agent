@@ -40,28 +40,23 @@ def apply_confidence_floor(decisions: list[dict], floor: float) -> list[dict]:
     return out
 
 
-def _is_vip_match(entries: list[dict], *, email: str, domain: str, subject: str) -> bool:
-    """Mirrors ``tools.memory.is_vip`` without a DB session, over pre-loaded entries."""
+def _is_vip_match(vip: dict, *, email: str, domain: str, subject: str) -> bool:
+    """Mirrors ``tools.memory.is_vip`` without a DB session, over the grouped VIP dict."""
     email_l = (email or "").lower()
     domain_l = (domain or "").lower()
     subject_l = (subject or "").lower()
-    for entry in entries or []:
-        kind = entry.get("kind")
-        val = (entry.get("value") or "").lower()
-        if not val:
-            continue
-        if kind == "email" and val == email_l:
-            return True
-        if kind == "domain" and (domain_l == val or domain_l.endswith("." + val)):
-            return True
-        if kind == "keyword" and val in subject_l:
-            return True
+    if any(e.lower() == email_l for e in (vip.get("emails") or [])):
+        return True
+    if any(domain_l == d.lower() or domain_l.endswith("." + d.lower()) for d in (vip.get("domains") or [])):
+        return True
+    if any(k.lower() in subject_l for k in (vip.get("keywords") or [])):
+        return True
     return False
 
 
 def apply_vip_guard(
     decisions: list[dict],
-    vip_entries: list[dict],
+    vip: dict,
     items: list[dict],
 ) -> list[dict]:
     """VIP entries (email, domain, keyword) can never be archived automatically,
@@ -69,6 +64,9 @@ def apply_vip_guard(
 
     A VIP match forces ``keep`` regardless of the proposed action or confidence,
     even if an earlier stage already left it as ``needs_your_call``.
+
+    ``vip`` is the grouped dict ``{emails: [], domains: [], keywords: []}`` as
+    loaded by ``graph.persistence.load_context``.
     """
     items_by_id = {item["id"]: item for item in items}
     out: list[dict] = []
@@ -76,7 +74,7 @@ def apply_vip_guard(
         decision = dict(decision)
         item = items_by_id.get(decision.get("item_id"), {})
         matched = _is_vip_match(
-            vip_entries,
+            vip or {},
             email=item.get("from_email") or "",
             domain=item.get("from_domain") or "",
             subject=item.get("subject") or "",

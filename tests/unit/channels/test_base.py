@@ -102,14 +102,26 @@ def test_channel_adapter_declares_the_full_read_and_mutation_surface():
         "fetch_thread_body",
         "sender_history",
         "list_labels",
-        "archive_thread",
-        "add_labels",
-        "remove_labels",
+        "archive_and_label",
+        "undo_archive_and_label",
         "create_label",
         "create_filter",
         "create_draft",
     }
     assert expected <= set(ChannelAdapter.__abstractmethods__)
+
+
+def test_channel_adapter_has_archive_and_label_not_the_old_three_stubs():
+    """Regression: spec requires archive_and_label / undo_archive_and_label exactly."""
+    from channels.base import ChannelAdapter
+
+    abstract = set(ChannelAdapter.__abstractmethods__)
+    assert "archive_and_label" in abstract
+    assert "undo_archive_and_label" in abstract
+    # Old methods must not exist on the interface.
+    assert "archive_thread" not in abstract
+    assert "add_labels" not in abstract
+    assert "remove_labels" not in abstract
 
 
 def test_dry_run_violation_and_reauth_required_are_distinct_errors():

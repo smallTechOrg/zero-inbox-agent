@@ -49,7 +49,7 @@ def _category_block(categories: list[dict]) -> str:
 def _priorities_block(state: TriageState) -> str:
     """The user's priorities profile, injected verbatim — never rewritten by the
     agent. Empty when the user has not written one yet."""
-    text = (state.get("priority_profile") or "").strip()
+    text = (state.get("priorities_profile") or "").strip()
     return text or "(The user has not written a priorities profile yet.)"
 
 

@@ -97,7 +97,7 @@ def _chunk(rows: list, size: int = MAX_BATCH) -> list[list]:
 def _priorities_block(state: TriageState) -> str:
     """The user's priorities profile, injected verbatim — never rewritten by the
     agent. Empty when the user has not written one yet."""
-    text = (state.get("priority_profile") or "").strip()
+    text = (state.get("priorities_profile") or "").strip()
     return text or "(The user has not written a priorities profile yet.)"
 
 
@@ -239,7 +239,7 @@ def apply_never_miss_floor(state: TriageState) -> dict:
         decisions, state.get("sender_stats") or {}, state.get("items") or []
     )
     decisions = apply_vip_guard(
-        decisions, state.get("vip_entries") or [], state.get("items") or []
+        decisions, state.get("vip") or {}, state.get("items") or []
     )
 
     log.info(

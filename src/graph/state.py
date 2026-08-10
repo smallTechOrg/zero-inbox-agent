@@ -20,8 +20,8 @@ class TriageState(TypedDict, total=False):
     rules: list[dict]
     sender_stats: dict[str, dict]
     settings: dict
-    vip_entries: list[dict]
-    priority_profile: str
+    vip: dict                        # {emails: [], domains: [], keywords: []}
+    priorities_profile: str
 
     # working set
     items: list[dict]

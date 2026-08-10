@@ -136,15 +136,18 @@ class ChannelAdapter(ABC):
     def list_labels(self) -> list[dict]:
         """`[{"id": ..., "name": ...}]` for the account's labels/folders."""
 
-    # --- mutate (Phase 2+; Phase 1 raises DryRunViolation) -------------
+    # --- mutate -------------------------------------------------------
     @abstractmethod
-    def archive_thread(self, external_thread_id: str) -> dict: ...
+    def archive_and_label(
+        self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
+    ) -> dict:
+        """Atomic: add category label(s) and remove INBOX in one call."""
 
     @abstractmethod
-    def add_labels(self, external_thread_id: str, label_ids: list[str]) -> dict: ...
-
-    @abstractmethod
-    def remove_labels(self, external_thread_id: str, label_ids: list[str]) -> dict: ...
+    def undo_archive_and_label(
+        self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
+    ) -> dict:
+        """The exact inverse: restore INBOX and remove the category label(s)."""
 
     @abstractmethod
     def create_label(self, name: str) -> dict: ...
