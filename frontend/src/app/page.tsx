@@ -5,9 +5,8 @@ import { api, AUTH_START_URL } from '@/lib/api'
 import { isRunActive, type Cluster, type Me, type Run } from '@/lib/types'
 import { DryRunBanner, LeftRail, StatusPill } from '@/components/Chrome'
 import { ConnectCard } from '@/components/ConnectCard'
-import { ClusterCard, type ClusterCardHandle } from '@/components/ClusterCard'
+import { ClusterCard } from '@/components/ClusterCard'
 import SettingsPanel from '@/components/Settings'
-import { NeedsYourCall } from '@/components/NeedsYourCall'
 import { RunProgress } from '@/components/RunProgress'
 import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
@@ -31,43 +30,8 @@ export default function Dashboard() {
   const [clusters, setClusters] = useState<Cluster[] | null>(null)
   const [clustersLoading, setClustersLoading] = useState(false)
   const [clustersError, setClustersError] = useState<unknown>(null)
-  const clusterRefs = useRef<Map<string, ClusterCardHandle | null>>(new Map())
-  const focusedId = useRef<string | null>(null)
+  const clusterRefs = useRef<Map<string, unknown>>(new Map())
   const [refreshKey, setRefreshKey] = useState(0)
-
-  // Keyboard sweep: j/k move between clusters, a approve, x reject,
-  // A approve whole cluster, Enter expand/collapse. (spec/ui.md §2)
-  const handleKeyDown = useCallback(
-    async (e: React.KeyboardEvent<HTMLUListElement>) => {
-      if (!clusters || clusters.length === 0) return
-      const ids = clusters.map(c => c.id)
-      if (focusedId.current === null || !ids.includes(focusedId.current)) {
-        focusedId.current = ids[0]
-      }
-      const idx = ids.indexOf(focusedId.current)
-      const card = clusterRefs.current.get(focusedId.current)
-      if (e.key === 'j') {
-        e.preventDefault()
-        focusedId.current = ids[(idx + 1) % ids.length]
-      } else if (e.key === 'k') {
-        e.preventDefault()
-        focusedId.current = ids[(idx - 1 + ids.length) % ids.length]
-      } else if (e.key === 'a') {
-        e.preventDefault()
-        void card?.approve()
-      } else if (e.key === 'x') {
-        e.preventDefault()
-        void card?.reject()
-      } else if (e.key === 'A') {
-        e.preventDefault()
-        void card?.approveAll()
-      } else if (e.key === 'Enter') {
-        e.preventDefault()
-        card?.toggle()
-      }
-    },
-    [clusters],
-  )
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -102,28 +66,23 @@ export default function Dashboard() {
     }
   }, [])
 
-  // Resume the last completed/running run on load — a triage pass already paid
-  // for should be visible on refresh, not thrown away and re-run from scratch.
+  // Resume the last completed/running run on load
   useEffect(() => {
     if (!connection || run) return
     let cancelled = false
     void api.latestRun().then(latest => {
       if (cancelled || !latest) return
       setRun(latest)
-      // A resumed *completed* run never enters the active-run polling effect
-      // below (it only fires for RUN_ACTIVE statuses), so its clusters must be
-      // fetched here explicitly or the queue stays empty after a refresh.
       if (!RUN_ACTIVE(latest.status)) void loadClusters(latest.id)
     }).catch(() => {
-      // No prior run yet, or it couldn't be loaded — the empty state below
-      // (Start Triage) is the correct fallback, so this is silently ignored.
+      // No prior run yet — empty state is the correct fallback
     })
     return () => {
       cancelled = true
     }
   }, [connection, run, loadClusters])
 
-  // Poll run progress every 1s while active; results stream in as they land.
+  // Poll run progress every 1s while active
   useEffect(() => {
     if (!run || !RUN_ACTIVE(run.status)) return
     const runId = run.id
@@ -169,91 +128,6 @@ export default function Dashboard() {
     [connection, loadClusters],
   )
 
-  const [approvingAll, setApprovingAll] = useState(false)
-  const [approveAllResult, setApproveAllResult] = useState<string | null>(null)
-
-  const approveAllClusters = useCallback(async () => {
-    if (!run) return
-    setApprovingAll(true)
-    setApproveAllResult(null)
-    setRunError(null)
-    try {
-      const res = await api.reviewAllClusters(run.id, 'approved')
-      let message =
-        res.updated === 0
-          ? 'Nothing left to approve — everything visible is already decided.'
-          : dryRun
-            ? `${res.updated} thread(s) approved — recorded only, Gmail untouched (dry run is on).`
-            : `${res.updated} thread(s) approved — archiving in Gmail now…`
-      if (res.skipped_needs_your_call > 0) {
-        message += ` ${res.skipped_needs_your_call} thread(s) below the confidence floor were left for you to decide individually.`
-      }
-      if (!dryRun && res.updated > 0) {
-        // Same pattern ClusterCard uses: re-read what actually ended up
-        // approved, then apply — needs_your_call items were already excluded
-        // server-side, so nothing here can archive something below the floor.
-        const approvedItems = await api.itemsByStatus(run.id, 'approved')
-        // Approving a 'keep' proposal means "yes, this stays in my inbox" —
-        // it is never eligible for a real mutation. Only archive/digest
-        // proposals may reach /api/actions/apply (the backend now enforces
-        // this too, via NotArchivableError, but filtering here avoids a wall
-        // of harmless-but-noisy per-id errors on a bulk approve-all).
-        const ids = approvedItems
-          .filter(i => i.proposed_action === 'archive' || i.proposed_action === 'digest')
-          .map(i => i.decision_id)
-        if (ids.length > 0) {
-          const results = await api.applyDecisions(ids)
-          const archived = results.filter(r => r.action_log_id).length
-          message = `${archived} thread(s) approved and archived in Gmail.`
-        }
-      }
-      setApproveAllResult(message)
-      void loadClusters(run.id)
-      setRefreshKey(k => k + 1)
-    } catch (e) {
-      setRunError(e)
-    } finally {
-      setApprovingAll(false)
-    }
-  }, [run, dryRun, loadClusters])
-
-  const [forcingKeep, setForcingKeep] = useState(false)
-
-  // Archives everything except needs_your_call — including confidently-'keep'
-  // mail. A deliberate, explicit override of the normal "keep stays visible"
-  // rule: force:true is the ONLY way apply_decision will ever touch a 'keep'
-  // decision (see tools/actions.py). Requires dry-run off and a fresh confirm
-  // every time — this is a materially bigger action than the ordinary
-  // Approve all, on purpose.
-  const forceArchiveEverythingExceptNeedsYourCall = useCallback(async () => {
-    if (!run || dryRun) return
-    if (
-      !window.confirm(
-        'This archives EVERY thread except the ones needing your call — including mail the agent judged important (people, urgent). ' +
-          'Nothing is deleted and everything stays one-click undoable, but it will leave your inbox. Continue?',
-      )
-    ) {
-      return
-    }
-    setForcingKeep(true)
-    setApproveAllResult(null)
-    setRunError(null)
-    try {
-      await api.reviewAllClusters(run.id, 'approved')
-      const approvedItems = await api.itemsByStatus(run.id, 'approved')
-      const ids = approvedItems.map(i => i.decision_id) // every proposed_action this time
-      const results = ids.length > 0 ? await api.applyDecisions(ids, true) : []
-      const archived = results.filter(r => r.action_log_id).length
-      setApproveAllResult(`${archived} thread(s) archived in Gmail, including confidently-important mail.`)
-      void loadClusters(run.id)
-      setRefreshKey(k => k + 1)
-    } catch (e) {
-      setRunError(e)
-    } finally {
-      setForcingKeep(false)
-    }
-  }, [run, dryRun, loadClusters])
-
   const cancelRun = useCallback(async () => {
     if (!run) return
     setCancelling(true)
@@ -274,6 +148,9 @@ export default function Dashboard() {
       : run.status === 'failed'
         ? 'bad'
         : 'ok'
+
+  // Suppress unused warning — ref used for cluster card handles (now read-only)
+  void clusterRefs
 
   return (
     <div className="min-h-screen">
@@ -301,7 +178,6 @@ export default function Dashboard() {
             {run ? `Run ${run.status}` : 'No run yet'}
           </StatusPill>
           <StubButton label="Model: auto" phase={3} />
-          {/* ActivityDrawer bell rendered here for layout context; the actual drawer is in layout.tsx */}
           {connection ? (
             <>
               <button
@@ -317,7 +193,7 @@ export default function Dashboard() {
                 <button
                   type="button"
                   data-testid="run-triage-new-only"
-                  title="Only fetch and classify threads newer than your last completed run — skips re-listing mail you've already seen."
+                  title="Only fetch and classify threads newer than your last completed run."
                   onClick={() => void startTriage(true)}
                   disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
                   className="rounded-lg border border-gray-300 bg-white px-3.5 py-1.5 text-sm font-semibold text-gray-800 hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
@@ -344,14 +220,13 @@ export default function Dashboard() {
         />
 
         <main
-          id={activeView === 'settings' ? 'settings-panel' : 'triage-queue'}
+          id={activeView === 'settings' ? 'settings-panel' : 'triage-history'}
           className="min-w-0 flex-1 space-y-4 p-4"
         >
           {activeView === 'settings' ? (
             <SettingsPanel
               settings={me?.settings ?? null}
               onSettingsChange={s => {
-                /* SettingsPanel already persisted this via PATCH /api/settings — mirror it locally. */
                 if (me) setMe({ ...me, settings: s })
               }}
             />
@@ -368,8 +243,8 @@ export default function Dashboard() {
               {run && !RUN_ACTIVE(run.status) ? (
                 <RunSummaryCard
                   runId={run.id}
-                  onReviewClusters={() => {
-                    const el = document.getElementById('triage-queue')
+                  onViewHistory={() => {
+                    const el = document.getElementById('triage-history')
                     el?.scrollIntoView({ behavior: 'smooth' })
                   }}
                 />
@@ -381,61 +256,23 @@ export default function Dashboard() {
                 <RunProgress run={run} onCancel={() => void cancelRun()} cancelling={cancelling} />
               ) : null}
 
-              {run ? (
-                <NeedsYourCall runId={run.id} refreshKey={refreshKey} dryRun={dryRun} />
-              ) : null}
-
-              <section aria-label="Triage queue" className="space-y-2">
+              <section aria-label="Triage history" className="space-y-2">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <h2 className="text-sm font-bold tracking-wide text-gray-700 uppercase">
-                    Triage queue
+                    Triage History
                   </h2>
-                  <div className="flex items-center gap-3">
-                    {clusters ? (
-                      <p className="text-xs text-gray-500">
-                        {clusters.length} clusters ·{' '}
-                        {clusters.reduce((n, c) => n + c.item_count, 0)} threads
-                      </p>
-                    ) : null}
-                    {clusters && clusters.length > 0 && run ? (
-                      <button
-                        type="button"
-                        data-testid="approve-all-clusters"
-                        title="Approve every proposed cluster in this run. Threads below the confidence floor stay in Needs your call for you to decide individually."
-                        onClick={() => void approveAllClusters()}
-                        disabled={approvingAll || RUN_ACTIVE(run.status)}
-                        className="rounded-lg bg-emerald-700 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-800 focus:ring-2 focus:ring-emerald-400 focus:outline-none disabled:opacity-50"
-                      >
-                        {approvingAll ? 'Approving…' : 'Approve all'}
-                      </button>
-                    ) : null}
-                    {clusters && clusters.length > 0 && run && !dryRun ? (
-                      <button
-                        type="button"
-                        data-testid="force-archive-all"
-                        title="Archives everything except Needs your call — including confidently-important mail (people, urgent). Asks for confirmation every time."
-                        onClick={() => void forceArchiveEverythingExceptNeedsYourCall()}
-                        disabled={forcingKeep || RUN_ACTIVE(run.status)}
-                        className="rounded-lg border border-orange-300 bg-orange-50 px-3 py-1 text-xs font-semibold text-orange-800 hover:bg-orange-100 focus:ring-2 focus:ring-orange-400 focus:outline-none disabled:opacity-50"
-                      >
-                        {forcingKeep ? 'Archiving…' : 'Archive everything except Needs your call'}
-                      </button>
-                    ) : null}
-                  </div>
+                  {clusters ? (
+                    <p className="text-xs text-gray-500">
+                      {clusters.length} clusters ·{' '}
+                      {clusters.reduce((n, c) => n + c.item_count, 0)} threads
+                    </p>
+                  ) : null}
                 </div>
-                {approveAllResult ? (
-                  <p
-                    data-testid="approve-all-result"
-                    className="rounded-md bg-emerald-50 px-3 py-2 text-xs text-emerald-800"
-                  >
-                    {approveAllResult}
-                  </p>
-                ) : null}
 
                 {!run ? (
                   <EmptyState
-                    title="No triage run yet"
-                    body="Run triage over your 200 most recent inbox threads. Phase 1 is dry run — the agent decides and explains, but never touches your mailbox."
+                    title="Connect your Gmail to start — triage runs automatically after connect"
+                    body="Run triage over your 200 most recent inbox threads. The agent decides and applies actions autonomously."
                     action={
                       <button
                         type="button"
@@ -452,12 +289,12 @@ export default function Dashboard() {
                 ) : clusters === null && clustersLoading ? (
                   <SkeletonRows rows={5} label="Loading clusters…" />
                 ) : clusters && clusters.length > 0 ? (
-                  <ul className="space-y-2" onKeyDown={handleKeyDown} tabIndex={-1}>
+                  <ul className="space-y-2">
                     {clusters.map(c => (
                       <ClusterCard
                         key={c.id}
                         cluster={c}
-                        dryRun={dryRun}
+                        readOnly={true}
                         ref={node => {
                           clusterRefs.current.set(c.id, node)
                         }}
@@ -523,8 +360,8 @@ export default function Dashboard() {
 
       <footer className="border-t border-gray-200 bg-white px-4 py-3 text-xs text-gray-500">
         {dryRun
-          ? 'Dry run is on. Approving or rejecting records your intent in the database; no Gmail message is archived, labelled, deleted or moved. Turn dry-run off in Settings to act for real.'
-          : 'Dry run is off. Approving a decision really archives and labels the matching thread in Gmail; rejecting still only records intent and never mutates your mailbox.'}
+          ? 'Dry run is on. Triage decisions are recorded but Gmail is not touched. Turn dry-run off in Settings to act for real.'
+          : 'Dry run is off. Triage actions are applied autonomously to your Gmail mailbox.'}
       </footer>
     </div>
   )

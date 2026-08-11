@@ -140,80 +140,99 @@ def get_run_summary(
     )
 
 
-@router.post("/api/runs/{run_id}/approve-and-apply")
-def approve_and_apply(
+
+@router.post("/api/runs/{run_id}/undo")
+def undo_run(
     run_id: str,
     user_id: str = Depends(require_user_id),
     session: Session = Depends(get_session),
 ) -> dict:
-    """Bulk-approve all non-needs_your_call, non-keep decisions and apply them."""
-    from db.models import Decision, UserSettings
+    """Reverse all Gmail mutations from this run in reverse chronological order.
 
-    load_run(session, run_id, user_id)  # ownership check
+    Idempotent: a second call on an already-undone run returns the same result.
+    Only ``completed`` runs may be undone — not running or cancelled runs.
+    """
+    from db.models import ActionLog, Decision
 
-    # Check dry_run setting
-    settings = session.get(UserSettings, user_id)
-    if settings is None or bool(settings.dry_run):
-        raise api_error(DRY_RUN_VIOLATION, "dry_run is on — no mutation was attempted", 409)
-
-    # Load eligible decisions: not needs_your_call
-    decisions = session.execute(
-        select(Decision).where(
-            Decision.run_id == run_id,
-            Decision.user_id == user_id,
-            Decision.status != "needs_your_call",
+    run = load_run(session, run_id, user_id)
+    if run.status not in ("completed",):
+        raise api_error(
+            VALIDATION_ERROR,
+            f"can only undo a completed run (status={run.status!r})",
+            422,
         )
+
+    # Load all action logs for this run's decisions, reverse-chronological.
+    action_logs = session.execute(
+        select(ActionLog)
+        .join(Decision, ActionLog.decision_id == Decision.id)
+        .where(
+            ActionLog.user_id == user_id,
+            Decision.run_id == run_id,
+        )
+        .order_by(ActionLog.created_at.desc())
     ).scalars().all()
 
-    skipped_needs_your_call = 0
-    skipped_keep = 0
-    approved_ids: list[str] = []
+    if not action_logs:
+        return ok({"reversed": 0, "skipped": 0, "errors": []})
 
-    for d in decisions:
-        if d.proposed_action == "keep":
-            skipped_keep += 1
-            continue
-        d.status = "approved"
-        approved_ids.append(d.id)
-
-    session.flush()
-
-    # Apply each approved decision
     from api.actions import _mutator_and_labels_for_user
-    from channels.base import ChannelError, DryRunViolation
-    from tools.actions import ActionsError, NeedsYourCallError, NotApprovedError, apply_decision
+    from channels.base import ChannelError
 
-    mutator, label_lookup = _mutator_and_labels_for_user(session, user_id)
+    try:
+        mutator, _ = _mutator_and_labels_for_user(session, user_id)
+    except Exception as exc:
+        raise api_error(PROVIDER_ERROR, f"could not build Gmail client: {exc}", 502) from exc
 
-    applied = 0
-    undo_tokens: list[dict] = []
+    reversed_count = 0
+    skipped_count = 0
+    errors: list[str] = []
 
-    for decision_id in approved_ids:
+    for action_log in action_logs:
+        if action_log.undone_at is not None:
+            # Already undone — idempotent skip.
+            skipped_count += 1
+            continue
         try:
-            action_log = apply_decision(
-                session,
-                user_id,
-                decision_id,
-                mutator=mutator,
-                label_lookup=label_lookup,
-                dry_run=False,
-            )
-            session.commit()
-            applied += 1
-            if action_log.undo_token:
-                undo_tokens.append({"action_log_id": action_log.id, "undo_token": action_log.undo_token})
-        except (NeedsYourCallError, NotApprovedError, ActionsError, ChannelError, DryRunViolation):
-            session.rollback()
-            # Continue with other decisions
+            token = action_log.undo_token or {}
+            thread_id = token.get("thread_id")
+            if not thread_id:
+                errors.append(f"action_log {action_log.id}: missing thread_id in undo_token")
+                continue
 
-    return ok(
-        {
-            "applied": applied,
-            "skipped_keep": skipped_keep,
-            "skipped_needs_your_call": skipped_needs_your_call,
-            "undo_tokens": undo_tokens,
-        }
-    )
+            original_label_ids = token.get("original_label_ids")
+            labels_added = token.get("labels_added_by_triage") or [token.get("category_label_id")]
+            labels_added = [lb for lb in labels_added if lb]
+
+            if original_label_ids is not None:
+                mutator.restore_labels(
+                    thread_id,
+                    add_label_ids=original_label_ids,
+                    remove_label_ids=labels_added,
+                )
+            else:
+                # Legacy token — fall back to implicit inverse.
+                category_label_id = token.get("category_label_id")
+                if not category_label_id:
+                    errors.append(f"action_log {action_log.id}: undo_token lacks category_label_id")
+                    continue
+                mutator.undo_archive_and_label(thread_id, category_label_id=category_label_id)
+
+            from datetime import datetime, timezone
+
+            action_log.undone_at = datetime.now(timezone.utc)
+            if action_log.decision_id:
+                decision = session.get(Decision, action_log.decision_id)
+                if decision is not None and decision.user_id == user_id:
+                    decision.status = "undone"
+            session.flush()
+            reversed_count += 1
+        except ChannelError as exc:
+            errors.append(f"action_log {action_log.id}: {exc}")
+        except Exception as exc:
+            errors.append(f"action_log {action_log.id}: {exc}")
+
+    return ok({"reversed": reversed_count, "skipped": skipped_count, "errors": errors})
 
 
 @router.post("/api/runs/{run_id}/cancel")

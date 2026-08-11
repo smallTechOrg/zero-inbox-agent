@@ -3,15 +3,15 @@
 Every capability maps to exactly one phase. See [`../roadmap.md`](../roadmap.md#phases-of-development)
 for the phase plan and slices.
 
-## Phase 1 — Connect Gmail + Dry-Run Clustered Triage
+## Phase 1 — Connect Gmail + Autonomous Clustered Triage
 
 | Capability | What it does |
 |------------|--------------|
 | [gmail-connection](gmail-connection.md) | Full Google OAuth web flow; per-user encrypted refresh-token storage; multi-tenant isolation |
 | [thread-ingestion](thread-ingestion.md) | Pulls recent inbox threads into the channel-agnostic `Item` shape; redacts secrets; never persists bodies |
-| [cost-tiered-triage](cost-tiered-triage.md) | Four-tier cascade: rules → sender history → batched LLM (20–50/call) → deep read |
-| [thread-clustering](thread-clustering.md) | Collapses hundreds of threads into ~30 cluster decisions |
-| [triage-queue-review](triage-queue-review.md) | The dashboard sweep: reasoning, confidence, tier badge, approve/reject, bulk approve — **pure dry-run** |
+| [cost-tiered-triage](cost-tiered-triage.md) | Four-tier cascade: rules → sender history → batched LLM (20–50/call) → deep read; applies all non-keep decisions automatically on completion |
+| [thread-clustering](thread-clustering.md) | Collapses hundreds of threads into ~30 cluster groups |
+| [triage-history-view](triage-history-view.md) | Read-only dashboard view of applied decisions: reasoning, confidence, tier badge, applied action per thread; no approve/reject |
 | [decision-audit-trail](decision-audit-trail.md) | Decision half: reasoning, confidence, which-rule-fired, structured logs + LangSmith traces |
 
 ## Phase 2 — Never-Miss Safeguards + Real Gmail Actions + Taxonomy Labels + Memory
@@ -28,7 +28,7 @@ for the phase plan and slices.
 
 | Capability | What it does |
 |------------|--------------|
-| [autopilot-and-digest](autopilot-and-digest.md) | Auto-trigger on connect, run summary card, one-click approve-all + apply, daily scheduler, catch-up digest, SSE activity feed, real taxonomy editor (D10 fix) |
+| [autopilot-and-digest](autopilot-and-digest.md) | Auto-trigger on connect (applies on completion), run summary card with "Undo this run" button, run-level undo (`POST /api/runs/{run_id}/undo`), daily scheduler, catch-up digest, SSE activity feed, real taxonomy editor (D10 fix) |
 
 ## Phase 4 — Rules, Chat, Digest, Backlog & Proactive Assistance
 

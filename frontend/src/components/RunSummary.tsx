@@ -3,12 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '@/lib/api'
 import { isRunActive, type RunSummary } from '@/lib/types'
-import { ApiError } from '@/lib/types'
 import { ErrorState, SkeletonRows } from './States'
 
 interface RunSummaryCardProps {
   runId: string
-  onReviewClusters?: () => void
+  onViewHistory?: () => void
 }
 
 function fmt(n: number, decimals = 4) {
@@ -27,13 +26,14 @@ function fmtDate(iso: string | null) {
   }
 }
 
-export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps) {
+export function RunSummaryCard({ runId, onViewHistory }: RunSummaryCardProps) {
   const [summary, setSummary] = useState<RunSummary | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
-  const [applying, setApplying] = useState(false)
-  const [applyResult, setApplyResult] = useState<string | null>(null)
-  const [applyError, setApplyError] = useState<string | null>(null)
+  const [undoing, setUndoing] = useState(false)
+  const [undoResult, setUndoResult] = useState<string | null>(null)
+  const [undoError, setUndoError] = useState<string | null>(null)
+  const [undoDone, setUndoDone] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const load = useCallback(async () => {
@@ -41,7 +41,6 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
       const s = await api.runSummary(runId)
       setSummary(s)
       setError(null)
-      // Stop polling once terminal
       if (!isRunActive(s.status) && pollRef.current) {
         clearInterval(pollRef.current)
         pollRef.current = null
@@ -59,7 +58,6 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
 
   useEffect(() => {
     void load()
-    // Poll every 2 s while run is active
     pollRef.current = setInterval(async () => {
       try {
         const s = await api.runSummary(runId)
@@ -70,7 +68,7 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
           pollRef.current = null
         }
       } catch {
-        // silently ignore mid-poll errors; we'll show the last good summary
+        // silently ignore mid-poll errors
       }
     }, 2000)
     return () => {
@@ -79,25 +77,22 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
     }
   }, [runId, load])
 
-  const handleApproveAndApply = useCallback(async () => {
+  const handleUndo = useCallback(async () => {
     if (!summary) return
-    setApplying(true)
-    setApplyResult(null)
-    setApplyError(null)
+    const confirmed = window.confirm(
+      `This will restore ${summary.total_threads} threads to their pre-triage state in Gmail. This cannot be undone. Continue?`,
+    )
+    if (!confirmed) return
+    setUndoing(true)
+    setUndoError(null)
     try {
-      const res = await api.approveAndApply(runId)
-      const msg =
-        res.applied > 0
-          ? `${res.applied} archived${res.skipped_needs_your_call > 0 ? ` · ${res.skipped_needs_your_call} need review` : ''}`
-          : res.skipped_needs_your_call > 0
-            ? `Nothing new to archive · ${res.skipped_needs_your_call} need review`
-            : 'Nothing to apply.'
-      setApplyResult(msg)
+      const res = await api.runs.undo(runId)
+      setUndoResult(`${res.reversed} threads restored`)
+      setUndoDone(true)
     } catch (e) {
-      const msg = e instanceof ApiError ? e.message : 'Approve-and-apply failed.'
-      setApplyError(msg)
+      setUndoError(e instanceof Error ? e.message : 'Undo failed.')
     } finally {
-      setApplying(false)
+      setUndoing(false)
     }
   }, [runId, summary])
 
@@ -107,6 +102,15 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
 
   const isActive = isRunActive(summary.status)
   const isCompleted = summary.status === 'completed'
+
+  // Derive counts from categories for the headline
+  const archived = summary.categories
+    .filter(c => c.suggested_action === 'archive')
+    .reduce((n, c) => n + c.count, 0)
+  const kept = summary.categories
+    .filter(c => c.suggested_action === 'keep')
+    .reduce((n, c) => n + c.count, 0)
+  const autoKeptLow = summary.needs_your_call_count
 
   return (
     <section
@@ -121,7 +125,7 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
               ? 'Triage in progress…'
               : summary.status === 'failed'
                 ? 'Triage failed'
-                : `Triage complete — ${summary.total_threads} threads processed`}
+                : `Triage complete — ${archived} archived, ${kept} kept, ${autoKeptLow} auto-kept`}
           </h2>
           <p className="mt-0.5 text-xs text-gray-500">
             <span
@@ -144,24 +148,27 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => onReviewClusters?.()}
+            onClick={() => onViewHistory?.()}
             className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-semibold text-gray-700 hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none"
           >
-            Review clusters
+            View history
           </button>
-          <button
-            type="button"
-            onClick={() => void handleApproveAndApply()}
-            disabled={!isCompleted || applying}
-            title={
-              !isCompleted
-                ? 'Run must be completed before approving'
-                : 'Approve all non-flagged decisions and archive them in Gmail'
-            }
-            className="rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-800 focus:ring-2 focus:ring-emerald-400 focus:outline-none disabled:opacity-50"
-          >
-            {applying ? 'Applying…' : 'Approve all & Apply'}
-          </button>
+          {!undoDone && (
+            <button
+              type="button"
+              data-testid="undo-run"
+              onClick={() => void handleUndo()}
+              disabled={!isCompleted || undoing}
+              title={
+                !isCompleted
+                  ? 'Run must be completed before undoing'
+                  : 'Restore all threads to their pre-triage state in Gmail'
+              }
+              className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-sm font-semibold text-rose-800 hover:bg-rose-100 focus:ring-2 focus:ring-rose-400 focus:outline-none disabled:opacity-50"
+            >
+              {undoing ? `Restoring ${summary.total_threads} threads…` : 'Undo this run'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -175,19 +182,19 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
         </div>
       )}
 
-      {/* Apply feedback */}
-      {applyResult && (
+      {/* Undo feedback */}
+      {undoResult && (
         <p className="mb-3 rounded-md bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-800">
-          {applyResult}
+          {undoResult} ✓
         </p>
       )}
-      {applyError && (
+      {undoError && (
         <p className="mb-3 rounded-md bg-rose-50 px-3 py-2 text-xs font-medium text-rose-800">
-          {applyError}
+          {undoError}
         </p>
       )}
 
-      {/* Needs your call badge */}
+      {/* Auto-kept low confidence badge */}
       {summary.needs_your_call_count > 0 && (
         <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2">
           <span className="text-amber-700" aria-hidden="true">
@@ -195,8 +202,8 @@ export function RunSummaryCard({ runId, onReviewClusters }: RunSummaryCardProps)
           </span>
           <span className="text-xs font-semibold text-amber-800">
             {summary.needs_your_call_count} thread
-            {summary.needs_your_call_count !== 1 ? 's' : ''} need your call — below the confidence
-            floor
+            {summary.needs_your_call_count !== 1 ? 's' : ''} auto-kept (low confidence) — stayed in
+            inbox
           </span>
         </div>
       )}

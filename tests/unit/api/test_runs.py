@@ -37,6 +37,7 @@ def test_start_triage_creates_a_running_dry_run_and_returns_immediately(
             "channel_account_id": "conn-alice",
             "limit": 200,
             "fetch_after": None,
+            "dry_run": True,  # alice's UserSettings.dry_run defaults to True
         }
     ]
 

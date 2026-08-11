@@ -83,13 +83,18 @@ def start_triage(
         # No prior completed run: only_new degrades to a normal full fetch —
         # there is nothing to be "newer than" yet.
 
+    from db.models import UserSettings
+
+    settings = session.get(UserSettings, user_id)
+    dry_run = True if settings is None else bool(settings.dry_run)
+
     run = TriageRun(
         id=str(uuid4()),
         user_id=user_id,
         channel_account_id=account.id,
         kind="incremental",
         status="running",
-        dry_run=True,  # Phase 1 forces dry-run server-side; the client cannot turn it off.
+        dry_run=dry_run,
         items_total=0,
         items_decided=0,
         counts={},
@@ -110,6 +115,7 @@ def start_triage(
         channel_account_id=account.id,
         limit=limit,
         fetch_after=fetch_after,
+        dry_run=dry_run,
     )
     return ok({"run_id": run_id})
 
@@ -121,6 +127,7 @@ def _run_triage_task(
     channel_account_id: str,
     limit: int,
     fetch_after: str | None = None,
+    dry_run: bool = True,
 ) -> None:
     """Background worker. Never raises — a failure is recorded on the run row."""
     from db.session import create_db_session
@@ -132,7 +139,7 @@ def _run_triage_task(
             user_id=user_id,
             channel_account_id=channel_account_id,
             limit=limit,
-            dry_run=True,
+            dry_run=dry_run,
             run_id=run_id,
             fetch_after=fetch_after,
         )

@@ -10,6 +10,18 @@ The frontend static export is mounted at `/app` (canonical entry: `http://localh
 
 ---
 
+## Undo model
+
+Before each Gmail mutation the system captures `{thread_id, original_label_ids: [...]}` — the exact
+list of Gmail label IDs the thread carried before triage — and stores it as a JSON snapshot in
+`ActionLog.undo_token`. Undo calls `gmail.users.threads.modify(addLabelIds=original_label_ids,
+removeLabelIds=labels_added_by_triage)` to restore the exact pre-triage state. If the user manually
+changed labels between triage and undo, the undo still restores to pre-triage state (their
+intermediate changes are overwritten — acceptable trade-off). The `ActionLog.undone_at` timestamp is
+set atomically; a second undo call on the same row is a no-op that returns the same result.
+
+---
+
 ## Phase 1
 
 ### Auth & session
@@ -24,18 +36,17 @@ The frontend static export is mounted at `/app` (canonical entry: `http://localh
 ### Triage
 | Method | Path | Body / Query | Returns |
 |--------|------|--------------|---------|
-| `POST` | `/api/connections/{connection_id}/triage` | `{limit: 200, only_new: bool}` | `{run_id}` — starts the run in the background, returns immediately. `only_new=true` fetches only threads newer than the last completed run's start time (cheaper incremental re-triage). |
-| `GET` | `/api/runs/{run_id}` | | `{id, status, dry_run, items_total, items_decided, counts, cost, error_message, started_at, finished_at}` — polled every 1s for the progress bar |
+| `POST` | `/api/connections/{connection_id}/triage` | `{limit: 200, only_new: bool}` | `{run_id}` — starts the run in the background and returns immediately. After the run completes, all non-`keep` and non-`needs_your_call` decisions are **automatically applied** (Gmail mutations performed); `needs_your_call` decisions are auto-kept and never archived. `only_new=true` fetches only threads newer than the last completed run's start time. |
+| `GET` | `/api/runs/{run_id}` | | `{id, status, items_total, items_decided, counts, cost, error_message, started_at, finished_at}` — polled every 1 s for the progress bar |
 | `GET` | `/api/runs/latest` | | Same shape as `/api/runs/{run_id}` but returns the most recent `completed` or `running` run for the session user — used by the frontend to auto-resume display on page load without a known run-id |
 | `POST` | `/api/runs/{run_id}/cancel` | | `{status: "cancelled"}` |
-| `GET` | `/api/triage/clusters` | `?run_id=` | `[{id, kind, label, item_count, suggested_action, min_confidence, avg_confidence, sample_subjects: [3]}]` |
-| `GET` | `/api/triage/items` | `?cluster_id=` or `?run_id=&status=` | `[{decision_id, item: {subject, from_name, from_email, snippet_redacted, internal_date, message_count, is_unread}, category, proposed_action, confidence, reasoning, decided_by, rule_id, rule_name, time_sensitive, status}]` |
-| `POST` | `/api/triage/decisions/{decision_id}` | `{status: "approved"\|"rejected"}` | updated decision. **Phase 1: records intent only — no Gmail call.** `rejected` never causes a Gmail call in any phase — only `approved` decisions can later be passed to `POST /api/actions/apply` (Phase 2) |
-| `POST` | `/api/triage/clusters/{cluster_id}/approve` | `{status: "approved"\|"rejected"}` | `{updated: n}` — the bulk sweep, same rule: rejecting never mutates the mailbox |
+| `GET` | `/api/triage/clusters` | `?run_id=` | `[{id, kind, label, item_count, applied_action, min_confidence, avg_confidence, sample_subjects: [3]}]` — read-only; `applied_action` reflects what was actually done |
+| `GET` | `/api/triage/items` | `?cluster_id=` or `?run_id=&status=` | `[{decision_id, item: {subject, from_name, from_email, snippet_redacted, internal_date, message_count, is_unread}, category, applied_action, confidence, reasoning, decided_by, rule_id, rule_name, time_sensitive, status}]` — read-only history; `applied_action` reflects the action that was performed |
 | `GET` | `/api/categories` | | the user's taxonomy |
 
-Any attempt to mutate Gmail while `dry_run` is true raises `api_error("dry_run_violation", …, 409)`.
-Phase 1 forces `dry_run=true` server-side; the client cannot turn it off.
+> **Note:** `dry_run` is now a debug/dev flag only (default `false` in production). When
+> `settings.dry_run=true` the system classifies threads but performs no Gmail mutations; the UI
+> shows a `DRY RUN` banner. The old Phase 1 constraint of forced `dry_run=true` is removed.
 
 ---
 
@@ -47,15 +58,12 @@ Phase 1 forces `dry_run=true` server-side; the client cannot turn it off.
 | `POST` | `/api/categories` / `PATCH` `/api/categories/{id}` | create/edit a category; creates or renames the matching Gmail label |
 | `POST` | `/api/categories/sync-labels` | ensures every category has a real Gmail label (1:1) |
 | `POST` | `/api/categories/propose` | agent proposes a taxonomy fitted to the user's actual mail |
-| `POST` | `/api/actions/apply` | `{decision_ids: [...]}` → performs the real mutations, returns `[{action_log_id, undo_token_id}]` |
-| `POST` | `/api/actions/{action_log_id}/undo` | fully reverses that action |
+| `POST` | `/api/actions/{action_log_id}/undo` | fully reverses a single mutation using the pre-triage label snapshot stored in `ActionLog.undo_token` |
 | `GET` | `/api/actions` | the audit trail, newest first, with an undo affordance per row |
 | `GET`/`POST`/`DELETE` | `/api/vip` | the never-hide list |
 | `GET`/`PUT` | `/api/profile` | the plain-English priorities profile |
 | `GET`/`POST` | `/api/corrections` | corrections recorded as training signal |
-| `GET` | `/api/triage/needs-your-call` | the below-the-floor queue |
-| `POST` | `/api/triage/runs/{run_id}/review-all` | `{status: "approved"\|"rejected"}` — bulk approve or reject every non-`needs_your_call` decision in a run in one call; the "get to zero inbox fast" sweep. `needs_your_call` decisions are silently skipped (they require individual review). Returns `{updated, skipped_needs_your_call}`. |
-| `GET` | `/api/inbox-summary` | Live Gmail thread counts: `{inbox_total, needs_your_call, categories: [{key, name, count, channel_label_name}]}`. Each count is one `labels().get()` call (no thread listing). Used by the inbox summary panel to show how close to zero the mailbox actually is. |
+| `GET` | `/api/inbox-summary` | Live Gmail thread counts: `{inbox_total, needs_your_call, categories: [{key, name, count, channel_label_name}]}`. Each count is one `labels().get()` call (no thread listing). |
 
 ---
 
@@ -65,22 +73,24 @@ Phase 1 forces `dry_run=true` server-side; the client cannot turn it off.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/api/runs/{run_id}/summary` | Run summary card — `{run_id, status, total_threads, categories: [{name, count, suggested_action}], top_clusters: [{label, count, suggested_action}] (top 3 by size), needs_your_call_count, cost_usd, completed_at}` |
-| `POST` | `/api/runs/{run_id}/approve-and-apply` | Bulk-approve all non-`needs_your_call` decisions then apply all approved archive/digest decisions atomically. Returns `{applied, skipped_keep, skipped_needs_your_call, undo_tokens: [...]}`. `needs_your_call` decisions silently skipped. Existing `review-all` and `apply` endpoints are unchanged. |
+| `GET` | `/api/runs/{run_id}/summary` | Run summary card — `{run_id, status, total_threads, applied_count, kept_count, auto_kept_count, categories: [{name, count, applied_action}], top_clusters: [{label, count, applied_action}] (top 3 by size), cost_usd, completed_at}`. Reflects what **was done** (applied counts), not what is pending. |
+| `POST` | `/api/runs/{run_id}/undo` | Reverses **all** Gmail mutations from this run in reverse chronological order. Each thread is restored to its pre-triage label state using the snapshot in `ActionLog.undo_token`. Returns `{reversed: n, skipped: n, errors: [...]}`. Idempotent — a second call on an already-undone run returns the same result immediately. Can only undo a `completed` run (not a running or cancelled run). |
 
-Auto-trigger: after `/auth/google/callback` completes, the backend enqueues a `BackgroundTask` equivalent to `POST /api/connections/{id}/triage` with `limit=200, only_new=false` — no client call required.
+Auto-trigger: after `/auth/google/callback` completes, the backend enqueues a `BackgroundTask`
+equivalent to `POST /api/connections/{id}/triage` with `limit=200, only_new=false` — no client call
+required. The run applies automatically on completion; the user sees the result in the Run Summary card.
 
 ### Digest
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/api/digest/latest` | Catch-up digest for the most recent completed run: `{run_id, generated_at, time_sensitive_kept: [{subject, from, reason}], vip_mail: [...], needs_your_call: [...], auto_archived: {count, by_category: [...]}}`. Returns `404` if no completed run exists. |
+| `GET` | `/api/digest/latest` | Catch-up digest for the most recent completed run: `{run_id, generated_at, time_sensitive_kept: [{subject, from, reason}], vip_mail: [...], auto_kept_low_confidence: [...], auto_archived: {count, by_category: [...]}}`. Returns `404` if no completed run exists. |
 
 ### Events (SSE)
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/api/events` | `text/event-stream`. Pushes structured JSON events — `run_started: {run_id, connection_id, triggered_by: "user"\|"scheduler"\|"connect"}`, `run_progress: {run_id, batch_n, batch_total, items_decided, cost_so_far}`, `gmail_mutation_applied: {action_log_id, thread_count, category}`, `run_completed: {run_id, total_threads, cost_usd}`, `error: {run_id, message}`. Last 50 events per user kept in memory only — not persisted to DB. |
+| `GET` | `/api/events` | `text/event-stream`. Pushes structured JSON events — `run_started: {run_id, connection_id, triggered_by: "user"\|"scheduler"\|"connect"}`, `run_progress: {run_id, batch_n, batch_total, items_decided, cost_so_far}`, `gmail_mutation_applied: {action_log_id, thread_count, category}`, `run_completed: {run_id, total_threads, applied_count, cost_usd}`, `error: {run_id, message}`. Last 50 events per user kept in memory only — not persisted to DB. |
 
 ---
 
@@ -107,6 +117,6 @@ Auto-trigger: after `/auth/google/callback` completes, the backend enqueues a `B
 
 ## Error codes
 
-`unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `dry_run_violation` (409) ·
+`unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `already_undone` (409) ·
 `reauth_required` (409, the Gmail refresh token is invalid) · `rate_limited` (429) ·
 `provider_error` (502) · `validation_error` (422).

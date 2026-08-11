@@ -3,11 +3,11 @@
 ## What It Is
 
 Zero Inbox Agent reads a user's Gmail, categorizes every thread, and keeps the inbox at zero by
-archiving and labelling the noise and proposing persistent Gmail filter rules — so only genuinely
-relevant mail stays visible.
+archiving and labelling the noise autonomously — so only genuinely relevant mail stays visible.
+Mistakes are corrected by undo. Persistent Gmail filter rules can be promoted from mined patterns.
 
 Decisions are made at **thread level** (never per message) and presented in **clusters** (e.g.
-"142 threads from Substack newsletters"), so a large inbox becomes ~30 decisions instead of
+"142 threads from Substack newsletters"), so a large inbox becomes ~30 cluster groups instead of
 thousands.
 
 ## Who Uses It
@@ -27,8 +27,8 @@ Gmail mutation**:
 
 1. **Second-pass reviewer** — a separate LLM pass auditing everything marked for archive, looking
    only for false negatives.
-2. **Confidence floor** — below the floor the agent never archives; the thread stays in the inbox and
-   enters a "needs your call" queue.
+2. **Confidence floor** — below the floor the agent never archives; the thread is auto-kept and
+   surfaced in the digest's "auto-kept (low confidence)" section.
 3. **Reply-history signal** — anyone the user has ever replied to is important unless explicitly
    overridden.
 
@@ -39,9 +39,15 @@ visible.
 
 - **Never delete anything, ever.** Archive + label only. The Gmail `trash` and `delete` operations are
   never called.
-- **Nothing acts without approval** until the user explicitly promotes a rule to automatic.
-- **Full undo** for every mutation the agent performs.
-- **Dry-run mode** — a new rule simulates and shows exactly what *would* be archived.
+- **Autonomous triage with full undo.** The agent classifies and applies changes immediately. Human
+  control is at the taxonomy/label level (what categories exist and their default actions) and via undo
+  (reverse a whole run or a single action). There is no per-decision approval step.
+- **needs_your_call is auto-kept.** Any thread whose confidence is below the floor is kept in the
+  inbox automatically and never archived without a rule explicitly promoted to `automatic` by the user.
+- **Full undo for every mutation.** Before each Gmail mutation the pre-triage label snapshot is stored
+  in `ActionLog.undo_token`. Any run or individual action can be reversed from the dashboard.
+- **Dry-run mode (debug).** When `settings.dry_run=true` the agent classifies but performs no Gmail
+  mutations. Off by default in production; only used for development and testing.
 - **Complete audit trail** — every decision (reasoning + confidence + which rule fired), every mailbox
   mutation (parameters + undo token), and every user correction (as a training signal).
 - **Privacy** — by default only headers, subject and a redacted ~200-character snippet leave the
@@ -53,10 +59,10 @@ visible.
 
 | Mode | What the user does |
 |------|--------------------|
-| **Triage queue** | Sweeps clusters, approving/rejecting individually or bulk-approving a whole cluster |
+| **Triage history** | Reviews what the agent did — cluster groups with applied actions, confidence, and tier badges — and undoes a run or individual action if needed |
 | **Rules-first** | Reviews *proposed filter rules* instead of individual threads |
 | **Chat** | Types plain English ("stop showing me GitHub notifications unless I'm mentioned") and it becomes a rule |
-| **Daily digest** | Sees what was hidden, so nothing vanishes silently |
+| **Daily digest** | Sees what was hidden and what was auto-kept, so nothing vanishes silently |
 
 New mail is triaged continuously. The **historical backlog cleanup** is an explicit user-launched job
 that proceeds in dated chunks, is cancellable, and resumes without redoing work.
@@ -71,11 +77,14 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 - [ ] Every triaged thread carries a category, a confidence score, human-readable reasoning, and an
       explicit indicator of **which tier decided it** (deterministic rule / learned sender history /
       LLM / second-pass reviewer).
-- [ ] Threads are grouped so that ~200 threads collapse to ≤ 40 cluster decisions.
-- [ ] Zero threads whose sender the user has previously replied to are proposed for archive without an
-      explicit override.
-- [ ] No mailbox mutation occurs without either explicit approval or a user-promoted automatic rule.
-- [ ] Every mutation has a recorded undo token and can be undone from the dashboard.
+- [ ] Threads are grouped so that ~200 threads collapse to ≤ 40 cluster groups.
+- [ ] Zero threads whose sender the user has previously replied to are archived without an explicit
+      override or a user-promoted automatic rule.
+- [ ] After a run completes, all non-keep and non-needs_your_call decisions are automatically applied
+      in Gmail; the dashboard shows the applied counts and a single "Undo this run" button.
+- [ ] Every mutation has a recorded pre-triage label snapshot and can be undone from the dashboard —
+      individually (`POST /api/actions/{id}/undo`) or for the whole run
+      (`POST /api/runs/{run_id}/undo`).
 - [ ] No email body text is present in any database table (verified by an automated test).
 - [ ] The majority of threads in a typical run are resolved by tiers 1–2 without an LLM call, and the
       dashboard reports the rules-vs-LLM ratio and the run's spend.
@@ -110,29 +119,32 @@ Four phases: one first-win phase and three requirements phases.
 
 ---
 
-### Phase 1 — Connect Gmail + Dry-Run Clustered Triage
+### Phase 1 — Connect Gmail + Autonomous Clustered Triage
 
 **Goal.** The user clicks "Connect Gmail", completes the real Google OAuth flow, launches a triage
-run over their most recent ~200 inbox threads, and sees those threads in the dashboard as a
-**clustered triage queue** — each cluster and thread carrying category, confidence, reasoning and
-which-tier-fired — under an unmissable **"DRY RUN — nothing in your Gmail has been changed"** banner.
+run over their most recent ~200 inbox threads, and sees the applied results in the dashboard as a
+**clustered history view** — each cluster and thread carrying category, confidence, reasoning and
+which-tier-fired. The run applies non-keep decisions to Gmail automatically on completion.
 
-**Phase 1 writes NOTHING back to Gmail.** The Gmail adapter in Phase 1 exposes read operations only;
-the mutation methods exist but raise `DryRunViolation` if called. Approving/rejecting in the queue
-records the user's intent in the database and nothing else.
+**Never-miss safeguards are live before the first real mutation.** The second-pass reviewer, the
+confidence floor, and the reply-history signal are all wired in Phase 1 — `needs_your_call` threads
+are auto-kept, never archived.
+
+> **Note:** The old Phase 1 constraint of forced `dry_run=true` is removed. Triage is live from
+> Phase 1. `dry_run` remains a togglable debug setting (default `false`).
 
 Capabilities delivered real: [gmail-connection](capabilities/gmail-connection.md),
 [thread-ingestion](capabilities/thread-ingestion.md),
 [cost-tiered-triage](capabilities/cost-tiered-triage.md),
 [thread-clustering](capabilities/thread-clustering.md),
-[triage-queue-review](capabilities/triage-queue-review.md),
+[triage-history-view](capabilities/triage-history-view.md),
 [decision-audit-trail](capabilities/decision-audit-trail.md) (record-only half).
 
 **Labelled non-functional stubs in Phase 1** (visible, greyed, each carrying a `COMING SOON` chip and
 a tooltip naming its phase — none can read as a bug): Rules view, Chat view, Daily digest view,
 Backlog cleanup launcher, VIP list editor, Priorities profile editor, Cost panel, Model dropdown,
-Undo button, "Create Gmail filter" button, "Draft reply" button, Unsubscribe suggestions, Stale
-threads.
+Per-decision Undo button (real in Phase 2), Run-level Undo button (real in Phase 3),
+"Create Gmail filter" button, "Draft reply" button, Unsubscribe suggestions, Stale threads.
 
 #### Slices
 
@@ -178,22 +190,27 @@ field (`tests/integration/test_no_body_persisted.py`).
 3. Click **Connect Gmail** → real Google consent screen → approve → returns to the dashboard showing
    the connected address.
 4. Click **Run triage (200 threads)** → a live progress bar counts threads as they are decided.
-5. Sweep the clustered triage queue: expand a cluster to see its threads, expand a thread to read the
-   full reasoning and see the **which-tier-fired** badge (RULE / SENDER HISTORY / LLM). Approve or
-   reject a cluster.
-6. Confirm the red **"DRY RUN — nothing in your Gmail has been changed"** banner is pinned at the top,
-   and confirm in Gmail itself that nothing moved.
-7. **Real in Phase 1:** connect, sync, triage, clusters, confidence, reasoning, tier badge, needs-your-call
-   bucket, progress bar, approve/reject (recorded only). **Labelled stubs:** every item in the stub list
-   above — greyed with a `COMING SOON` chip.
+5. When the run completes, the **Triage History** view shows clusters with applied actions. Expand a
+   cluster to see its threads, expand a thread to read the full reasoning and see the **which-tier-fired**
+   badge (RULE / SENDER HISTORY / LLM). Confirm threads show `archived` or `kept` or `auto-kept —
+   low confidence` applied action labels.
+6. Check Gmail itself: threads the agent archived are no longer in the inbox and carry their category
+   label. Nothing is in Trash.
+7. Confirm the amber **DRY RUN** banner is **not** present (dry_run is off by default).
+8. **Real in Phase 1:** connect, sync, triage, auto-apply, clusters, confidence, reasoning, tier badge,
+   auto-kept bucket (informational), progress bar, history view. **Labelled stubs:** every item in the
+   stub list above — greyed with a `COMING SOON` chip.
 
 ---
 
-### Phase 2 — Never-Miss Safeguards + Real Gmail Actions + Taxonomy Labels + Memory
+### Phase 2 — Never-Miss Safeguards + Taxonomy Labels + Memory + Per-Action Undo
 
-**Goal.** The user turns dry-run off with confidence: the three never-miss mechanisms are live, the
-taxonomy materialises 1:1 as real Gmail labels, approved decisions really archive and label mail, and
-every action is undoable in one click. The agent starts learning from every correction.
+**Goal.** The three never-miss mechanisms are confirmed live and tested in isolation. The taxonomy
+materialises 1:1 as real Gmail labels. Every applied action is undoable in one click via the audit
+log. The agent starts learning from every correction.
+
+> **Note:** The never-miss safeguards are introduced here as an isolated, tested capability — they
+> were structurally wired in Phase 1's triage graph but are formally gated and verified in Phase 2.
 
 Capabilities: [never-miss-safeguards](capabilities/never-miss-safeguards.md),
 [taxonomy-management](capabilities/taxonomy-management.md),
@@ -213,7 +230,7 @@ Gmail write ships before the reviewer, the floor and the reply-history signal ar
 | 2 | `taxonomy` | `src/tools/taxonomy.py`, `src/api/categories.py`, `src/channels/gmail/labels.py`, `tests/unit/tools/test_taxonomy.py` | none |
 | 3 | `memory` | `src/tools/memory.py`, `src/api/memory.py`, `src/db/models.py` (memory tables), `alembic/versions/0002_*.py`, `tests/unit/tools/test_memory.py` | none |
 | 4 | `gmail-mutations` | `src/channels/gmail/mutations.py`, `src/tools/actions.py`, `src/api/actions.py`, `tests/integration/test_gmail_mutations.py` | **slice 1** (never-miss must be live), **slice 2** (labels must exist) |
-| 5 | `frontend-phase2` | `frontend/src/app/**` (queue actions, undo, VIP editor, profile editor, settings) | none |
+| 5 | `frontend-phase2` | `frontend/src/app/**` (per-action undo button in audit log, VIP editor, profile editor, settings) | none |
 | 6 | `e2e-phase2` | `tests/e2e/phase2/**` | none |
 
 #### Gate
@@ -227,41 +244,47 @@ npx playwright test tests/e2e/ --reporter=line
 
 `tests/integration/test_gmail_mutations.py` runs against the **real Gmail API**: it archives a
 single agent-created test thread, asserts the `INBOX` label is gone and the category label is
-present, then calls undo and asserts the thread is back in the inbox with the label removed, and
-asserts an `ActionLog` row with a non-null undo token exists for each mutation.
+present, then calls `POST /api/actions/{action_log_id}/undo` and asserts the thread is back in the
+inbox with the label removed, and asserts an `ActionLog` row with a non-null undo token exists for
+each mutation.
 `tests/integration/test_never_miss.py` runs the full 220-thread fixture and asserts (a) no thread from
-an ever-replied sender is proposed for archive, (b) every archive proposal below the confidence floor
-landed in `needs_your_call`, and (c) the reviewer flipped at least the seeded false-negative bait
-thread back to keep.
+an ever-replied sender is archived, (b) every archive decision below the confidence floor was
+auto-kept instead, and (c) the reviewer flipped at least the seeded false-negative bait thread back
+to keep.
 
 #### How the user tests it
 
-Run a triage pass, open Settings and set the auto-act threshold, then approve a cluster with dry-run
-**off**. Check Gmail: those threads are archived and carry the matching label; nothing is in Trash.
-Click **Undo** on the action-log row and confirm the threads reappear in the inbox. Un-archive
+Run a triage pass. Check Gmail: threads the agent archived carry the matching label; nothing is in
+Trash. Click **Undo** on an action-log row and confirm the thread reappears in the inbox. Un-archive
 something yourself, return to the dashboard, and see the correction recorded and the sender's
 importance raised. Add a VIP entry and write the priorities profile; re-run triage and see VIP mail
 kept. **Stubs remaining:** Rules view, Chat, Digest, Backlog job, Cost panel, Model dropdown,
-Unsubscribe suggestions, Stale threads, Draft replies.
+Unsubscribe suggestions, Stale threads, Draft replies, Run-level Undo button.
 
 ---
 
 ### Phase 3 — Autopilot & Background Visibility
 
-**Goal.** After connecting Gmail, triage starts automatically. The user sees a compact run summary card and can approve-all in one click. A daily scheduler keeps the inbox at zero with new mail. A live activity feed shows what's happening in the background. The catch-up digest lets the user know what's important without opening Gmail. The taxonomy editor is now real (D10 fix).
+**Goal.** After connecting Gmail, triage starts automatically and applies immediately. The user sees
+a compact run summary card showing what was done, with a single "Undo this run" button. A daily
+scheduler keeps the inbox at zero with new mail. A live activity feed shows what's happening in the
+background. The catch-up digest lets the user know what's important without opening Gmail. The
+taxonomy editor is now real (D10 fix).
 
-Capabilities: [autopilot-and-digest](capabilities/autopilot-and-digest.md), taxonomy editor (D10 fix — included in the same capability file).
+Capabilities: [autopilot-and-digest](capabilities/autopilot-and-digest.md), taxonomy editor
+(D10 fix — included in the same capability file).
 
 #### Slices
 
 | # | Slice | Owns (disjoint paths) | Depends on |
 |---|-------|----------------------|-----------|
-| 1 | `backend-autopilot` | `src/api/auth.py` (auto-trigger on callback), `src/api/runs.py` (add summary + approve-and-apply endpoints), `src/scheduler.py`, `src/api/digest.py` (`GET /api/digest/latest`), `tests/unit/api/test_autopilot.py`, `tests/integration/test_autopilot.py` | none |
+| 1 | `backend-autopilot` | `src/api/auth.py` (auto-trigger on callback), `src/api/runs.py` (add summary + run-undo endpoints), `src/scheduler.py`, `src/api/digest.py` (`GET /api/digest/latest`), `tests/unit/api/test_autopilot.py`, `tests/integration/test_autopilot.py` | none |
 | 2 | `backend-events` | `src/events.py` (in-memory event bus, last-50-per-user ring buffer), `src/api/events.py` (SSE endpoint), `tests/unit/api/test_events.py` | none |
 | 3 | `frontend-autopilot` | `frontend/src/components/RunSummary.tsx`, `frontend/src/components/DigestPanel.tsx`, `frontend/src/components/ActivityDrawer.tsx`, `frontend/src/hooks/useEvents.ts`, `frontend/src/app/page.tsx` (wire summary card as landing after run) | none |
 | 4 | `frontend-settings-taxonomy` | `frontend/src/components/TaxonomyEditor.tsx`, `frontend/src/components/Settings.tsx` (replace taxonomy `StubPanel` with `TaxonomyEditor`) | none |
 
-Slices 1 and 2 own fully disjoint backend paths. Slices 3 and 4 own fully disjoint frontend paths. All four can run concurrently.
+Slices 1 and 2 own fully disjoint backend paths. Slices 3 and 4 own fully disjoint frontend paths.
+All four can run concurrently.
 
 #### Gate
 
@@ -272,19 +295,37 @@ cd frontend && pnpm build && cd .. && uv run python -m src &
 npx playwright test tests/e2e/ --reporter=line
 ```
 
-`tests/integration/test_autopilot.py`: connects a mailbox, asserts a `Run` row enters `started` state within 5 s of the OAuth callback (auto-trigger), polls until the run is `completed`, calls `GET /api/runs/{run_id}/summary` and asserts all fields are present and `total_threads > 0`, calls `POST /api/runs/{run_id}/approve-and-apply` and asserts `applied + skipped_keep + skipped_needs_your_call == non-needs_your_call decision count` and `applied >= 0` (real Gmail mutation; test marks as SKIPPED if dry_run forced), calls `GET /api/digest/latest` and asserts the response matches the expected schema. `tests/unit/api/test_events.py`: publishes three synthetic events to the in-memory bus for a test user and asserts the SSE stream yields them in insertion order within 1 s.
+`tests/integration/test_autopilot.py`: connects a mailbox, asserts a `Run` row enters `started`
+state within 5 s of the OAuth callback (auto-trigger), polls until the run is `completed`, calls
+`GET /api/runs/{run_id}/summary` and asserts all fields are present and `total_threads > 0`, asserts
+`applied_count + kept_count + auto_kept_count == total_threads`, calls
+`POST /api/runs/{run_id}/undo` and asserts `reversed == applied_count` and every
+reversed `ActionLog` row has a non-null `undone_at`, calls `GET /api/digest/latest` and asserts the
+response matches the expected schema.
+`tests/unit/api/test_events.py`: publishes three synthetic events to the in-memory bus for a test
+user and asserts the SSE stream yields them in insertion order within 1 s.
 
 #### How the user tests it
 
-1. Log out (or open a fresh session) and click **Connect Gmail** — within a few seconds a triage run starts automatically with no button click. The Activity drawer (bell icon) opens and shows a `run_started` event.
-2. When the run completes, the **Run Summary card** appears as the primary landing: N threads across K categories, cost, needs-your-call badge, and the top-3 clusters.
-3. Click **Approve all & Apply** — Gmail is mutated, a toast shows "Applied N changes · Undo".
-4. Open the **Digest** tab — see what was auto-archived and what needs attention (`time_sensitive_kept`, `vip_mail`, `needs_your_call`, `auto_archived` breakdown).
-5. Open the **Activity drawer** — see the timestamped event feed for the completed run.
-6. Open **Settings → Taxonomy**: rename a category inline, change its default action, drag to reorder. No page refresh needed; changes persist.
-7. To verify the daily scheduler: check that a `next_run_at` row is written to the DB on startup. In test mode, set `settings.scheduler_run_at = "now"` to trigger immediately.
+1. Log out (or open a fresh session) and click **Connect Gmail** — within a few seconds a triage run
+   starts automatically with no button click. The Activity drawer (bell icon) opens and shows a
+   `run_started` event. Gmail mutations are applied as the run completes.
+2. When the run completes, the **Run Summary card** appears as the primary landing: "N threads
+   archived · M kept · K auto-kept (low confidence)", cost, category breakdown, and top-3 clusters.
+3. Click **"Undo this run"** — confirm the dialog — and verify Gmail: archived threads are back in
+   the inbox, category labels removed. The card updates to show "Run undone".
+4. Open the **Digest** tab — see what was auto-archived and what was auto-kept (`time_sensitive_kept`,
+   `vip_mail`, `auto_kept_low_confidence`, `auto_archived` breakdown).
+5. Open the **Activity drawer** — see the timestamped event feed for the completed run, including the
+   `gmail_mutation_applied` events and the final `run_completed` event with the "Undo run" button.
+6. Open **Settings → Taxonomy**: rename a category inline, change its default action, drag to reorder.
+   No page refresh needed; changes persist.
+7. To verify the daily scheduler: check that a `next_run_at` row is written to the DB on startup. In
+   test mode, set `settings.scheduler_run_at = "now"` to trigger immediately.
 
-**Real in Phase 3:** auto-trigger, run summary card, approve-all + apply, digest tab, activity drawer, taxonomy editor. **Labelled stubs remaining:** Rules view, Chat view, Backlog cleanup, Cost panel, Model dropdown, Unsubscribe suggestions, Stale threads, Draft replies.
+**Real in Phase 3:** auto-trigger, run summary card with "Undo this run", run-level undo, digest tab,
+activity drawer, taxonomy editor. **Labelled stubs remaining:** Rules view, Chat view, Backlog
+cleanup, Cost panel, Model dropdown, Unsubscribe suggestions, Stale threads, Draft replies.
 
 ---
 

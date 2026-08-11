@@ -210,11 +210,18 @@ export type DigestData = {
   auto_archived: { count: number; by_category: { name: string; count: number }[] }
 }
 
+export type UndoRunResult = {
+  reversed: number
+  skipped: number
+  errors: string[]
+}
+
 export type SseEventType =
   | 'run_started'
   | 'run_progress'
   | 'gmail_mutation_applied'
   | 'run_completed'
+  | 'auto_apply_complete'
   | 'error'
   | 'heartbeat'
 

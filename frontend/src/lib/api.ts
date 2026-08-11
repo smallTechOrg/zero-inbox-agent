@@ -17,6 +17,7 @@ import {
   type Settings,
   type TaxonomyProposal,
   type TriageItem,
+  type UndoRunResult,
   type VipEntry,
   type VipKind,
 } from './types'
@@ -166,6 +167,11 @@ export const api = {
 
   approveAndApply: (runId: string) =>
     request<ApproveAndApplyResult>(`/api/runs/${runId}/approve-and-apply`, { method: 'POST' }),
+
+  runs: {
+    undo: (runId: string) =>
+      request<UndoRunResult>(`/api/runs/${runId}/undo`, { method: 'POST' }),
+  },
 
   digestLatest: () => request<DigestData>('/api/digest/latest'),
 

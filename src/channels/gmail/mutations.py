@@ -84,6 +84,15 @@ class GmailMutator:
         }
 
     # --- the only two mutations that exist ------------------------------
+    def get_thread_labels(self, thread_id: str) -> list[str]:
+        """Return the current Gmail label IDs for a thread (pre-mutation snapshot)."""
+        result = self._execute(
+            self._service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="metadata")
+        )
+        return list((result or {}).get("labelIds") or [])
+
     def archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict:
         """One atomic ``modify()``: add the category label, remove ``INBOX``.
 
@@ -101,4 +110,18 @@ class GmailMutator:
             thread_id,
             add_label_ids=[INBOX_LABEL_ID],
             remove_label_ids=[category_label_id],
+        )
+
+    def restore_labels(
+        self, thread_id: str, *, add_label_ids: list[str], remove_label_ids: list[str]
+    ) -> dict:
+        """Generic restore: add back the given labels, remove the ones triage added.
+
+        Used by the run-level undo to restore exactly the pre-triage label state
+        captured in ``ActionLog.undo_token['original_label_ids']``.
+        """
+        return self._modify(
+            thread_id,
+            add_label_ids=add_label_ids,
+            remove_label_ids=remove_label_ids,
         )

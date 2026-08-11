@@ -55,8 +55,12 @@ class NotArchivableError(ActionsError):
 
 
 class Mutator(Protocol):
+    def get_thread_labels(self, thread_id: str) -> list[str]: ...
     def archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict: ...
     def undo_archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict: ...
+    def restore_labels(
+        self, thread_id: str, *, add_label_ids: list[str], remove_label_ids: list[str]
+    ) -> dict: ...
 
 
 class LabelLookup(Protocol):
@@ -133,6 +137,15 @@ def apply_decision(
     if not category.channel_label_id:
         category.channel_label_id = category_label_id
 
+    # Capture the pre-triage label state for exact undo restoration.
+    # Best-effort: a failed snapshot must not block the mutation — we fall
+    # back to the old implicit inverse if we cannot read the current labels.
+    original_label_ids: list[str] = []
+    try:
+        original_label_ids = mutator.get_thread_labels(item.external_thread_id)
+    except Exception:
+        pass  # snapshot is best-effort; undo will use category_label_id fallback
+
     # The single atomic Gmail call. Failure here (after 3 retries inside the
     # mutator) propagates unchanged — nothing below is executed, nothing is
     # logged as applied, and the decision stays `approved` for Retry.
@@ -151,6 +164,11 @@ def apply_decision(
         undo_token={
             "thread_id": item.external_thread_id,
             "category_label_id": category_label_id,
+            # Full pre-triage snapshot — used by the precision undo path.
+            "original_label_ids": original_label_ids,
+            # Labels this mutation added; needed to undo exactly what was done.
+            "labels_added_by_triage": [category_label_id],
+            # Legacy inverse fields kept for older tokens still in the DB.
             "add_label_ids": [INBOX_LABEL_ID],
             "remove_label_ids": [category_label_id],
         },
@@ -215,8 +233,20 @@ def undo_action(
     if not thread_id or not category_label_id:
         raise ActionsError("undo token is missing the fields needed to reverse this action")
 
-    # Also propagates unchanged on failure — never mark undone optimistically.
-    mutator.undo_archive_and_label(thread_id, category_label_id=category_label_id)
+    # Precision undo: if we captured the exact pre-triage label state, use it.
+    # Falls back to the implicit inverse (add INBOX, remove category label) for
+    # older tokens that pre-date the snapshot feature.
+    original_label_ids = token.get("original_label_ids")
+    labels_added = token.get("labels_added_by_triage") or [category_label_id]
+    if original_label_ids is not None and hasattr(mutator, "restore_labels"):
+        mutator.restore_labels(
+            thread_id,
+            add_label_ids=original_label_ids,
+            remove_label_ids=labels_added,
+        )
+    else:
+        # Also propagates unchanged on failure — never mark undone optimistically.
+        mutator.undo_archive_and_label(thread_id, category_label_id=category_label_id)
 
     action_log.undone_at = _now()
 
@@ -229,10 +259,14 @@ def undo_action(
         select(m.Item).where(m.Item.external_thread_id == thread_id, m.Item.user_id == user_id)
     ).scalar_one_or_none()
     if item is not None:
-        labels = set(item.channel_labels or [])
-        labels.discard(category_label_id)
-        labels.add(INBOX_LABEL_ID)
-        item.channel_labels = sorted(labels)
+        if original_label_ids is not None:
+            # Precision restore: snapshot is the ground truth.
+            item.channel_labels = sorted(original_label_ids)
+        else:
+            labels = set(item.channel_labels or [])
+            labels.discard(category_label_id)
+            labels.add(INBOX_LABEL_ID)
+            item.channel_labels = sorted(labels)
 
     session.flush()
     return action_log

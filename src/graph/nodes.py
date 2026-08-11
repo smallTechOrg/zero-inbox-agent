@@ -928,6 +928,149 @@ def handle_error(state: TriageState) -> dict:
     return {"status": "failed", "decisions": decisions, "counts": counts}
 
 
+def _build_mutator_for_user(user_id: str, channel_account_id: str, session):
+    """Build a GmailMutator + GmailLabelManager for auto-apply.
+
+    Returns ``(mutator, label_lookup)`` or raises on auth failure.
+    """
+    from googleapiclient.discovery import build
+
+    from channels.gmail.labels import GmailLabelManager
+    from channels.gmail.mutations import GmailMutator
+    from channels.gmail.oauth import credentials_from_refresh_token, google_oauth_config
+    from channels.gmail.store import SqlConnectionStore
+
+    refresh_token = SqlConnectionStore().load_refresh_token(
+        user_id=user_id, connection_id=channel_account_id
+    )
+    config = google_oauth_config()
+    credentials = credentials_from_refresh_token(config, refresh_token)
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    return GmailMutator(service), GmailLabelManager(service)
+
+
+def _auto_apply_decisions(state: TriageState, counts: dict) -> None:
+    """Apply all non-keep, non-needs_your_call decisions for this run.
+
+    Called from ``finalize`` when dry_run is off. Each decision is applied
+    independently — one failure never blocks the others.
+    """
+    run_id = state.get("run_id")
+    user_id = state["user_id"]
+    channel_account_id = state.get("channel_account_id") or ""
+
+    applied = 0
+    kept = 0
+    auto_kept_low_confidence = 0
+    errors: list[str] = []
+
+    try:
+        from db.session import create_db_session
+        from db.models import Decision as DecisionModel
+        from sqlalchemy import select as sa_select
+        from tools.actions import apply_decision, ActionsError, NeedsYourCallError, NotApprovedError
+        from channels.base import ChannelError, DryRunViolation
+
+        with create_db_session() as session:
+            try:
+                mutator, label_lookup = _build_mutator_for_user(user_id, channel_account_id, session)
+            except Exception as exc:
+                log.error(
+                    "triage.auto_apply_build_mutator_failed",
+                    run_id=run_id,
+                    error=str(exc),
+                )
+                return
+
+            decisions = list(
+                session.execute(
+                    sa_select(DecisionModel).where(
+                        DecisionModel.run_id == run_id,
+                        DecisionModel.user_id == user_id,
+                    )
+                ).scalars()
+            )
+
+            for decision in decisions:
+                if decision.status == "needs_your_call":
+                    auto_kept_low_confidence += 1
+                    continue
+                if decision.proposed_action not in ("archive", "digest"):
+                    kept += 1
+                    continue
+                # Mark approved so apply_decision accepts it.
+                decision.status = "approved"
+                session.flush()
+                try:
+                    apply_decision(
+                        session,
+                        user_id,
+                        decision.id,
+                        mutator=mutator,
+                        label_lookup=label_lookup,
+                        dry_run=False,
+                    )
+                    session.commit()
+                    applied += 1
+                except (ActionsError, NeedsYourCallError, NotApprovedError) as exc:
+                    session.rollback()
+                    errors.append(str(exc))
+                    log.warning(
+                        "triage.auto_apply_decision_failed",
+                        run_id=run_id,
+                        decision_id=decision.id,
+                        error=str(exc),
+                    )
+                except (ChannelError, DryRunViolation) as exc:
+                    session.rollback()
+                    errors.append(str(exc))
+                    log.warning(
+                        "triage.auto_apply_gmail_failed",
+                        run_id=run_id,
+                        decision_id=decision.id,
+                        error=str(exc),
+                    )
+                except Exception as exc:
+                    session.rollback()
+                    errors.append(str(exc))
+                    log.warning(
+                        "triage.auto_apply_unexpected_error",
+                        run_id=run_id,
+                        decision_id=decision.id,
+                        error=str(exc),
+                    )
+    except Exception as exc:
+        log.error("triage.auto_apply_outer_failed", run_id=run_id, error=str(exc))
+        return
+
+    log.info(
+        "triage.auto_apply_complete",
+        run_id=run_id,
+        applied=applied,
+        kept=kept,
+        auto_kept_low_confidence=auto_kept_low_confidence,
+        errors=len(errors),
+    )
+
+    try:
+        from events import bus
+        import time
+
+        bus.emit(
+            user_id,
+            {
+                "type": "auto_apply_complete",
+                "ts": time.time(),
+                "run_id": run_id,
+                "applied": applied,
+                "kept": kept,
+                "auto_kept_low_confidence": auto_kept_low_confidence,
+            },
+        )
+    except Exception:  # pragma: no cover - event bus must never fail
+        pass
+
+
 def finalize(state: TriageState) -> dict:
     counts = state.get("counts") or _counts(state.get("decisions") or [])
     cost = state.get("cost") or _cost(state)
@@ -952,6 +1095,12 @@ def finalize(state: TriageState) -> dict:
     if _run_is_cancelled(state.get("run_id")):
         log.info("triage.finished_cancelled", run_id=state.get("run_id"))
         return {"status": "cancelled", "counts": counts, "cost": cost}
+
+    # Auto-apply: apply all archive/digest decisions that are not needs_your_call.
+    # Skip when dry_run is on; each apply is wrapped individually so one failure
+    # never blocks the rest.
+    if not state.get("dry_run", True):
+        _auto_apply_decisions(state, counts)
 
     log.info(
         "triage.completed",

@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { api } from '@/lib/api'
 import type { SseEvent, SseEventType } from '@/lib/types'
 
 const MAX_EVENTS = 50
@@ -18,6 +19,7 @@ const EVENT_ICON: Record<SseEventType | string, string> = {
   run_progress: '⟳',
   gmail_mutation_applied: '✓',
   run_completed: '★',
+  auto_apply_complete: '⚡',
   error: '!',
   heartbeat: '♡',
 }
@@ -31,6 +33,8 @@ function eventLabel(ev: SseEvent): string | null {
       return `Progress: ${p.items_decided ?? 0} items decided, $${Number(p.cost_so_far ?? 0).toFixed(4)} spent`
     case 'run_completed':
       return `Run complete — ${p.total_threads ?? 0} threads, $${Number(p.cost_usd ?? 0).toFixed(4)}`
+    case 'auto_apply_complete':
+      return `Auto-applied: ${p.applied ?? 0} archived, ${p.auto_kept_low_confidence ?? 0} auto-kept (low confidence)`
     case 'gmail_mutation_applied':
       return `${p.thread_count ?? 0} thread${Number(p.thread_count) !== 1 ? 's' : ''} archived → ${p.category ?? ''}`
     case 'error':
@@ -50,6 +54,48 @@ function genId() {
 /** Exponential back-off capped at 30 s */
 function backoff(attempt: number) {
   return Math.min(1000 * Math.pow(2, attempt), 30_000)
+}
+
+function UndoRunButton({ runId }: { runId: string }) {
+  const [undoing, setUndoing] = useState(false)
+  const [done, setDone] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleUndo = async () => {
+    const confirmed = window.confirm(
+      'This will restore threads to their pre-triage state in Gmail. This cannot be undone. Continue?',
+    )
+    if (!confirmed) return
+    setUndoing(true)
+    setError(null)
+    try {
+      const res = await api.runs.undo(runId)
+      setDone(true)
+      void res
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Undo failed.')
+    } finally {
+      setUndoing(false)
+    }
+  }
+
+  if (done) {
+    return <span className="text-[11px] font-semibold text-emerald-700">Restored ✓</span>
+  }
+
+  return (
+    <div className="mt-1 flex items-center gap-2">
+      <button
+        type="button"
+        onClick={() => void handleUndo()}
+        disabled={undoing}
+        className="rounded border border-rose-300 bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-700 hover:bg-rose-100 focus:ring-1 focus:ring-rose-400 focus:outline-none disabled:opacity-50"
+      >
+        {undoing ? 'Restoring…' : 'Undo run'}
+      </button>
+      {error && <span className="text-[11px] text-rose-700">{error}</span>}
+    </div>
+  )
 }
 
 export function ActivityDrawer() {
@@ -110,6 +156,7 @@ export function ActivityDrawer() {
       'run_progress',
       'gmail_mutation_applied',
       'run_completed',
+      'auto_apply_complete',
       'error',
       'heartbeat',
     ]
@@ -219,6 +266,7 @@ export function ActivityDrawer() {
               {events.map(ev => {
                 const label = eventLabel(ev)
                 const isError = ev.type === 'error'
+                const runId = ev.payload.run_id as string | undefined
                 return (
                   <li
                     key={ev.id}
@@ -237,6 +285,9 @@ export function ActivityDrawer() {
                         {label ?? ev.type}
                       </p>
                       <p className="mt-0.5 text-[11px] text-gray-400">{relativeTime(ev.ts)}</p>
+                      {ev.type === 'run_completed' && runId ? (
+                        <UndoRunButton runId={runId} />
+                      ) : null}
                     </div>
                   </li>
                 )
