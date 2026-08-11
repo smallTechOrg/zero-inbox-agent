@@ -9,6 +9,7 @@ scope, not deferred.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import structlog
 
@@ -100,6 +101,20 @@ class GmailAdapter(ChannelAdapter):
             return True
         return "insufficientPermissions" in str(exc) or "ACCESS_TOKEN" in str(exc)
 
+    # --- helpers ------------------------------------------------------
+    def _fetch_thread_meta(self, thread_id: str) -> dict | None:
+        """Fetch a single thread's metadata — safe to call from a thread pool."""
+        try:
+            return self._execute(
+                self._service.users().threads().get(
+                    userId="me", id=thread_id, format="metadata",
+                    metadataHeaders=WANTED_HEADERS,
+                )
+            )
+        except Exception as e:
+            log.warning("gmail.thread_fetch_failed", thread_id=thread_id, error=str(e))
+            return None
+
     # --- read ---------------------------------------------------------
     def account_email(self) -> str:
         profile = self._execute(self._service.users().getProfile(userId="me"))
@@ -114,6 +129,7 @@ class GmailAdapter(ChannelAdapter):
         query: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
         after: datetime | None = None,
+        on_page: Callable[[int, int], None] | None = None,
     ) -> list[ChannelItem]:
         """Most recent inbox threads, newest first.
 
@@ -125,10 +141,15 @@ class GmailAdapter(ChannelAdapter):
         run. A thread that received a genuinely new reply since ``after``
         legitimately reappears (its internal_date moved forward), which is the
         correct "what's new" behaviour, not a bug.
+
+        ``on_page`` (optional) is called with ``(page_num, fetched_so_far)``
+        after each page's metadata is fully fetched and normalised — useful for
+        emitting SSE progress events during long inbox scans.
         """
         if limit < 0:
             raise ChannelError("limit must be >= 0")
 
+        redactor = self._redactor
         items: list[ChannelItem] = []
         page_token: str | None = None
         page_num = 0
@@ -156,35 +177,52 @@ class GmailAdapter(ChannelAdapter):
             if not batch:
                 break
             log.info("gmail.fetch_page", page=page_num, fetched_so_far=len(items), page_size=len(batch))
-            for entry in batch:
-                if cancel_check is not None and cancel_check():
-                    return items
-                thread_id = entry.get("id")
-                if not thread_id:
-                    continue
-                try:
-                    thread = self._execute(
-                        self._service.users()
-                        .threads()
-                        .get(
-                            userId="me",
-                            id=thread_id,
-                            format="metadata",
-                            metadataHeaders=WANTED_HEADERS,
-                        )
-                    )
-                except ChannelError:
-                    # One unreadable thread must not fail the whole listing.
-                    continue
-                try:
-                    item = normalize_thread(thread, redactor=self._redactor)
-                except ChannelError:
-                    continue
-                if after is not None and item.internal_date <= after:
-                    return items
-                items.append(item)
-                if len(items) >= limit:
-                    break
+
+            # Parallelise the per-thread metadata requests (up to 10 at once).
+            page_items: list[ChannelItem] = []
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = {
+                    pool.submit(self._fetch_thread_meta, entry["id"]): entry["id"]
+                    for entry in batch if entry.get("id")
+                }
+                for future in as_completed(futures):
+                    raw = future.result()
+                    if raw is None:
+                        continue
+                    try:
+                        item = normalize_thread(raw, redactor=redactor)
+                    except ChannelError:
+                        continue
+                    if item is not None:
+                        page_items.append(item)
+
+            # Apply the after-cutoff filter: if any thread is older than the
+            # watermark the scan is done (Gmail returns newest-first; once we
+            # cross the cutoff all subsequent pages are older still).
+            hit_cutoff = False
+            if after is not None:
+                filtered: list[ChannelItem] = []
+                for item in page_items:
+                    if item.internal_date <= after:
+                        hit_cutoff = True
+                    else:
+                        filtered.append(item)
+                page_items = filtered
+
+            # Honour cancel between pages (not mid-page, as the pool is already done).
+            if cancel_check is not None and cancel_check():
+                items.extend(page_items)
+                break
+
+            items.extend(page_items)
+
+            # Notify the caller (e.g. to emit SSE progress events).
+            if on_page is not None:
+                on_page(page_num, len(items))
+
+            if hit_cutoff or len(items) >= limit:
+                break
+
             page_token = (page or {}).get("nextPageToken")
             if not page_token:
                 break

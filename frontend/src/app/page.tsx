@@ -34,6 +34,9 @@ export default function Dashboard() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // fetchedSoFar: updated by fetch_progress SSE events during the inbox-reading phase
+  const [fetchedSoFar, setFetchedSoFar] = useState(0)
+
   const loadMe = useCallback(async () => {
     setMeLoading(true)
     setMeError(null)
@@ -105,6 +108,40 @@ export default function Dashboard() {
       pollRef.current = null
     }
   }, [run, loadClusters])
+
+  // Subscribe to SSE for real-time fetch_progress and run_progress updates.
+  // fetch_progress: shows live inbox-read count during the fetch phase.
+  // run_progress: updates items_decided immediately without waiting for the poll.
+  const runActive = run ? isRunActive(run.status) : false
+  const runId = run?.id
+  useEffect(() => {
+    if (!runActive || !runId) {
+      setFetchedSoFar(0)
+      return
+    }
+    const es = new EventSource('/api/events')
+
+    // Server sends unnamed data: frames; dispatch by the type field in the JSON.
+    es.onmessage = (e: MessageEvent) => {
+      try {
+        const payload = JSON.parse(e.data as string) as Record<string, unknown>
+        if (payload.type === 'fetch_progress') {
+          setFetchedSoFar(Number(payload.fetched_so_far ?? 0))
+        } else if (payload.type === 'run_progress') {
+          const decided = payload.items_decided
+          if (typeof decided === 'number') {
+            setRun(prev => (prev ? { ...prev, items_decided: decided } : prev))
+          }
+        }
+      } catch {
+        // ignore malformed event
+      }
+    }
+
+    return () => {
+      es.close()
+    }
+  }, [runActive, runId])
 
   const startTriage = useCallback(
     async (onlyNew = false) => {
@@ -239,7 +276,12 @@ export default function Dashboard() {
               {runError ? <ErrorState error={runError} onRetry={() => void startTriage()} /> : null}
 
               {run ? (
-                <RunProgress run={run} onCancel={() => void cancelRun()} cancelling={cancelling} />
+                <RunProgress
+                  run={run}
+                  onCancel={() => void cancelRun()}
+                  cancelling={cancelling}
+                  fetchedSoFar={fetchedSoFar}
+                />
               ) : null}
 
               <section aria-label="Triage history" className="space-y-2">

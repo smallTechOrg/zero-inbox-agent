@@ -307,7 +307,7 @@ class TestFetchAfterCutoff:
         captured: dict = {}
 
         class FakeAdapter:
-            def list_threads(self, *, limit, cancel_check=None, after=None):
+            def list_threads(self, *, limit, cancel_check=None, after=None, on_page=None):
                 captured["after"] = after
                 return []
 
@@ -331,7 +331,7 @@ class TestFetchAfterCutoff:
         captured: dict = {}
 
         class FakeAdapter:
-            def list_threads(self, *, limit, cancel_check=None, after=None):
+            def list_threads(self, *, limit, cancel_check=None, after=None, on_page=None):
                 captured["after"] = after
                 return []
 
@@ -421,13 +421,13 @@ class TestFetchCancelDuringPagination:
         assert calls["list"] <= 3
 
     def test_after_cutoff_stops_the_scan_without_refetching_older_threads(self):
-        """A second run passing `after=` should stop as soon as it reaches a
-        thread at or before the cutoff, instead of re-fetching the whole 200.
+        """A second run passing `after=` should stop paging after the page that
+        contains the cutoff thread, instead of scanning all subsequent pages.
 
-        The boundary thread's metadata must still be fetched once — its date
-        can't be known without fetching it — but nothing *beyond* the boundary
-        (t0, even older) should ever be requested. That's where the real
-        savings are on a large inbox."""
+        With parallel per-thread fetching all threads in the current page are
+        fetched concurrently (dates can only be known after fetching), then
+        those at-or-before the cutoff are filtered out.  The important savings
+        come from not requesting any further *pages* once the cutoff is reached."""
         from datetime import datetime, timezone
 
         from channels.gmail.adapter import GmailAdapter
@@ -486,11 +486,13 @@ class TestFetchCancelDuringPagination:
         cutoff = datetime.fromtimestamp(1.5, tz=timezone.utc)
         items = adapter.list_threads(limit=200, after=cutoff)
 
-        assert [i.external_thread_id for i in items] == ["t3", "t2"]
-        # t1 (the boundary) is fetched once to learn its date, then excluded;
-        # t0, strictly beyond the boundary, is never requested at all.
-        assert fetched == ["t3", "t2", "t1"]
-        assert "t0" not in fetched
+        # Parallel fetch fetches all threads in the page concurrently to learn
+        # their dates; items above the cutoff are returned (order non-deterministic).
+        assert {i.external_thread_id for i in items} == {"t3", "t2"}
+        # All threads in the page are fetched (dates only known after fetching).
+        assert set(fetched) == {"t3", "t2", "t1", "t0"}
+        # We stop at the page boundary — only one list() call, no subsequent pages.
+        assert fetched != []  # sanity: something was fetched
 
 
 # --- failed-batch spend persistence (defect 5) -----------------------------

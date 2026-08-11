@@ -219,6 +219,7 @@ export type UndoRunResult = {
 export type SseEventType =
   | 'run_started'
   | 'run_progress'
+  | 'fetch_progress'
   | 'gmail_mutation_applied'
   | 'run_completed'
   | 'auto_apply_complete'

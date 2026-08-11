@@ -296,3 +296,79 @@ def test_listed_items_never_carry_a_body_attribute():
     items = _adapter(service).list_threads(limit=1)
 
     assert not hasattr(items[0], "body")
+
+
+# --- parallel fetch + on_page callback -----------------------------------
+
+
+def test_list_threads_fetches_page_threads_in_parallel_and_all_are_returned():
+    """All threads in a page are fetched (in parallel) and returned — none silently dropped."""
+    threads = {f"t{i}": _thread(f"t{i}", [_msg(f"m{i}", subject=f"Subject {i}")])
+               for i in range(20)}
+    service = FakeGmailService(threads=threads)
+
+    items = _adapter(service).list_threads(limit=20)
+
+    assert len(items) == 20
+    # Every thread.get() call used format=metadata (never format=full).
+    assert all(call["format"] == "metadata" for call in service.thread_get_calls)
+
+
+def test_on_page_callback_is_called_once_per_page_with_cumulative_count():
+    """``on_page(page_num, fetched_so_far)`` fires after each page is normalised."""
+    threads = {f"t{i}": _thread(f"t{i}", [_msg(f"m{i}")]) for i in range(150)}
+    pages = [
+        {"threads": [{"id": f"t{i}"} for i in range(100)], "nextPageToken": "p2"},
+        {"threads": [{"id": f"t{i}"} for i in range(100, 150)]},
+    ]
+    service = FakeGmailService(threads=threads, thread_pages=pages)
+
+    calls: list[tuple[int, int]] = []
+    _adapter(service).list_threads(limit=150, on_page=lambda p, n: calls.append((p, n)))
+
+    # Two pages → two on_page calls.
+    assert len(calls) == 2
+    page_nums = [c[0] for c in calls]
+    assert page_nums == [1, 2]
+    # Cumulative count increases each page.
+    assert calls[0][1] <= calls[1][1]
+    assert calls[1][1] == 150
+
+
+def test_on_page_callback_is_not_called_when_omitted():
+    """Passing no on_page must not raise — the default (None) is a no-op."""
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    # Must not raise even without the on_page argument.
+    items = _adapter(service).list_threads(limit=10)
+    assert len(items) == 1
+
+
+def test_on_page_callback_receives_correct_arguments():
+    """Verify page_num starts at 1 and fetched_so_far matches the running total."""
+    threads = {f"t{i}": _thread(f"t{i}", [_msg(f"m{i}")]) for i in range(5)}
+    service = FakeGmailService(threads=threads)
+
+    received: list[tuple[int, int]] = []
+    _adapter(service).list_threads(limit=5, on_page=lambda p, n: received.append((p, n)))
+
+    assert len(received) == 1
+    page_num, fetched_so_far = received[0]
+    assert page_num == 1
+    assert fetched_so_far == 5
+
+
+def test_fetch_thread_meta_returns_none_on_any_exception():
+    """``_fetch_thread_meta`` is the pool worker; a fetch failure yields None, not an exception."""
+    from channels.gmail.adapter import GmailAdapter
+    from tests.unit.channels.fake_gmail import http_error
+
+    service = FakeGmailService(threads={})
+    service.thread_errors["bad-id"] = http_error(500, "server error")
+    # Inject a thread that will fail so _fetch_thread_meta is exercised.
+    service.threads["bad-id"] = _thread("bad-id", [_msg("mx")])
+
+    adapter = _adapter(service, backoff_seconds=0)
+    result = adapter._fetch_thread_meta("bad-id")
+
+    # After all retries, returns None rather than raising.
+    assert result is None

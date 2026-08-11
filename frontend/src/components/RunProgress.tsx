@@ -2,26 +2,59 @@
 
 import { isRunActive, type Run } from '@/lib/types'
 
-/** Real progress only — the numbers come straight from GET /api/runs/{id}. */
+/** Real progress only — the numbers come straight from GET /api/runs/{id}.
+ *
+ * fetchedSoFar: live thread count from fetch_progress SSE events supplied by
+ * the parent page.  Used only while items_total is still 0 (fetch phase).
+ */
 export function RunProgress({
   run,
   onCancel,
   cancelling,
+  fetchedSoFar = 0,
 }: {
   run: Run
   onCancel: () => void
   cancelling: boolean
+  fetchedSoFar?: number
 }) {
   const total = run.items_total ?? 0
   const decided = run.items_decided ?? 0
   const active = isRunActive(run.status)
 
-  // `items_total` is written early in the run, but there is a brief window at
-  // the start where the mailbox has not been listed yet. That window is shown
-  // as an explicit "counting threads" state with an indeterminate bar, rather
-  // than a misleading, frozen-looking "0 of ?".
-  const counting = active && total === 0
+  // --- Phase detection ---
+  // fetch phase: run active, inbox not yet enumerated
+  const fetchPhase = active && total === 0
+  // LLM phase: inbox known, decisions still in-flight
+  const llmPhase = active && total > 0 && decided < total
+  // apply phase: all decisions made, run still active (auto-apply in progress)
+  const applyPhase = active && total > 0 && decided >= total
+
   const pct = total > 0 ? Math.min(100, (decided / total) * 100) : 0
+
+  // Indeterminate bar during the fetch phase
+  const indeterminate = fetchPhase
+
+  // --- Contextual status message ---
+  let statusMessage: string
+  if (fetchPhase) {
+    statusMessage =
+      fetchedSoFar > 0
+        ? `Reading your inbox… ${fetchedSoFar} threads`
+        : 'Reading your inbox…'
+  } else if (llmPhase) {
+    statusMessage = `Classifying ${decided} / ${total} threads…`
+  } else if (applyPhase) {
+    statusMessage = 'Applying changes to Gmail…'
+  } else if (run.status === 'completed') {
+    statusMessage = `Done — ${decided} threads processed`
+  } else if (run.status === 'cancelled') {
+    statusMessage = `Run cancelled — ${decided} threads decided`
+  } else if (run.status === 'failed') {
+    statusMessage = 'Run failed'
+  } else {
+    statusMessage = `Run ${run.status}`
+  }
 
   return (
     <section
@@ -32,19 +65,16 @@ export function RunProgress({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-semibold text-blue-950">
-          {active ? 'Triage running' : `Run ${run.status}`} —{' '}
-          {counting ? (
-            <span>counting threads in your inbox…</span>
-          ) : (
-            <>
-              <span data-testid="run-progress-counts">
-                {decided} of {total} threads decided
-              </span>{' '}
-              <span className="font-mono text-xs font-normal text-blue-800">
-                ({decided}/{total} · {Math.round(pct)}%)
-              </span>
-            </>
-          )}
+          <span data-testid="run-progress-status">{statusMessage}</span>
+          {/* Show the raw ratio as a secondary hint once we have real counts */}
+          {total > 0 && !fetchPhase ? (
+            <span
+              data-testid="run-progress-counts"
+              className="ml-2 font-mono text-xs font-normal text-blue-800"
+            >
+              ({decided}/{total} · {Math.round(pct)}%)
+            </span>
+          ) : null}
         </p>
         {active ? (
           <button
@@ -60,14 +90,20 @@ export function RunProgress({
 
       <div
         role="progressbar"
-        {...(counting
+        {...(indeterminate
           ? {}
           : { 'aria-valuenow': Math.round(pct), 'aria-valuemin': 0, 'aria-valuemax': 100 })}
-        aria-valuetext={counting ? 'Counting threads' : `${decided} of ${total} threads decided`}
+        aria-valuetext={
+          indeterminate
+            ? fetchedSoFar > 0
+              ? `Reading inbox — ${fetchedSoFar} threads fetched`
+              : 'Reading inbox'
+            : `${decided} of ${total} threads decided`
+        }
         aria-label="Threads decided"
         className="mt-2 h-2 w-full overflow-hidden rounded-full bg-blue-200"
       >
-        {counting ? (
+        {indeterminate ? (
           <div className="h-full w-1/3 animate-pulse rounded-full bg-blue-500 motion-reduce:animate-none" />
         ) : (
           <div

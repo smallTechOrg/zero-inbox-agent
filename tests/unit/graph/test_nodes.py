@@ -311,3 +311,119 @@ class TestClusterNode:
         out = nodes.cluster_decisions(state)
         assert out["decisions"][0]["status"] == "needs_your_call"
         assert all(c["suggested_action"] != "archive" for c in out["clusters"])
+
+
+class TestFetchProgressSSE:
+    """fetch_items passes an on_page callback that emits fetch_progress events."""
+
+    def test_fetch_progress_event_emitted_per_page(self, monkeypatch):
+        """Each page of Gmail results fires a fetch_progress SSE event."""
+        import channels
+        import events.bus as bus_mod
+
+        emitted: list[dict] = []
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+
+        pages_served = {"n": 0}
+
+        class FakeAdapter:
+            def list_threads(self, *, limit, cancel_check=None, after=None, on_page=None):
+                # Simulate two pages by calling on_page twice.
+                if on_page:
+                    on_page(1, 50)
+                    on_page(2, 80)
+                return []
+
+            def sender_history(self, *, limit=500):
+                return {}
+
+        monkeypatch.setattr(channels, "get_adapter", lambda **kw: FakeAdapter())
+
+        nodes.fetch_items(base_state(items=[], run_id="run-x", user_id="u1"))
+
+        fetch_events = [e for e in emitted if e.get("type") == "fetch_progress"]
+        assert len(fetch_events) == 2
+        assert fetch_events[0]["page"] == 1
+        assert fetch_events[0]["fetched_so_far"] == 50
+        assert fetch_events[1]["page"] == 2
+        assert fetch_events[1]["fetched_so_far"] == 80
+        # run_id is included so the frontend can correlate.
+        assert all(e["run_id"] == "run-x" for e in fetch_events)
+
+    def test_fetch_progress_not_emitted_when_no_pages(self, monkeypatch):
+        """No events emitted if the adapter calls on_page zero times (empty inbox)."""
+        import channels
+        import events.bus as bus_mod
+
+        emitted: list[dict] = []
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+
+        class FakeAdapter:
+            def list_threads(self, *, limit, cancel_check=None, after=None, on_page=None):
+                return []
+
+            def sender_history(self, *, limit=500):
+                return {}
+
+        monkeypatch.setattr(channels, "get_adapter", lambda **kw: FakeAdapter())
+        nodes.fetch_items(base_state(items=[], run_id="run-y", user_id="u2"))
+
+        assert not any(e.get("type") == "fetch_progress" for e in emitted)
+
+
+class TestRunProgressSSEDuringBatch:
+    """llm_classify_batch emits run_progress SSE after each batch."""
+
+    def test_run_progress_emitted_after_successful_batch(self, monkeypatch):
+        from llm.providers.base import BatchClassification, LLMResult
+
+        emitted: list[dict] = []
+        import events.bus as bus_mod
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+
+        class FakeLLM:
+            async def classify_batch(self, payloads, *, instructions, item_schema,
+                                     id_field, model=None, max_attempts=2):
+                return BatchClassification(
+                    results=[{
+                        "item_id": p["item_id"], "category": "newsletters",
+                        "action": "archive", "confidence": 0.92, "reasoning": "test",
+                    } for p in payloads],
+                    usage=LLMResult(text="", model="m", tokens_in=10, tokens_out=5),
+                )
+
+        monkeypatch.setattr("llm.client.get_llm_client", lambda: FakeLLM())
+        state = base_state(batch=[item()], resolved=[], llm_decisions=[], llm_calls=[])
+        nodes.llm_classify_batch(state)
+
+        progress_events = [e for e in emitted if e.get("type") == "run_progress"]
+        assert len(progress_events) >= 1
+        assert "items_decided" in progress_events[0]
+        assert "cost_so_far" in progress_events[0]
+        assert "run_id" in progress_events[0]
+
+    def test_run_progress_contains_run_id(self, monkeypatch):
+        from llm.providers.base import BatchClassification, LLMResult
+
+        emitted: list[dict] = []
+        import events.bus as bus_mod
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+
+        class FakeLLM:
+            async def classify_batch(self, payloads, *, instructions, item_schema,
+                                     id_field, model=None, max_attempts=2):
+                return BatchClassification(
+                    results=[{
+                        "item_id": p["item_id"], "category": "newsletters",
+                        "action": "archive", "confidence": 0.92, "reasoning": "test",
+                    } for p in payloads],
+                    usage=LLMResult(text="", model="m", tokens_in=10, tokens_out=5),
+                )
+
+        monkeypatch.setattr("llm.client.get_llm_client", lambda: FakeLLM())
+        state = base_state(batch=[item()], run_id="run-batch-42",
+                           resolved=[], llm_decisions=[], llm_calls=[])
+        nodes.llm_classify_batch(state)
+
+        progress_events = [e for e in emitted if e.get("type") == "run_progress"]
+        assert any(e["run_id"] == "run-batch-42" for e in progress_events)

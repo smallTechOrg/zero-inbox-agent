@@ -391,6 +391,7 @@ def fetch_items(state: TriageState) -> dict:
             user_id=state["user_id"], channel_account_id=state["channel_account_id"]
         )
         run_id = state.get("run_id")
+        user_id = state["user_id"]
         fetch_after = state.get("fetch_after")
         after_dt = None
         if fetch_after:
@@ -404,12 +405,26 @@ def fetch_items(state: TriageState) -> dict:
             # here (see db/session.py / _now()), so naive-means-UTC is correct.
             if after_dt.tzinfo is None:
                 after_dt = after_dt.replace(tzinfo=timezone.utc)
+
+        def _on_fetch_page(page_num: int, fetched_so_far: int) -> None:
+            try:
+                from events import bus as _bus
+                _bus.emit(user_id, {
+                    "type": "fetch_progress",
+                    "run_id": run_id,
+                    "page": page_num,
+                    "fetched_so_far": fetched_so_far,
+                })
+            except Exception:  # pragma: no cover - bus must never fail a run
+                pass
+
         items = [
             i if isinstance(i, dict) else i.model_dump()
             for i in adapter.list_threads(
                 limit=state.get("limit", 200),
                 cancel_check=(lambda: _run_is_cancelled(run_id)) if run_id else None,
                 after=after_dt,
+                on_page=_on_fetch_page,
             )
         ]
         # The progress bar's denominator, written the moment the total is known —
@@ -668,6 +683,22 @@ def llm_classify_batch(state: TriageState) -> dict:
     )
     # Live progress: this batch is decided — bump the numerator atomically.
     _record_progress(run_id, decided_delta=len(batch))
+    # Emit an SSE progress event so the frontend sees incremental LLM progress
+    # rather than waiting until persist_decisions fires at the very end.
+    try:
+        from events import bus as _bus
+
+        _bus.emit(
+            state["user_id"],
+            {
+                "type": "run_progress",
+                "run_id": run_id,
+                "items_decided": len(state.get("llm_decisions", [])) + len(state.get("resolved", [])),
+                "cost_so_far": sum(float(c.get("cost_usd") or 0.0) for c in (state.get("llm_calls") or []) + calls),
+            },
+        )
+    except Exception:  # pragma: no cover - bus must never fail a run
+        pass
     log.info(
         "triage.tier3",
         run_id=state.get("run_id"),

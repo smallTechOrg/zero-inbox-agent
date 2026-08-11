@@ -17,6 +17,7 @@ function relativeTime(ts: number): string {
 const EVENT_ICON: Record<SseEventType | string, string> = {
   run_started: '▶',
   run_progress: '⟳',
+  fetch_progress: '↓',
   gmail_mutation_applied: '✓',
   run_completed: '★',
   auto_apply_complete: '⚡',
@@ -31,6 +32,8 @@ function eventLabel(ev: SseEvent): string | null {
       return `Triage started (triggered by ${p.triggered_by ?? 'unknown'})`
     case 'run_progress':
       return `Progress: ${p.items_decided ?? 0} items decided, $${Number(p.cost_so_far ?? 0).toFixed(4)} spent`
+    case 'fetch_progress':
+      return `Fetching inbox… ${p.fetched_so_far ?? 0} threads read (page ${p.page ?? 1})`
     case 'run_completed':
       return `Run complete — ${p.total_threads ?? 0} threads, $${Number(p.cost_usd ?? 0).toFixed(4)}`
     case 'auto_apply_complete':
@@ -151,6 +154,7 @@ export function ActivityDrawer() {
     const EVENT_TYPES: SseEventType[] = [
       'run_started',
       'run_progress',
+      'fetch_progress',
       'gmail_mutation_applied',
       'run_completed',
       'auto_apply_complete',
