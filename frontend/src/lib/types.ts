@@ -223,6 +223,8 @@ export type SseEventType =
   | 'gmail_mutation_applied'
   | 'run_completed'
   | 'auto_apply_complete'
+  | 'thread_classified'
+  | 'thread_archived'
   | 'error'
   | 'heartbeat'
 

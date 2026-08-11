@@ -580,6 +580,25 @@ def apply_deterministic_rules(state: TriageState) -> dict:
         "triage.tier1", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
+    # Emit per-thread classification events for live transparency (tier 1 rules)
+    try:
+        from events import bus as _bus
+        import time as _time
+        _items_by_id = {i["id"]: i for i in (state.get("items") or [])}
+        for _d in decisions:
+            _item = _items_by_id.get(_d["item_id"], {})
+            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
+            _bus.emit(state["user_id"], {
+                "type": "thread_classified",
+                "ts": _time.time(),
+                "run_id": state.get("run_id"),
+                "subject": _subj,
+                "category": _d.get("category_key") or _d.get("category") or "",
+                "action": _d.get("proposed_action") or "",
+                "decided_by": "rule",
+            })
+    except Exception:  # pragma: no cover - bus must never fail a run
+        pass
     return {"resolved": decisions, "llm_queue": unresolved}
 
 
@@ -591,6 +610,25 @@ def apply_sender_history(state: TriageState) -> dict:
         "triage.tier2", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
+    # Emit per-thread classification events for live transparency (tier 2 sender history)
+    try:
+        from events import bus as _bus
+        import time as _time
+        _items_by_id = {i["id"]: i for i in (state.get("items") or [])}
+        for _d in decisions:
+            _item = _items_by_id.get(_d["item_id"], {})
+            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
+            _bus.emit(state["user_id"], {
+                "type": "thread_classified",
+                "ts": _time.time(),
+                "run_id": state.get("run_id"),
+                "subject": _subj,
+                "category": _d.get("category_key") or _d.get("category") or "",
+                "action": _d.get("proposed_action") or "",
+                "decided_by": "sender_history",
+            })
+    except Exception:  # pragma: no cover - bus must never fail a run
+        pass
     return {"resolved": decisions, "llm_queue": unresolved}
 
 
@@ -690,6 +728,25 @@ def llm_classify_batch(state: TriageState) -> dict:
     calls = failed_calls + (
         [_usage_row(result.usage, "classify", len(batch))] if result.usage else []
     )
+    # Emit per-thread classification events for live transparency (tier 3 LLM)
+    try:
+        from events import bus as _bus
+        import time as _time
+        _items_by_id = {i["id"]: i for i in batch}
+        for _d in decisions:
+            _item = _items_by_id.get(_d["item_id"], {})
+            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
+            _bus.emit(state["user_id"], {
+                "type": "thread_classified",
+                "ts": _time.time(),
+                "run_id": run_id,
+                "subject": _subj,
+                "category": _d.get("category_key") or _d.get("category") or "",
+                "action": _d.get("proposed_action") or "",
+                "decided_by": _d.get("decided_by") or "llm",
+            })
+    except Exception:  # pragma: no cover - bus must never fail a run
+        pass
     # Live progress: this batch is decided — bump the numerator atomically.
     _record_progress(run_id, decided_delta=len(batch))
     # Emit an SSE progress event so the frontend sees incremental LLM progress
@@ -781,6 +838,22 @@ def deep_read_escalation(state: TriageState) -> dict:
                 verdict["decided_by"] = "llm_deep"
                 verdict["unsure"] = False
                 decisions.append(verdict)
+                # Emit per-thread classification event for live transparency (tier 4 deep read)
+                try:
+                    from events import bus as _bus
+                    import time as _time
+                    _subj = str(item.get("subject") or item.get("from_email") or item["id"])[:60]
+                    _bus.emit(state["user_id"], {
+                        "type": "thread_classified",
+                        "ts": _time.time(),
+                        "run_id": run_id,
+                        "subject": _subj,
+                        "category": verdict.get("category_key") or verdict.get("category") or "",
+                        "action": verdict.get("proposed_action") or "",
+                        "decided_by": "llm_deep",
+                    })
+                except Exception:  # pragma: no cover - bus must never fail a run
+                    pass
                 # Deep reads land one item at a time (unlike a batch, which lands
                 # all at once) — the progress bar's numerator advances with each
                 # one instead of waiting for the whole queue to finish.

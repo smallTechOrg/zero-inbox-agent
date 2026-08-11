@@ -151,6 +151,21 @@ def apply_decision(
     # logged as applied, and the decision stays `approved` for Retry.
     response = mutator.archive_and_label(item.external_thread_id, category_label_id=category_label_id)
 
+    # Emit transparency event — must never block or raise
+    try:
+        from events import bus as _archived_bus
+        import time as _archived_time
+        _archived_bus.emit(user_id, {
+            "type": "thread_archived",
+            "ts": _archived_time.time(),
+            "run_id": getattr(decision, "run_id", None),
+            "subject": str(getattr(item, "subject", None) or "")[:60],
+            "category": category.name if category else "",
+            "label_name": category.channel_label_name if category else "",
+        })
+    except Exception:  # pragma: no cover
+        pass
+
     action_log = m.ActionLog(
         user_id=user_id,
         decision_id=decision.id,

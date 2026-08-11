@@ -115,7 +115,7 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 
 ## Phases of Development
 
-Four phases: one first-win phase and three requirements phases.
+Five phases: one first-win phase and four requirements phases.
 
 ---
 
@@ -383,3 +383,45 @@ rather than restart. Launch the **Backlog cleanup** job, watch chunked progress 
 restart it, confirm nothing is redone. Open **Digest** to see what was hidden. Open **Cost** to see
 run spend, monthly total, and the rules-vs-LLM ratio, and switch the model in the dropdown. Everything
 is now real — there are no stubs left.
+
+---
+
+### Phase 5 — Triage Transparency
+
+> **Assumed:** The user requested this as "Phase 4 — Triage Transparency" but the roadmap already has a Phase 4. This phase is numbered 5 to preserve existing phase numbering without renaming any prior phase.
+
+**Goal.** Full per-thread visibility of classification and Gmail mutation decisions in the Activity drawer: every classified thread appears in real time with subject, category, action and which tier decided it; every archived thread shows its Gmail label. A shared `SseContext` eliminates the duplicate `EventSource` in `page.tsx`.
+
+Capability: [triage-transparency](capabilities/triage-transparency.md).
+
+#### Slices
+
+| # | Slice | Owns (disjoint paths) | Depends on |
+|---|-------|----------------------|-----------|
+| A | `backend-transparency` | `src/graph/nodes.py` (emit `thread_classified` after each tier decision), `src/tools/actions.py` (emit `thread_archived` inside `apply_decision`), `tests/unit/graph/test_triage_transparency.py` | none |
+| B | `frontend-transparency` | `frontend/src/lib/SseContext.tsx` (new shared context + single `EventSource`), `frontend/src/lib/types.ts` (extend `SseEventType` union), `frontend/src/components/ActivityDrawer.tsx` (render new event types, use `SseContext.addEvent`), `frontend/src/app/page.tsx` (remove local `EventSource`, read from `SseContext`) | none |
+
+Slices A and B are fully independent — they own disjoint file paths and can be generated concurrently.
+
+#### Gate
+
+```bash
+uv run pytest tests/unit/ -q
+cd /Users/sai/Workspace/Code/zero-inbox-agent/frontend && pnpm build
+```
+
+Both commands must exit 0. `tests/unit/graph/test_triage_transparency.py` asserts:
+- `thread_classified` is emitted once per thread with all required fields at the correct tier decision point.
+- `thread_archived` is emitted exactly once per successful archive mutation inside `apply_decision`.
+- Monkeypatching `bus.publish` to raise does not cause the test run to record a failed triage decision or a failed mutation — the exception is caught and the run proceeds.
+- Both event shapes match their documented JSON schemas (field names and types).
+`pnpm build` asserts zero TypeScript errors after the `SseEventType` union extension.
+
+#### How the user tests it
+
+1. Start the server (`uv run python -m src`) and the frontend (`cd frontend && pnpm dev`).
+2. Open the dashboard and click **Run triage**.
+3. Open the **Activity drawer** (bell icon) while the run is in progress.
+4. Watch per-thread events arrive in real time: each classified thread shows `"[tier] subject → category (action, confidence%)"`.
+5. After the run, scroll the drawer: every thread that was archived shows `"Archived: subject → label_name"`.
+6. Open browser DevTools → Network → EventSource: confirm there is **exactly one** SSE connection (no duplicate), confirming the `SseContext` consolidation.

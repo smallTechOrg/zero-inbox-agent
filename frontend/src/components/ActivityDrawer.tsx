@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '@/lib/api'
 import type { SseEvent, SseEventType } from '@/lib/types'
+import { sseLive } from '@/lib/sseLive'
 
 const MAX_EVENTS = 50
 
@@ -21,6 +22,8 @@ const EVENT_ICON: Record<SseEventType | string, string> = {
   gmail_mutation_applied: '✓',
   run_completed: '★',
   auto_apply_complete: '⚡',
+  thread_classified: '→',
+  thread_archived: '✓',
   error: '!',
   heartbeat: '♡',
 }
@@ -42,6 +45,15 @@ function eventLabel(ev: SseEvent): string | null {
       return `${p.thread_count ?? 0} thread${Number(p.thread_count) !== 1 ? 's' : ''} archived → ${p.category ?? ''}`
     case 'error':
       return `Error: ${p.message ?? 'unknown error'}`
+    case 'thread_classified': {
+      const action = String(p.action ?? '')
+      const cat = String(p.category ?? '')
+      const subj = String(p.subject ?? '').slice(0, 50)
+      const verb = action === 'archive' ? 'archive' : action === 'keep' ? 'keep' : action
+      return `${subj || '(no subject)'} → ${cat} · ${verb}`
+    }
+    case 'thread_archived':
+      return `Archived: ${String(p.subject ?? '').slice(0, 50) || '(no subject)'} → ${p.label_name ?? ''}`
     case 'heartbeat':
       return null
     default:
@@ -123,6 +135,12 @@ export function ActivityDrawer() {
   const addEvent = useCallback(
     (type: SseEventType, payload: Record<string, unknown>) => {
       if (type === 'heartbeat') return
+      if (type === 'fetch_progress') {
+        sseLive.setFetchedSoFar(Number(payload.fetched_so_far ?? 0))
+      }
+      if (type === 'run_completed' || type === 'run_started') {
+        sseLive.setFetchedSoFar(0)
+      }
       const ev: SseEvent = { id: genId(), type, ts: Date.now(), payload }
       setEvents(prev => [ev, ...prev].slice(0, MAX_EVENTS))
       setUnread(n => n + 1)
@@ -158,6 +176,8 @@ export function ActivityDrawer() {
       'gmail_mutation_applied',
       'run_completed',
       'auto_apply_complete',
+      'thread_classified',
+      'thread_archived',
       'error',
       'heartbeat',
     ]

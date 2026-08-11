@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, AUTH_START_URL } from '@/lib/api'
 import { isRunActive, type Cluster, type Me, type Run } from '@/lib/types'
+import { sseLive } from '@/lib/sseLive'
 import { DryRunBanner, LeftRail, StatusPill } from '@/components/Chrome'
 import { ConnectCard } from '@/components/ConnectCard'
 import { ClusterCard } from '@/components/ClusterCard'
@@ -109,39 +110,11 @@ export default function Dashboard() {
     }
   }, [run, loadClusters])
 
-  // Subscribe to SSE for real-time fetch_progress and run_progress updates.
-  // fetch_progress: shows live inbox-read count during the fetch phase.
-  // run_progress: updates items_decided immediately without waiting for the poll.
-  const runActive = run ? isRunActive(run.status) : false
-  const runId = run?.id
+  // Drive fetchedSoFar from the ActivityDrawer's shared SSE connection (sseLive)
+  // instead of opening a second EventSource.
   useEffect(() => {
-    if (!runActive || !runId) {
-      setFetchedSoFar(0)
-      return
-    }
-    const es = new EventSource('/api/events')
-
-    // Server sends unnamed data: frames; dispatch by the type field in the JSON.
-    es.onmessage = (e: MessageEvent) => {
-      try {
-        const payload = JSON.parse(e.data as string) as Record<string, unknown>
-        if (payload.type === 'fetch_progress') {
-          setFetchedSoFar(Number(payload.fetched_so_far ?? 0))
-        } else if (payload.type === 'run_progress') {
-          const decided = payload.items_decided
-          if (typeof decided === 'number') {
-            setRun(prev => (prev ? { ...prev, items_decided: decided } : prev))
-          }
-        }
-      } catch {
-        // ignore malformed event
-      }
-    }
-
-    return () => {
-      es.close()
-    }
-  }, [runActive, runId])
+    return sseLive.subscribeFetchedSoFar(setFetchedSoFar)
+  }, [])
 
   const startTriage = useCallback(
     async (onlyNew = false) => {

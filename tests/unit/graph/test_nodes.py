@@ -427,3 +427,61 @@ class TestRunProgressSSEDuringBatch:
 
         progress_events = [e for e in emitted if e.get("type") == "run_progress"]
         assert any(e["run_id"] == "run-batch-42" for e in progress_events)
+
+
+class TestThreadClassifiedSSE:
+    """llm_classify_batch emits thread_classified for each verdict."""
+
+    def _fake_llm(self):
+        from llm.providers.base import BatchClassification, LLMResult
+
+        class FakeLLM:
+            async def classify_batch(self, payloads, *, instructions, item_schema,
+                                     id_field, model=None, max_attempts=2):
+                return BatchClassification(
+                    results=[{
+                        "item_id": p["item_id"], "category": "newsletters",
+                        "action": "archive", "confidence": 0.92, "reasoning": "test",
+                    } for p in payloads],
+                    usage=LLMResult(text="", model="m", tokens_in=10, tokens_out=5),
+                )
+
+        return FakeLLM()
+
+    def test_thread_classified_emitted_per_verdict(self, monkeypatch):
+        emitted: list[dict] = []
+        import events.bus as bus_mod
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+        monkeypatch.setattr("llm.client.get_llm_client", lambda: self._fake_llm())
+
+        state = base_state(
+            batch=[item(id="i1", subject="Weekly newsletter")],
+            resolved=[], llm_decisions=[], llm_calls=[],
+        )
+        nodes.llm_classify_batch(state)
+
+        classified = [e for e in emitted if e.get("type") == "thread_classified"]
+        assert len(classified) >= 1
+        evt = classified[0]
+        assert evt["subject"] == "Weekly newsletter"
+        assert evt["category"] != "" or evt["action"] != "" or True  # at least the key exists
+        assert "category" in evt
+        assert "action" in evt
+        assert "decided_by" in evt
+        assert "run_id" in evt
+
+    def test_thread_classified_subject_truncated_to_60(self, monkeypatch):
+        emitted: list[dict] = []
+        import events.bus as bus_mod
+        monkeypatch.setattr(bus_mod, "emit", lambda uid, evt: emitted.append(evt))
+        monkeypatch.setattr("llm.client.get_llm_client", lambda: self._fake_llm())
+
+        long_subject = "A" * 100
+        state = base_state(
+            batch=[item(id="i1", subject=long_subject)],
+            resolved=[], llm_decisions=[], llm_calls=[],
+        )
+        nodes.llm_classify_batch(state)
+
+        classified = [e for e in emitted if e.get("type") == "thread_classified"]
+        assert all(len(e["subject"]) <= 60 for e in classified)

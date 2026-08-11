@@ -40,3 +40,9 @@ for the phase plan and slices.
 | [backlog-cleanup](backlog-cleanup.md) | User-launched chunked historical cleanup — streaming, cancellable, resumable |
 | [cost-and-model-controls](cost-and-model-controls.md) | Run + monthly spend, rules-vs-LLM ratio, per-user model dropdown |
 | [proactive-assistance](proactive-assistance.md) | Missed-important flags, unsubscribe candidates, stale threads, draft replies |
+
+## Phase 5 — Triage Transparency
+
+| Capability | What it does |
+|------------|--------------|
+| [triage-transparency](triage-transparency.md) | Per-thread SSE events (`thread_classified`, `thread_archived`) surfaced in the Activity drawer; shared `SseContext` eliminates duplicate EventSource |
