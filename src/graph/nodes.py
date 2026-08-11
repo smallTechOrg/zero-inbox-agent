@@ -106,19 +106,28 @@ def _verdict_schema(category_keys: list[str]) -> dict:
     }
 
 
-def _run_async(coro):
-    """Run an async LLM coroutine from a synchronous graph node."""
+_LLM_TIMEOUT = 120.0  # seconds; a hung LLM call raises asyncio.TimeoutError
+
+
+def _run_async(coro, timeout: float = _LLM_TIMEOUT):
+    """Run an async LLM coroutine from a synchronous graph node.
+
+    Always applies a hard timeout so a hung NIM/API connection raises
+    asyncio.TimeoutError (caught by callers' except Exception) rather than
+    blocking forever and stalling the whole triage run.
+    """
     import asyncio
 
+    wrapped = asyncio.wait_for(coro, timeout=timeout)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(wrapped)
 
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+        return pool.submit(asyncio.run, wrapped).result(timeout=timeout + 5)
 
 
 def _usage_row(usage, purpose: str, items_in_batch: int) -> dict:

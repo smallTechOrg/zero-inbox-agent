@@ -51,18 +51,22 @@ def _prompt(name: str) -> str:
     return cached
 
 
-def _run_async(coro):
+_LLM_TIMEOUT = 120.0  # seconds
+
+
+def _run_async(coro, timeout: float = _LLM_TIMEOUT):
     import asyncio
 
+    wrapped = asyncio.wait_for(coro, timeout=timeout)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(wrapped)
 
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+        return pool.submit(asyncio.run, wrapped).result(timeout=timeout + 5)
 
 
 def _usage_row(usage, items_in_batch: int) -> dict:
