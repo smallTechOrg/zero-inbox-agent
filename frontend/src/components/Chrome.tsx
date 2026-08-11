@@ -1,6 +1,5 @@
 'use client'
 
-import { ComingSoonChip } from './Stub'
 
 /**
  * Pinned above all content (spec/ui.md §Global chrome). Shown red whenever
@@ -50,17 +49,11 @@ export function DryRunBanner({ dryRun = true }: { dryRun?: boolean }) {
 }
 
 type NavItem = { label: string; description: string; href?: string }
-type StubItem = { label: string; phase: 2 | 3; description: string }
-type RailItem = NavItem | ({ _stub: true } & StubItem)
 
-const RAIL: RailItem[] = [
-  { label: 'Triage', description: 'Review clustered triage decisions' },
-  { label: 'Settings', description: 'Thresholds, VIP list, priorities profile' },
-  { _stub: true, label: 'Rules', phase: 3, description: 'Proposed filter rules ranked by coverage' },
-  { _stub: true, label: 'Chat', phase: 3, description: 'Turn plain English into rules' },
-  { label: 'Digest', description: 'Catch-up digest of what was hidden', href: '/app/digest' },
-  { _stub: true, label: 'Backlog', phase: 3, description: 'Historical cleanup in dated chunks' },
-  { _stub: true, label: 'Cost', phase: 3, description: 'Spend and rules-vs-LLM ratio' },
+const RAIL: NavItem[] = [
+  { label: 'Triage', description: 'Triage history' },
+  { label: 'Settings', description: 'VIP list, categories, priorities profile' },
+  { label: 'Digest', description: 'Catch-up digest of what was archived', href: '/app/digest' },
 ]
 
 export function LeftRail({
@@ -74,24 +67,6 @@ export function LeftRail({
     <nav aria-label="Main" className="w-44 shrink-0 border-r border-gray-200 bg-white p-2">
       <ul className="space-y-1">
         {RAIL.map(item => {
-          if ('_stub' in item) {
-            const tip = `${item.label} — ${item.description}. Not built yet; planned for Phase ${item.phase}.`
-            return (
-              <li key={item.label}>
-                <button
-                  type="button"
-                  disabled
-                  aria-disabled="true"
-                  title={tip}
-                  aria-label={`${item.label} (coming soon, Phase ${item.phase})`}
-                  className="flex w-full cursor-not-allowed flex-col items-start gap-1 rounded px-2.5 py-1.5 text-left text-sm text-gray-600 opacity-50"
-                >
-                  <span>{item.label}</span>
-                  <ComingSoonChip phase={item.phase} />
-                </button>
-              </li>
-            )
-          }
           const isActive = active === item.label
           // External href nav items use an anchor tag
           if (item.href) {

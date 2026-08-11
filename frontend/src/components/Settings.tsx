@@ -427,7 +427,7 @@ export default function SettingsPanel({
           data-testid="digest-hour"
           className="w-16 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-800"
         />
-        <span className="text-[10px] text-gray-500">COMING SOON · Phase 3 — the Digest screen itself is not built yet.</span>
+        <span className="text-[10px] text-gray-500">UTC hour (0–23). Digest available in the Digest tab.</span>
       </div>
 
       <div className="flex items-center gap-2 border-t border-gray-200 pt-4">

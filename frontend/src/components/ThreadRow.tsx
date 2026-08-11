@@ -3,7 +3,6 @@
 import { useState } from 'react'
 import type { TriageItem } from '@/lib/types'
 import { ActionChip, CategoryChip, ConfidenceBar, TierBadge } from './TierBadge'
-import { StubButton } from './Stub'
 
 function formatDate(value: string | null) {
   if (!value) return ''
@@ -94,10 +93,6 @@ export function ThreadRow({ item }: { item: TriageItem }) {
                   <dd className="font-mono">{item.status}</dd>
                 </div>
               </dl>
-              <div className="mt-2.5 flex flex-wrap items-center gap-2">
-                <StubButton label="Create Gmail filter" phase={3} />
-                <StubButton label="Draft reply" phase={3} />
-              </div>
             </div>
           ) : null}
         </div>

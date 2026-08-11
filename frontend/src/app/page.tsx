@@ -10,7 +10,6 @@ import SettingsPanel from '@/components/Settings'
 import { RunProgress } from '@/components/RunProgress'
 import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
-import { StubButton, StubPanel } from '@/components/Stub'
 import { RunSummaryCard } from '@/components/RunSummary'
 
 /** Anything that is not a terminal status (completed / failed / cancelled). */
@@ -177,7 +176,6 @@ export default function Dashboard() {
           <StatusPill tone={statusTone}>
             {run ? `Run ${run.status}` : 'No run yet'}
           </StatusPill>
-          <StubButton label="Model: auto" phase={3} />
           {connection ? (
             <>
               <button
@@ -187,20 +185,8 @@ export default function Dashboard() {
                 disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
                 className="rounded-lg bg-gray-900 px-3.5 py-1.5 text-sm font-semibold text-white hover:bg-gray-700 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
               >
-                {starting ? 'Starting…' : 'Run triage (200 threads)'}
+                {starting ? 'Starting…' : 'Triage inbox'}
               </button>
-              {run ? (
-                <button
-                  type="button"
-                  data-testid="run-triage-new-only"
-                  title="Only fetch and classify threads newer than your last completed run."
-                  onClick={() => void startTriage(true)}
-                  disabled={starting || (run ? RUN_ACTIVE(run.status) : false)}
-                  className="rounded-lg border border-gray-300 bg-white px-3.5 py-1.5 text-sm font-semibold text-gray-800 hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
-                >
-                  {starting ? 'Starting…' : 'Fetch new mail only'}
-                </button>
-              ) : null}
             </>
           ) : (
             <a
@@ -272,7 +258,7 @@ export default function Dashboard() {
                 {!run ? (
                   <EmptyState
                     title="Connect your Gmail to start — triage runs automatically after connect"
-                    body="Run triage over your 200 most recent inbox threads. The agent decides and applies actions autonomously."
+                    body="The agent reads your inbox, applies your category rules, and archives what doesn't need your attention — automatically."
                     action={
                       <button
                         type="button"
@@ -280,7 +266,7 @@ export default function Dashboard() {
                         disabled={starting}
                         className="rounded-lg bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-700 focus:ring-2 focus:ring-gray-400 focus:outline-none disabled:opacity-50"
                       >
-                        {starting ? 'Starting…' : 'Run triage (200 threads)'}
+                        {starting ? 'Starting…' : 'Triage inbox'}
                       </button>
                     }
                   />
@@ -314,48 +300,6 @@ export default function Dashboard() {
           )}
         </main>
 
-        <aside
-          aria-label="Coming soon"
-          className="hidden w-72 shrink-0 space-y-3 border-l border-gray-200 bg-gray-50 p-3 xl:block"
-        >
-          <p className="text-[11px] font-semibold tracking-wide text-gray-500 uppercase">
-            Not built yet — later phases
-          </p>
-          <StubPanel
-            title="Cost panel"
-            phase={3}
-            description="Run spend, month-to-date total and the rules-vs-LLM handling ratio."
-          />
-          <StubPanel
-            title="Model dropdown"
-            phase={3}
-            description="Pick which NVIDIA free model triages your mail."
-          />
-          <p className="rounded-lg border border-emerald-300 bg-emerald-50 p-2.5 text-[11px] text-emerald-900">
-            VIP list and priorities profile are real now — open <strong>Settings</strong> to edit
-            them.
-          </p>
-          <StubPanel
-            title="Backlog cleanup"
-            phase={3}
-            description="Clean historical mail in dated, cancellable, resumable chunks."
-          />
-          <StubPanel
-            title="Daily digest"
-            phase={3}
-            description="A daily summary of everything that was hidden, so nothing vanishes silently."
-          />
-          <StubPanel
-            title="Unsubscribe suggestions"
-            phase={3}
-            description="Senders you never open, with a one-click unsubscribe suggestion."
-          />
-          <StubPanel
-            title="Stale threads"
-            phase={3}
-            description="Threads awaiting a reply from you, or from someone else, for too long."
-          />
-        </aside>
       </div>
 
       <footer className="border-t border-gray-200 bg-white px-4 py-3 text-xs text-gray-500">
