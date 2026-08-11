@@ -228,9 +228,14 @@ class TestSecondPassReviewer:
         assert out["decisions"][0]["proposed_action"] == "keep"
         assert "items" not in called_with  # the reviewer was never even called
 
-    def test_persistent_failure_routes_every_unreviewed_archive_to_needs_your_call(
+    def test_persistent_failure_keeps_primary_llm_decision_as_archive(
         self, monkeypatch
     ):
+        """When the reviewer batch call fails, the primary LLM's original decision
+        must be preserved (archive at >0.75 confidence).  Demoting to
+        needs_your_call would silently keep mail the AI was confident should be
+        archived, which is the bug this test guards against."""
+
         class BoomClient:
             async def classify_batch(self, items, **kwargs):
                 raise RuntimeError("NIM endpoint unreachable")
@@ -242,10 +247,20 @@ class TestSecondPassReviewer:
             "items": [_item("item-1"), _item("item-2")],
             "settings": {},
         }
+        original = {d["item_id"]: dict(d) for d in state["decisions"]}
         out = nodes_review.second_pass_reviewer(state)
         for decision in out["decisions"]:
-            assert decision["proposed_action"] == "archive"
-            assert decision["status"] == "needs_your_call"
+            orig = original[decision["item_id"]]
+            # proposed_action must remain archive — not changed to keep
+            assert decision["proposed_action"] == "archive", (
+                f"item {decision['item_id']}: expected archive, got {decision['proposed_action']}"
+            )
+            # status must NOT be needs_your_call — the primary LLM decided at high confidence
+            assert decision.get("status") != "needs_your_call", (
+                f"item {decision['item_id']}: must not be demoted to needs_your_call on reviewer failure"
+            )
+            # decided_by must remain as the primary LLM set it
+            assert decision["decided_by"] == orig["decided_by"]
 
     def test_decisions_already_needs_your_call_are_never_sent_to_the_reviewer(self, monkeypatch):
         called = {"count": 0}

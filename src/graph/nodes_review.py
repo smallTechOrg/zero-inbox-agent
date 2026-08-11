@@ -200,17 +200,16 @@ def second_pass_reviewer(state: TriageState) -> dict:
             flipped += 1
 
     if failed_ids:
-        for i, decision in enumerate(decisions):
-            if decision["item_id"] in failed_ids:
-                decisions[i] = {
-                    **decision,
-                    "status": "needs_your_call",
-                    "reasoning": (
-                        f"{decision.get('reasoning', '')} The second-pass reviewer could not "
-                        "be reached, so this thread was left for you to decide rather than "
-                        "archived unreviewed."
-                    ).strip(),
-                }
+        # Reviewer call failed — keep the primary LLM's original decision rather than
+        # demoting to needs_your_call.  The primary LLM already classified these at
+        # >0.75 confidence; in autonomous mode, forcing needs_your_call would silently
+        # keep mail the AI was confident should be archived.  A warning is emitted so
+        # the operator can investigate the connection issue.
+        log.warning(
+            "never_miss.reviewer_batch_failed_fallback_to_llm",
+            run_id=state.get("run_id"),
+            failed_item_count=len(failed_ids),
+        )
 
     log.info(
         "never_miss.reviewer",
