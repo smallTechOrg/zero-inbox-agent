@@ -9,6 +9,10 @@ scope, not deferred.
 from __future__ import annotations
 
 import time
+
+import structlog
+
+log = structlog.get_logger(__name__)
 from collections.abc import Callable
 from datetime import datetime
 
@@ -127,6 +131,7 @@ class GmailAdapter(ChannelAdapter):
 
         items: list[ChannelItem] = []
         page_token: str | None = None
+        page_num = 0
         while len(items) < limit:
             if cancel_check is not None and cancel_check():
                 break
@@ -147,8 +152,10 @@ class GmailAdapter(ChannelAdapter):
                 )
             )
             batch = (page or {}).get("threads") or []
+            page_num += 1
             if not batch:
                 break
+            log.info("gmail.fetch_page", page=page_num, fetched_so_far=len(items), page_size=len(batch))
             for entry in batch:
                 if cancel_check is not None and cancel_check():
                     return items
