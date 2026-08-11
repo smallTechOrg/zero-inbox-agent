@@ -59,7 +59,32 @@ Phase 1 forces `dry_run=true` server-side; the client cannot turn it off.
 
 ---
 
-## Phase 3
+## Phase 3 — Autopilot & Digest
+
+### Autopilot
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/api/runs/{run_id}/summary` | Run summary card — `{run_id, status, total_threads, categories: [{name, count, suggested_action}], top_clusters: [{label, count, suggested_action}] (top 3 by size), needs_your_call_count, cost_usd, completed_at}` |
+| `POST` | `/api/runs/{run_id}/approve-and-apply` | Bulk-approve all non-`needs_your_call` decisions then apply all approved archive/digest decisions atomically. Returns `{applied, skipped_keep, skipped_needs_your_call, undo_tokens: [...]}`. `needs_your_call` decisions silently skipped. Existing `review-all` and `apply` endpoints are unchanged. |
+
+Auto-trigger: after `/auth/google/callback` completes, the backend enqueues a `BackgroundTask` equivalent to `POST /api/connections/{id}/triage` with `limit=200, only_new=false` — no client call required.
+
+### Digest
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/api/digest/latest` | Catch-up digest for the most recent completed run: `{run_id, generated_at, time_sensitive_kept: [{subject, from, reason}], vip_mail: [...], needs_your_call: [...], auto_archived: {count, by_category: [...]}}`. Returns `404` if no completed run exists. |
+
+### Events (SSE)
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/api/events` | `text/event-stream`. Pushes structured JSON events — `run_started: {run_id, connection_id, triggered_by: "user"\|"scheduler"\|"connect"}`, `run_progress: {run_id, batch_n, batch_total, items_decided, cost_so_far}`, `gmail_mutation_applied: {action_log_id, thread_count, category}`, `run_completed: {run_id, total_threads, cost_usd}`, `error: {run_id, message}`. Last 50 events per user kept in memory only — not persisted to DB. |
+
+---
+
+## Phase 4 — Rules, Chat, Digest, Backlog & Proactive Assistance
 
 | Method | Path | Notes |
 |--------|------|-------|

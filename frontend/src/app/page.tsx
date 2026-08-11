@@ -12,6 +12,7 @@ import { RunProgress } from '@/components/RunProgress'
 import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
 import { StubButton, StubPanel } from '@/components/Stub'
+import { RunSummaryCard } from '@/components/RunSummary'
 
 /** Anything that is not a terminal status (completed / failed / cancelled). */
 const RUN_ACTIVE = isRunActive
@@ -300,6 +301,7 @@ export default function Dashboard() {
             {run ? `Run ${run.status}` : 'No run yet'}
           </StatusPill>
           <StubButton label="Model: auto" phase={3} />
+          {/* ActivityDrawer bell rendered here for layout context; the actual drawer is in layout.tsx */}
           {connection ? (
             <>
               <button
@@ -362,6 +364,16 @@ export default function Dashboard() {
           ) : (
             <>
               <InboxSummary refreshKey={refreshKey} />
+
+              {run && !RUN_ACTIVE(run.status) ? (
+                <RunSummaryCard
+                  runId={run.id}
+                  onReviewClusters={() => {
+                    const el = document.getElementById('triage-queue')
+                    el?.scrollIntoView({ behavior: 'smooth' })
+                  }}
+                />
+              ) : null}
 
               {runError ? <ErrorState error={runError} onRetry={() => void startTriage()} /> : null}
 

@@ -4,12 +4,18 @@ import {
   ApiError,
   type ActionLogRow,
   type ApplyResult,
+  type ApproveAndApplyResult,
+  type Category,
   type Cluster,
+  type DefaultAction,
+  type DigestData,
   type Envelope,
   type Me,
   type PriorityProfile,
   type Run,
+  type RunSummary,
   type Settings,
+  type TaxonomyProposal,
   type TriageItem,
   type VipEntry,
   type VipKind,
@@ -151,6 +157,33 @@ export const api = {
       request<PriorityProfile>('/api/profile', {
         method: 'PUT',
         body: JSON.stringify({ text }),
+      }),
+  },
+
+  // --- Phase 3 ---
+
+  runSummary: (runId: string) => request<RunSummary>(`/api/runs/${runId}/summary`),
+
+  approveAndApply: (runId: string) =>
+    request<ApproveAndApplyResult>(`/api/runs/${runId}/approve-and-apply`, { method: 'POST' }),
+
+  digestLatest: () => request<DigestData>('/api/digest/latest'),
+
+  categories: {
+    list: () => request<Category[]>('/api/categories'),
+    create: (name: string, defaultAction: DefaultAction = 'keep', key?: string) =>
+      request<Category>('/api/categories', {
+        method: 'POST',
+        body: JSON.stringify({ name, default_action: defaultAction, key: key ?? name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') }),
+      }),
+    patch: (id: string, patch: { name?: string; default_action?: DefaultAction; sort_order?: number }) =>
+      request<Category>(`/api/categories/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      }),
+    propose: () =>
+      request<{ proposals: TaxonomyProposal[]; model: string; tokens: number }>('/api/categories/propose', {
+        method: 'POST',
       }),
   },
 }

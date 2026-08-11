@@ -861,6 +861,22 @@ def persist_decisions(state: TriageState) -> dict:
                 llm_calls=state.get("llm_calls") or [],
                 status="running",
             )
+        try:
+            from events import bus
+
+            bus.emit(
+                state["user_id"],
+                {
+                    "type": "run_progress",
+                    "ts": __import__("time").time(),
+                    "run_id": state["run_id"],
+                    "items_decided": counts.get("total", 0),
+                    "cost_so_far": cost.get("usd", 0.0),
+                },
+            )
+        except Exception:  # pragma: no cover - event bus must never fail a run
+            pass
+
         return {"decisions": decisions, "counts": counts, "cost": cost, "error": None}
     except Exception as exc:
         return {"error": f"persist_decisions failed: {exc}"}
@@ -893,6 +909,22 @@ def handle_error(state: TriageState) -> dict:
     except Exception as exc:  # pragma: no cover - the run is already failing
         log.error("triage.persist_on_error_failed", error=str(exc))
     log.error("triage.failed", run_id=state.get("run_id"), error=error)
+
+    try:
+        from events import bus
+
+        bus.emit(
+            state["user_id"],
+            {
+                "type": "error",
+                "ts": __import__("time").time(),
+                "run_id": state.get("run_id"),
+                "message": error,
+            },
+        )
+    except Exception:  # pragma: no cover
+        pass
+
     return {"status": "failed", "decisions": decisions, "counts": counts}
 
 
@@ -933,4 +965,21 @@ def finalize(state: TriageState) -> dict:
         tokens_out=cost.get("tokens_out"),
         usd=cost.get("usd"),
     )
+
+    try:
+        from events import bus
+
+        bus.emit(
+            state["user_id"],
+            {
+                "type": "run_completed",
+                "ts": __import__("time").time(),
+                "run_id": state["run_id"],
+                "total_threads": counts.get("total", 0),
+                "cost_usd": cost.get("usd", 0.0),
+            },
+        )
+    except Exception:  # pragma: no cover
+        pass
+
     return {"status": "completed", "counts": counts, "cost": cost}

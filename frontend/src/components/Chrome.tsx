@@ -49,7 +49,7 @@ export function DryRunBanner({ dryRun = true }: { dryRun?: boolean }) {
   )
 }
 
-type NavItem = { label: string; description: string }
+type NavItem = { label: string; description: string; href?: string }
 type StubItem = { label: string; phase: 2 | 3; description: string }
 type RailItem = NavItem | ({ _stub: true } & StubItem)
 
@@ -58,7 +58,7 @@ const RAIL: RailItem[] = [
   { label: 'Settings', description: 'Thresholds, VIP list, priorities profile' },
   { _stub: true, label: 'Rules', phase: 3, description: 'Proposed filter rules ranked by coverage' },
   { _stub: true, label: 'Chat', phase: 3, description: 'Turn plain English into rules' },
-  { _stub: true, label: 'Digest', phase: 3, description: 'Daily summary of what was hidden' },
+  { label: 'Digest', description: 'Catch-up digest of what was hidden', href: '/app/digest' },
   { _stub: true, label: 'Backlog', phase: 3, description: 'Historical cleanup in dated chunks' },
   { _stub: true, label: 'Cost', phase: 3, description: 'Spend and rules-vs-LLM ratio' },
 ]
@@ -93,6 +93,22 @@ export function LeftRail({
             )
           }
           const isActive = active === item.label
+          // External href nav items use an anchor tag
+          if (item.href) {
+            return (
+              <li key={item.label}>
+                <a
+                  href={item.href}
+                  aria-current={isActive ? 'page' : undefined}
+                  className={`flex w-full items-center justify-between rounded px-2.5 py-1.5 text-left text-sm font-medium focus:ring-2 focus:ring-gray-400 focus:outline-none ${
+                    isActive ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100'
+                  }`}
+                >
+                  <span>{item.label}</span>
+                </a>
+              </li>
+            )
+          }
           return (
             <li key={item.label}>
               <button

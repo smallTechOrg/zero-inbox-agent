@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '@/lib/api'
 import { type Settings as SettingsShape, type VipEntry, type VipKind } from '@/lib/types'
-import { StubPanel } from '@/components/Stub'
+import { TaxonomyEditor } from '@/components/TaxonomyEditor'
 import { ErrorState, SkeletonRows } from '@/components/States'
 
 function clamp(v: number, min: number, max: number) {
@@ -452,16 +452,9 @@ export default function SettingsPanel({
         <PriorityProfileEditor />
       </div>
 
-      {/* Still stubs in Phase 2 */}
+      {/* Phase 3: real taxonomy editor */}
       <div className="border-t border-gray-200 pt-4">
-        <p className="mb-2 text-[11px] font-semibold tracking-wide text-gray-500 uppercase">
-          Not built yet
-        </p>
-        <StubPanel
-          title="Taxonomy editor"
-          phase={3}
-          description="Rename, merge and reorder your categories directly from Settings."
-        />
+        <TaxonomyEditor />
       </div>
     </section>
   )

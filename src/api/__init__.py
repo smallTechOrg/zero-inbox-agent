@@ -23,7 +23,15 @@ async def _lifespan(app: FastAPI):
     from db.session import init_db
 
     init_db()
-    yield
+
+    try:
+        from scheduler import start_scheduler, stop_scheduler
+
+        start_scheduler()
+        yield
+        stop_scheduler()
+    except Exception:  # noqa: BLE001 — scheduler must never block the server from starting
+        yield
 
 
 def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
@@ -57,7 +65,7 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return ok({"status": "ok", "version": VERSION})
 
-    from api import actions, categories, connections, memory, runs, session, triage
+    from api import actions, categories, connections, digest, events, memory, runs, session, triage
 
     app.include_router(session.router)
     app.include_router(connections.router)
@@ -66,6 +74,8 @@ def create_app() -> FastAPI:
     app.include_router(memory.router)
     app.include_router(categories.router)
     app.include_router(actions.router)
+    app.include_router(events.router)
+    app.include_router(digest.router)
 
     # Google OAuth routes live in api/auth.py (gmail-adapter slice). Mounted at the
     # paths spec/api.md documents: /auth/google/start, /auth/google/callback, /auth/logout.

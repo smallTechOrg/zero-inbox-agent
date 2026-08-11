@@ -125,14 +125,36 @@ def run_triage(
     run_id: str | None = None,
     items: list[dict] | None = None,
     fetch_after: str | None = None,
+    triggered_by: str = "user",
 ) -> str:
     """Creates (or resumes) a TriageRun, invokes the triage graph, returns ``run_id``."""
+    from events import bus
+
+    # We need to resolve the run_id before emitting so the event carries it.
+    resolved_id = _ensure_run(
+        run_id=run_id,
+        user_id=user_id,
+        channel_account_id=channel_account_id,
+        dry_run=dry_run,
+        kind="incremental",
+    )
+    bus.emit(
+        user_id,
+        {
+            "type": "run_started",
+            "ts": time.time(),
+            "run_id": resolved_id,
+            "connection_id": channel_account_id,
+            "triggered_by": triggered_by,
+        },
+    )
+
     final = execute_triage(
         user_id=user_id,
         channel_account_id=channel_account_id,
         limit=limit,
         dry_run=dry_run,
-        run_id=run_id,
+        run_id=resolved_id,
         items=items,
         fetch_after=fetch_after,
     )

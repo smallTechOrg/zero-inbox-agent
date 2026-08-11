@@ -65,6 +65,63 @@ Auto-act threshold slider, confidence floor slider, dry-run toggle (locked on in
 explanatory tooltip), timezone, digest hour, taxonomy editor, **VIP / never-hide list** editor, and
 the plain-English **priorities profile** textarea.
 
+---
+
+## Phase 3 screens
+
+### 9. Run Summary card *(primary post-connect / post-run landing — Phase 3)*
+
+Primary landing view shown after a run completes (auto-triggered on connect, or user-triggered). Loaded from `GET /api/runs/{run_id}/summary` (polled every 2 s while status is `running`; stops on `completed` or `failed`).
+
+Contents:
+- Header: run status pill, `total_threads` count, `cost_usd`, `completed_at` timestamp.
+- Category breakdown table: name · count · suggested action (archive / keep / digest).
+- **Needs your call** badge: `needs_your_call_count`, links to the triage queue filtered to that bucket.
+- Top-3 clusters by size (label · count · suggested action).
+- Two CTAs:
+  - **Review clusters** — navigates to the existing triage queue (screen 2).
+  - **Approve all & Apply** — calls `POST /api/runs/{run_id}/approve-and-apply`; on success a toast shows "Applied N changes · Undo"; on partial failure shows count and a link to the action log.
+- If the run is still in progress, a skeleton card with a live progress bar is shown instead; CTAs are disabled until `status === "completed"`.
+
+### 10. Catch-up Digest tab *(Phase 3)*
+
+Accessible from the left rail as **Digest** (replaces the Phase 1–2 stub). Loaded from `GET /api/digest/latest`.
+
+Sections (collapsible):
+1. **Time-sensitive kept** — subject, from, reason chip.
+2. **VIP mail** — same shape.
+3. **Needs your call** — each row links to the decision in the triage queue.
+4. **Auto-archived** — count + breakdown by category; each category is expandable to list subjects.
+
+Empty state: "No digest yet — run triage first." Error state: standard envelope error + Retry.
+
+### 11. Activity drawer *(Phase 3)*
+
+A slide-in panel anchored to the right edge (or a persistent bottom bar on narrow viewports). Toggled by a bell icon in the top bar; auto-opens and highlights when a background run is active.
+
+Subscribes to `GET /api/events` (SSE) on page load. Each received event is prepended to a scrollable feed:
+- `run_started` → green "Triage started" row with trigger badge (`user` / `scheduler` / `connect`).
+- `run_progress` → progress bar row updating in place (keyed by `run_id`).
+- `gmail_mutation_applied` → "Archived N threads · {category}" row.
+- `run_completed` → "Run complete · N threads · $cost" row.
+- `error` → red "Error" row with message.
+
+Icons differentiate event types. Timestamps are relative ("2 s ago") updating in real time. Max 50 events shown (mirrors server-side cap). On SSE disconnect the drawer shows a subtle "Reconnecting…" chip and retries with exponential back-off.
+
+### 12. Real taxonomy editor *(D10 fix — Phase 3)*
+
+Replaces the `StubPanel` in **Settings → Taxonomy** with a live inline editor backed by the existing `/api/categories` endpoints.
+
+Layout — a flat list of category rows. Each row:
+- **Name**: click to enter inline-edit mode; `Enter` / blur confirms; calls `PATCH /api/categories/{id}` with `{name}`.
+- **Default action** dropdown: `archive` / `keep` / `digest` / `needs_your_call`; on change calls `PATCH /api/categories/{id}` with `{default_action}`.
+- **Drag handle** (six-dot icon): drag to reorder; on drop calls `PATCH /api/categories/{id}` with `{sort_order: <new_integer>}` for each row whose order changed. Order is client-side only.
+- **Delete** icon (only for user-created categories, not system defaults): confirm modal, then `DELETE /api/categories/{id}` if that endpoint exists; otherwise deactivated.
+
+**Add category** button at bottom: inline new row, name required, default action defaults to `keep`.
+
+Loading: skeleton rows. Error: toast with message. No page refresh required for any action.
+
 ## States (required for every list surface)
 
 | State | Treatment |

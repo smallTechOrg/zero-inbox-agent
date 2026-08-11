@@ -167,6 +167,23 @@ def apply_decision(
     item.channel_labels = sorted(labels)
     session.flush()  # ...the decision flips to applied.
 
+    try:
+        from events import bus
+        import time
+
+        bus.emit(
+            user_id,
+            {
+                "type": "gmail_mutation_applied",
+                "ts": time.time(),
+                "action_log_id": str(action_log.id),
+                "thread_count": 1,
+                "category": category.key if category else None,
+            },
+        )
+    except Exception:  # pragma: no cover - event bus must never fail an action
+        pass
+
     return action_log
 
 

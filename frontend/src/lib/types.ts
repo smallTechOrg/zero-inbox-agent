@@ -145,10 +145,84 @@ export type ActionLogRow = {
   created_at: string
 }
 
+/** Phase 2+: categories (taxonomy). */
+export type DefaultAction = 'archive' | 'keep' | 'digest' | 'needs_your_call'
+
+export type Category = {
+  id: string
+  key: string
+  name: string
+  description: string | null
+  channel_label_name: string | null
+  channel_label_id: string | null
+  default_action: DefaultAction
+  is_default: boolean
+  sort_order: number
+}
+
+/** POST /api/categories/propose → {proposals, model, tokens} */
+export type TaxonomyProposal = {
+  action: 'add' | 'rename' | 'merge' | 'remove' | 'redescribe'
+  key: string
+  name: string
+  description: string
+  reasoning: string
+  merge_keys?: string[]
+}
+
 /** POST /api/actions/apply → [{action_log_id, undo_token_id}], ordered like the request's decision_ids. */
 export type ApplyResult = {
   action_log_id: string
   undo_token_id: string | null
+}
+
+// --- Phase 3 ---
+
+export type RunSummaryCategory = { name: string; count: number; suggested_action: string }
+export type RunSummaryCluster = { label: string; count: number; suggested_action: string }
+
+export type RunSummary = {
+  run_id: string
+  status: RunStatus
+  total_threads: number
+  categories: RunSummaryCategory[]
+  top_clusters: RunSummaryCluster[]
+  needs_your_call_count: number
+  cost_usd: number
+  completed_at: string | null
+}
+
+export type ApproveAndApplyResult = {
+  applied: number
+  skipped_keep: number
+  skipped_needs_your_call: number
+  undo_tokens: string[]
+}
+
+export type DigestItem = { subject: string; from: string; reason?: string; reasoning?: string }
+
+export type DigestData = {
+  run_id: string
+  generated_at: string
+  time_sensitive_kept: DigestItem[]
+  vip_mail: DigestItem[]
+  needs_your_call: DigestItem[]
+  auto_archived: { count: number; by_category: { name: string; count: number }[] }
+}
+
+export type SseEventType =
+  | 'run_started'
+  | 'run_progress'
+  | 'gmail_mutation_applied'
+  | 'run_completed'
+  | 'error'
+  | 'heartbeat'
+
+export type SseEvent = {
+  id: string // client-side generated
+  type: SseEventType
+  ts: number // Date.now() when received
+  payload: Record<string, unknown>
 }
 
 export class ApiError extends Error {

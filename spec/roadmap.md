@@ -106,7 +106,7 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 
 ## Phases of Development
 
-Three phases: one first-win phase and two requirements phases.
+Four phases: one first-win phase and three requirements phases.
 
 ---
 
@@ -246,7 +246,49 @@ Unsubscribe suggestions, Stale threads, Draft replies.
 
 ---
 
-### Phase 3 — Rules, Chat, Digest, Backlog & Proactive Assistance
+### Phase 3 — Autopilot & Background Visibility
+
+**Goal.** After connecting Gmail, triage starts automatically. The user sees a compact run summary card and can approve-all in one click. A daily scheduler keeps the inbox at zero with new mail. A live activity feed shows what's happening in the background. The catch-up digest lets the user know what's important without opening Gmail. The taxonomy editor is now real (D10 fix).
+
+Capabilities: [autopilot-and-digest](capabilities/autopilot-and-digest.md), taxonomy editor (D10 fix — included in the same capability file).
+
+#### Slices
+
+| # | Slice | Owns (disjoint paths) | Depends on |
+|---|-------|----------------------|-----------|
+| 1 | `backend-autopilot` | `src/api/auth.py` (auto-trigger on callback), `src/api/runs.py` (add summary + approve-and-apply endpoints), `src/scheduler.py`, `src/api/digest.py` (`GET /api/digest/latest`), `tests/unit/api/test_autopilot.py`, `tests/integration/test_autopilot.py` | none |
+| 2 | `backend-events` | `src/events.py` (in-memory event bus, last-50-per-user ring buffer), `src/api/events.py` (SSE endpoint), `tests/unit/api/test_events.py` | none |
+| 3 | `frontend-autopilot` | `frontend/src/components/RunSummary.tsx`, `frontend/src/components/DigestPanel.tsx`, `frontend/src/components/ActivityDrawer.tsx`, `frontend/src/hooks/useEvents.ts`, `frontend/src/app/page.tsx` (wire summary card as landing after run) | none |
+| 4 | `frontend-settings-taxonomy` | `frontend/src/components/TaxonomyEditor.tsx`, `frontend/src/components/Settings.tsx` (replace taxonomy `StubPanel` with `TaxonomyEditor`) | none |
+
+Slices 1 and 2 own fully disjoint backend paths. Slices 3 and 4 own fully disjoint frontend paths. All four can run concurrently.
+
+#### Gate
+
+```bash
+uv run alembic upgrade head && uv run alembic current
+uv run pytest tests/unit tests/integration -q
+cd frontend && pnpm build && cd .. && uv run python -m src &
+npx playwright test tests/e2e/ --reporter=line
+```
+
+`tests/integration/test_autopilot.py`: connects a mailbox, asserts a `Run` row enters `started` state within 5 s of the OAuth callback (auto-trigger), polls until the run is `completed`, calls `GET /api/runs/{run_id}/summary` and asserts all fields are present and `total_threads > 0`, calls `POST /api/runs/{run_id}/approve-and-apply` and asserts `applied + skipped_keep + skipped_needs_your_call == non-needs_your_call decision count` and `applied >= 0` (real Gmail mutation; test marks as SKIPPED if dry_run forced), calls `GET /api/digest/latest` and asserts the response matches the expected schema. `tests/unit/api/test_events.py`: publishes three synthetic events to the in-memory bus for a test user and asserts the SSE stream yields them in insertion order within 1 s.
+
+#### How the user tests it
+
+1. Log out (or open a fresh session) and click **Connect Gmail** — within a few seconds a triage run starts automatically with no button click. The Activity drawer (bell icon) opens and shows a `run_started` event.
+2. When the run completes, the **Run Summary card** appears as the primary landing: N threads across K categories, cost, needs-your-call badge, and the top-3 clusters.
+3. Click **Approve all & Apply** — Gmail is mutated, a toast shows "Applied N changes · Undo".
+4. Open the **Digest** tab — see what was auto-archived and what needs attention (`time_sensitive_kept`, `vip_mail`, `needs_your_call`, `auto_archived` breakdown).
+5. Open the **Activity drawer** — see the timestamped event feed for the completed run.
+6. Open **Settings → Taxonomy**: rename a category inline, change its default action, drag to reorder. No page refresh needed; changes persist.
+7. To verify the daily scheduler: check that a `next_run_at` row is written to the DB on startup. In test mode, set `settings.scheduler_run_at = "now"` to trigger immediately.
+
+**Real in Phase 3:** auto-trigger, run summary card, approve-all + apply, digest tab, activity drawer, taxonomy editor. **Labelled stubs remaining:** Rules view, Chat view, Backlog cleanup, Cost panel, Model dropdown, Unsubscribe suggestions, Stale threads, Draft replies.
+
+---
+
+### Phase 4 — Rules, Chat, Digest, Backlog & Proactive Assistance
 
 **Goal.** The user stops reviewing individual threads: they review *rules*. Plain English becomes a
 rule, mined patterns become one-click filters covering hundreds of threads, the backlog is cleaned in

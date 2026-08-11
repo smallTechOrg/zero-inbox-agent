@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
@@ -142,6 +142,7 @@ def google_start(request: Request):
 @router.get("/auth/google/callback")
 def google_callback(
     request: Request,
+    background_tasks: BackgroundTasks,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
@@ -186,7 +187,7 @@ def google_callback(
         )
 
     refresh_token_enc = TokenCipher().encrypt(result.refresh_token)
-    user_id, _connection_id = store.upsert_user_and_connection(
+    user_id, connection_id = store.upsert_user_and_connection(
         email=result.account_email,
         display_name=result.display_name or result.account_email.split("@")[0],
         refresh_token_enc=refresh_token_enc,
@@ -194,10 +195,53 @@ def google_callback(
         channel="gmail",
     )
 
+    background_tasks.add_task(_auto_triage_task, user_id=user_id, connection_id=connection_id)
+
     response = RedirectResponse(DASHBOARD_URL, status_code=302)
     set_session_cookie(response, user_id)
     response.delete_cookie(STATE_COOKIE, path="/")
     return response
+
+
+def _auto_triage_task(*, user_id: str, connection_id: str) -> None:
+    """Auto-trigger a full triage run after OAuth connect. Never raises."""
+    import structlog
+
+    log = structlog.get_logger("auth")
+    log.info("auto_triage_triggered", user_id=user_id, connection_id=connection_id)
+    try:
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        from db.models import TriageRun
+        from db.session import create_db_session
+        from graph.runner import run_triage
+
+        run_id = str(uuid4())
+        with create_db_session() as session:
+            run = TriageRun(
+                id=run_id,
+                user_id=user_id,
+                channel_account_id=connection_id,
+                kind="incremental",
+                status="running",
+                dry_run=False,
+                items_total=0,
+                items_decided=0,
+                counts={},
+                started_at=datetime.now(timezone.utc),
+            )
+            session.add(run)
+
+        run_triage(
+            user_id=user_id,
+            channel_account_id=connection_id,
+            limit=200,
+            dry_run=False,
+            run_id=run_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auto_triage_failed", user_id=user_id, connection_id=connection_id, error=str(exc))
 
 
 @router.post("/auth/logout")

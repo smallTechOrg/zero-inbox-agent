@@ -24,7 +24,13 @@ for the phase plan and slices.
 | [user-memory](user-memory.md) | Corrections as training signal, VIP list, priorities profile, per-sender stats |
 | [decision-audit-trail](decision-audit-trail.md) | Completed: mutation log with undo tokens, corrections |
 
-## Phase 3 — Rules, Chat, Digest, Backlog & Proactive Assistance
+## Phase 3 — Autopilot & Background Visibility
+
+| Capability | What it does |
+|------------|--------------|
+| [autopilot-and-digest](autopilot-and-digest.md) | Auto-trigger on connect, run summary card, one-click approve-all + apply, daily scheduler, catch-up digest, SSE activity feed, real taxonomy editor (D10 fix) |
+
+## Phase 4 — Rules, Chat, Digest, Backlog & Proactive Assistance
 
 | Capability | What it does |
 |------------|--------------|
