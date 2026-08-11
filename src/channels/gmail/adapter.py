@@ -130,15 +130,20 @@ class GmailAdapter(ChannelAdapter):
         while len(items) < limit:
             if cancel_check is not None and cancel_check():
                 break
+            # Use q="in:inbox" instead of labelIds=["INBOX"] so that threads
+            # in Gmail's tabbed-inbox categories (Social, Updates, Promotions,
+            # Forums) are included. Those threads carry INBOX + CATEGORY_* labels
+            # and are silently excluded when labelIds=["INBOX"] is used.
+            effective_q = f"in:inbox {query}".strip() if query else "in:inbox"
             page = self._execute(
                 self._service.users()
                 .threads()
                 .list(
                     userId="me",
-                    labelIds=["INBOX"],
+                    # labelIds removed — "in:inbox" query covers all tabs including Social/Updates/Promotions
                     maxResults=min(GMAIL_PAGE_SIZE, limit - len(items)),
                     pageToken=page_token,
-                    q=query,
+                    q=effective_q,
                 )
             )
             batch = (page or {}).get("threads") or []

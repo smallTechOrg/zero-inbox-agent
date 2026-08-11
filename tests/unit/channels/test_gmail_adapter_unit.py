@@ -59,8 +59,18 @@ def test_list_threads_requests_only_inbox_metadata_never_full_bodies():
 
     _adapter(service).list_threads(limit=10)
 
-    assert service.thread_list_calls[0]["labelIds"] == ["INBOX"]
+    assert service.thread_list_calls[0].get("labelIds") is None
+    assert "in:inbox" in (service.thread_list_calls[0].get("q") or "")
     assert all(call["format"] == "metadata" for call in service.thread_get_calls)
+
+
+def test_list_threads_fetches_all_inbox_tabs():
+    """in:inbox query ensures Social/Updates/Promotions threads are included."""
+    service = FakeGmailService(threads={"t1": _thread("t1", [_msg("m1")])})
+    _adapter(service).list_threads(limit=10)
+    call = service.thread_list_calls[0]
+    assert call.get("labelIds") is None, "labelIds must not be set — it excludes CATEGORY_ threads"
+    assert "in:inbox" in (call.get("q") or ""), "q must include in:inbox to cover all tabs"
 
 
 def test_list_threads_paginates_until_the_limit_is_reached():
