@@ -63,7 +63,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   me: () => request<Me>('/api/me'),
 
-  startTriage: (connectionId: string, limit = 200, onlyNew = false) =>
+  startTriage: (connectionId: string, limit = 10_000, onlyNew = false) =>
     request<{ run_id: string }>(`/api/connections/${connectionId}/triage`, {
       method: 'POST',
       body: JSON.stringify({ limit, only_new: onlyNew }),

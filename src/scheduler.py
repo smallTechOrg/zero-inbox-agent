@@ -56,7 +56,7 @@ def _run_daily_triage() -> None:
                 run_triage(
                     user_id=user_id,
                     channel_account_id=connection_id,
-                    limit=200,
+                    limit=10_000,
                     dry_run=False,
                     fetch_after=None,
                 )

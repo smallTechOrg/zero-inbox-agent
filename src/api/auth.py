@@ -236,7 +236,7 @@ def _auto_triage_task(*, user_id: str, connection_id: str) -> None:
         run_triage(
             user_id=user_id,
             channel_account_id=connection_id,
-            limit=200,
+            limit=10_000,
             dry_run=False,
             run_id=run_id,
         )

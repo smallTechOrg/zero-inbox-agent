@@ -112,7 +112,7 @@ export default function Dashboard() {
       setStarting(true)
       setRunError(null)
       try {
-        const { run_id } = await api.startTriage(connection.id, 200, onlyNew)
+        const { run_id } = await api.startTriage(connection.id, 10_000, onlyNew)
         const fresh = await api.run(run_id)
         setRun(fresh)
         setClusters(null)
