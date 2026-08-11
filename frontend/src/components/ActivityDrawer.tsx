@@ -122,12 +122,9 @@ export function ActivityDrawer() {
       if (type === 'heartbeat') return
       const ev: SseEvent = { id: genId(), type, ts: Date.now(), payload }
       setEvents(prev => [ev, ...prev].slice(0, MAX_EVENTS))
-      if (type === 'run_started') {
-        setOpen(true)
-      }
-      setUnread(n => (open ? 0 : n + 1))
+      setUnread(n => n + 1)
     },
-    [open],
+    [],
   )
 
   const connect = useCallback(() => {
@@ -199,25 +196,25 @@ export function ActivityDrawer() {
   return (
     <>
       {/* Bell button — fixed in top-right corner */}
-      <button
-        type="button"
-        aria-label={`Activity feed${unread > 0 ? ` (${unread} new)` : ''}`}
-        data-testid="activity-bell"
-        onClick={handleOpen}
-        className="fixed right-4 top-2 z-30 relative flex h-8 w-8 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-600 shadow-sm hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none"
-      >
-        <span aria-hidden="true" className="text-base">
-          🔔
-        </span>
-        {unread > 0 && (
-          <span
-            aria-hidden="true"
-            className="absolute -right-1 -top-1 flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white"
-          >
-            {unread > 9 ? '9+' : unread}
-          </span>
-        )}
-      </button>
+      <div className="fixed right-4 top-2 z-30">
+        <button
+          type="button"
+          aria-label={`Activity feed${unread > 0 ? ` (${unread} new)` : ''}`}
+          data-testid="activity-bell"
+          onClick={handleOpen}
+          className="relative flex h-8 w-8 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-600 shadow-sm hover:bg-gray-50 focus:ring-2 focus:ring-gray-400 focus:outline-none"
+        >
+          <span aria-hidden="true" className="text-base">🔔</span>
+          {unread > 0 && (
+            <span
+              aria-hidden="true"
+              className="absolute -right-1 -top-1 flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white"
+            >
+              {unread > 9 ? '9+' : unread}
+            </span>
+          )}
+        </button>
+      </div>
 
       {/* Overlay */}
       {open && (
