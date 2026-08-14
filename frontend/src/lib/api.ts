@@ -12,6 +12,7 @@ import {
   type Envelope,
   type Me,
   type PriorityProfile,
+  type RemainderLedger,
   type Run,
   type RunSummary,
   type Settings,
@@ -171,6 +172,20 @@ export const api = {
   runs: {
     undo: (runId: string) =>
       request<UndoRunResult>(`/api/runs/${runId}/undo`, { method: 'POST' }),
+
+    // --- Phase 7 (spec/api.md § Phase 7 — Drive to Inbox Zero) ---
+
+    /** The single honest answer to "how far from zero am I, and why?".
+     *  Computed live from `decisions`, never from cached counts. */
+    remainder: (runId: string) =>
+      request<RemainderLedger>(`/api/runs/${encodeURIComponent(runId)}/remainder`),
+
+    /** Re-runs the apply pass for a `completed` run without re-classifying a
+     *  single thread. Idempotent — the recovery path behind "Retry archiving". */
+    apply: (runId: string) =>
+      request<Record<string, unknown>>(`/api/runs/${encodeURIComponent(runId)}/apply`, {
+        method: 'POST',
+      }),
   },
 
   digestLatest: () => request<DigestData>('/api/digest/latest'),
@@ -182,7 +197,16 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ name, default_action: defaultAction, key: key ?? name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') }),
       }),
-    patch: (id: string, patch: { name?: string; default_action?: DefaultAction; sort_order?: number }) =>
+    patch: (
+      id: string,
+      patch: {
+        name?: string
+        default_action?: DefaultAction
+        sort_order?: number
+        /** Phase 7 — per-category autonomy bar; `null` clears it back to inherit. */
+        auto_act_threshold?: number | null
+      },
+    ) =>
       request<Category>(`/api/categories/${id}`, {
         method: 'PATCH',
         body: JSON.stringify(patch),

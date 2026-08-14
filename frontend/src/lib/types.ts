@@ -21,6 +21,9 @@ export type Settings = {
   llm_model: string
   digest_hour_local: number
   timezone: string
+  /** Phase 7 — PATCH /api/settings returns `"above_model_ceiling"` when the
+   *  accepted auto_act_threshold is > 0.90. Absent on GET /api/me. */
+  warning?: string | null
 }
 
 export type Me = {
@@ -65,7 +68,42 @@ export type Run = {
   error_message: string | null
   started_at: string | null
   finished_at: string | null
+  /** Phase 7 — how many threads the agent decided should leave but that are
+   *  still sitting in the inbox. Absent on a pre-Phase-7 backend. */
+  distance_to_zero?: number
+  /** Phase 7 — false when the apply pass recorded a reason OR distance_to_zero > 0. */
+  apply_ok?: boolean
 }
+
+/** Phase 7 — GET /api/runs/{run_id}/remainder (spec/api.md § Phase 7). */
+export type RemainderBuckets = {
+  needs_your_call: number
+  category_keep: number
+  held_by_never_miss: number
+  below_threshold: number
+  unclassified: number
+}
+
+export type RemainderLedger = {
+  run_id: string
+  inbox_remaining: number
+  distance_to_zero: number
+  applied: number
+  apply_ok: boolean
+  apply_failed_reason: string | null
+  dry_run: boolean
+  remainder: RemainderBuckets
+  failures: { decision_id: string; error: string }[]
+}
+
+/** The fixed display order of the remainder ledger (ui.md screen 16). */
+export const REMAINDER_ORDER: (keyof RemainderBuckets)[] = [
+  'needs_your_call',
+  'category_keep',
+  'below_threshold',
+  'held_by_never_miss',
+  'unclassified',
+]
 
 export type ClusterKind = 'list' | 'sender' | 'domain' | 'category' | string
 
@@ -165,6 +203,8 @@ export type Category = {
   default_action: DefaultAction
   is_default: boolean
   sort_order: number
+  /** Phase 7 — per-category autonomy bar. `null` = inherit the global slider. */
+  auto_act_threshold?: number | null
 }
 
 /** POST /api/categories/propose → {proposals, model, tokens} */
@@ -197,6 +237,11 @@ export type RunSummary = {
   needs_your_call_count: number
   cost_usd: number
   completed_at: string | null
+  /** Phase 7 — decisions that actually reached `applied` in Gmail. */
+  applied_count?: number
+  /** Phase 7 — decided to leave the inbox but still sitting in it. */
+  distance_to_zero?: number
+  remainder?: RemainderBuckets
 }
 
 export type ApproveAndApplyResult = {
@@ -238,6 +283,15 @@ export type SseEventType =
   | 'run_resumable'
   /** Phase 6 — a mid-run switch to the next model in the fallback chain. */
   | 'model_fallback'
+  /** Phase 7 — apply-pass progress, every 25 applied decisions + once at the end. */
+  | 'apply_progress'
+  /** Phase 7 — the apply pass could not run, or did not reach zero. */
+  | 'run_apply_failed'
+  /** Phase 7 — the end-of-run remainder report. */
+  | 'inbox_zero_report'
+  /** Phase 7 — the watchdog's proof-of-life, carrying real observed state.
+   * Never a scrolling row: it is the pinned line at the foot of the feed. */
+  | 'activity_heartbeat'
   | 'error'
   | 'heartbeat'
   /** Every backend log line, bridged from structlog — including Gmail 429
@@ -265,6 +319,22 @@ export type ThreadClassifiedEvent = {
   review_state: ReviewState
 }
 
+/** Payload of a `thread_archived` SSE event.
+ * spec/capabilities/triage-transparency.md § `thread_archived` event shape. */
+export type ThreadArchivedEvent = {
+  run_id: string
+  item_id: string
+  subject: string
+  category: string
+  label_name: string
+}
+
+/** An `error` event, surfaced inline — the user needs to tell stuck from slow. */
+export type FeedErrorEvent = {
+  run_id: string
+  message: string
+}
+
 export type ProviderDegradedEvent = {
   run_id: string
   provider: string
@@ -279,6 +349,27 @@ export type RunResumableEvent = {
   items_total: number
   items_decided: number
   reason: string
+}
+
+/**
+ * Phase 7 — the watchdog heartbeat.
+ * spec/capabilities/triage-transparency.md § `activity_heartbeat` event shape.
+ * Counts, ids, phase names, model ids and elapsed times only — never a subject,
+ * sender or body.
+ */
+export type ActivityHeartbeatEvent = {
+  run_id: string
+  phase: string
+  detail: string
+  batch_n: number | null
+  batch_total: number | null
+  batch_size: number | null
+  /** Nullable on the wire (spec/api.md § Phase 7): the watchdog emits `null`
+   * outside a batch phase, exactly as it does for the three counts above.
+   * Coercing that to `""` would silently invent "no model" as a value. */
+  model: string | null
+  elapsed_s: number
+  silent_for_s: number
 }
 
 export type ModelFallbackEvent = {

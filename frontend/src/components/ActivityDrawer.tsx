@@ -1,7 +1,13 @@
 'use client'
 
 /**
- * The Activity drawer — the live classification surface (ui.md screen 14).
+ * The Activity drawer — the full-history / archive surface (ui.md screen 14).
+ *
+ * Phase 7 correction: this is **not** the live surface. It stays closed by
+ * default (`useState(false)`) and that is now fine, because the live feed
+ * renders inline on the main page (`LiveRunFeed.tsx`, ui.md screen 18). The
+ * drawer is the complete scrollback, reachable from the bell or from the
+ * feed's "See all activity →" link via `openActivityDrawer()`.
  *
  * It no longer owns an `EventSource`: the single shared stream lives in
  * `@/lib/SseContext`. The drawer renders the derived feed — one row per decided
@@ -16,6 +22,15 @@ import { api } from '@/lib/api'
 import type { ModelFallbackEvent, RunResumableEvent, SseEvent, SseEventType } from '@/lib/types'
 import { useSse } from '@/lib/SseContext'
 import { ThreadFeedRow } from '@/components/ThreadFeedRow'
+
+/** Cross-tree open signal: the drawer lives in `layout.tsx`, the feed's
+ *  "See all activity →" link lives inside `page.tsx`. */
+const OPEN_DRAWER_EVENT = 'zi:open-activity-drawer'
+
+export function openActivityDrawer(): void {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new CustomEvent(OPEN_DRAWER_EVENT))
+}
 
 function relativeTime(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000)
@@ -40,6 +55,11 @@ const EVENT_ICON: Record<SseEventType | string, string> = {
   error: '!',
   heartbeat: '♡',
   log: '·',
+  // Phase 7
+  apply_progress: '↗',
+  run_apply_failed: '!',
+  inbox_zero_report: '∅',
+  activity_heartbeat: '·',
 }
 
 function eventLabel(ev: SseEvent): string | null {
@@ -69,6 +89,24 @@ function eventLabel(ev: SseEvent): string | null {
       return `Archived: ${String(p.subject ?? '').slice(0, 50) || '(no subject)'} → ${p.label_name ?? ''}`
     case 'heartbeat':
       return null
+    // --- Phase 7 (spec/api.md § Phase 7) ---
+    case 'apply_progress':
+      return `Archiving ${p.applied ?? 0} of ${p.total_to_apply ?? 0}${
+        Number(p.failed ?? 0) > 0 ? ` — ${p.failed} failed` : ''
+      }`
+    case 'run_apply_failed':
+      return `Could not archive ${p.distance_to_zero ?? 0} thread${
+        Number(p.distance_to_zero) === 1 ? '' : 's'
+      } — ${p.reason ?? 'no reason reported'}`
+    case 'inbox_zero_report': {
+      const rem = (p.remainder ?? {}) as Record<string, unknown>
+      const detail = Object.entries(rem)
+        .map(([k, v]) => `${k}=${String(v)}`)
+        .join(' ')
+      return `Inbox-zero report — ${p.applied ?? 0} archived, ${
+        p.distance_to_zero ?? 0
+      } still to go${detail ? ` · ${detail}` : ''}`
+    }
     case 'log': {
       // Every backend log line, bridged from structlog. Render the event name
       // plus whatever fields the call site logged, so a Gmail 429 backoff or an
@@ -241,6 +279,17 @@ export function ActivityDrawer() {
     setOpen(true)
     setSeen(events.length)
   }
+
+  // "See all activity →" on the inline live feed (ui.md screen 18).
+  const eventCount = events.length
+  useEffect(() => {
+    const onOpen = () => {
+      setOpen(true)
+      setSeen(eventCount)
+    }
+    window.addEventListener(OPEN_DRAWER_EVENT, onOpen)
+    return () => window.removeEventListener(OPEN_DRAWER_EVENT, onOpen)
+  }, [eventCount])
   const handleClose = () => {
     setSeen(events.length)
     setOpen(false)
@@ -249,7 +298,11 @@ export function ActivityDrawer() {
   return (
     <>
       {/* Bell button — fixed in top-right corner */}
-      <div className="fixed right-4 top-2 z-30">
+      {/* z-[60]: the dry-run banner (Chrome.tsx) is `sticky top-0 z-50` and full
+          width, so at z-30 the bell sat *underneath* it and could not be
+          clicked at all — the drawer was unreachable, which is the same class
+          of "rendered but not usable" bug Phase 7 exists to close. */}
+      <div className="fixed right-4 top-2 z-[60]">
         <button
           type="button"
           aria-label={`Activity feed${unread > 0 ? ` (${unread} new)` : ''}`}
@@ -271,7 +324,7 @@ export function ActivityDrawer() {
 
       {/* Overlay */}
       {open && (
-        <div role="presentation" className="fixed inset-0 z-40 bg-black/10" onClick={handleClose} />
+        <div role="presentation" className="fixed inset-0 z-[70] bg-black/10" onClick={handleClose} />
       )}
 
       {/* Drawer */}
@@ -279,8 +332,12 @@ export function ActivityDrawer() {
         role="dialog"
         aria-label="Activity feed"
         aria-modal={open}
-        className={`fixed right-0 top-0 z-50 flex h-full w-80 flex-col border-l border-gray-200 bg-white shadow-xl transition-transform duration-300 ${
-          open ? 'translate-x-0' : 'translate-x-full'
+        aria-hidden={!open}
+        // A closed drawer is slid off-screen, so it must also be removed from
+        // the accessibility tree and the tab order — otherwise its contents stay
+        // focusable and announced while nobody can see them.
+        className={`fixed right-0 top-0 z-[80] flex h-full w-80 flex-col border-l border-gray-200 bg-white shadow-xl transition-transform duration-300 ${
+          open ? 'translate-x-0' : 'invisible translate-x-full'
         }`}
       >
         <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">

@@ -156,6 +156,87 @@ interface CategoryRowProps {
   onDrop: () => void
   onNameChange: (id: string, name: string) => Promise<void>
   onActionChange: (id: string, action: DefaultAction) => Promise<void>
+  onThresholdChange: (id: string, threshold: number | null) => Promise<void>
+}
+
+/**
+ * Per-category autonomy bar (ui.md screen 17). Blank = inherit the global
+ * slider. A `keep` category never archives automatically at any confidence, so
+ * its input is rendered **disabled with the reason stated** rather than hidden —
+ * inertness the user can see beats inertness they have to infer.
+ */
+function ThresholdInput({
+  category,
+  onThresholdChange,
+}: {
+  category: Category
+  onThresholdChange: (id: string, threshold: number | null) => Promise<void>
+}) {
+  const inert = category.default_action === 'keep' || category.default_action === 'needs_your_call'
+  const [value, setValue] = useState(
+    category.auto_act_threshold == null ? '' : String(category.auto_act_threshold),
+  )
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setValue(category.auto_act_threshold == null ? '' : String(category.auto_act_threshold))
+  }, [category.auto_act_threshold])
+
+  const commit = useCallback(async () => {
+    const trimmed = value.trim()
+    const next = trimmed === '' ? null : Number(trimmed)
+    if (next !== null && (!Number.isFinite(next) || next <= 0 || next > 1)) {
+      setError('0 < value ≤ 1')
+      return
+    }
+    if (next === (category.auto_act_threshold ?? null)) return
+    setSaving(true)
+    setError(null)
+    try {
+      await onThresholdChange(category.id, next)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }, [value, category.auto_act_threshold, category.id, onThresholdChange])
+
+  return (
+    <span className="flex shrink-0 items-center gap-1">
+      <input
+        type="number"
+        min={0.01}
+        max={1}
+        step={0.01}
+        value={inert ? '' : value}
+        disabled={inert || saving}
+        placeholder={inert ? '—' : 'global'}
+        onChange={e => setValue(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={e => {
+          if (e.key === 'Enter') void commit()
+        }}
+        data-testid="category-threshold-input"
+        aria-label={`Auto-act threshold for ${category.name}`}
+        title={
+          inert
+            ? 'kept by default — never archived automatically'
+            : 'Act alone above this confidence. Blank inherits the global bar.'
+        }
+        className="w-16 rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700 disabled:bg-gray-100 disabled:text-gray-400 focus:outline-none focus:ring-1 focus:ring-gray-900"
+      />
+      {inert ? (
+        <span
+          data-testid="category-threshold-inert-note"
+          className="max-w-[9rem] text-[9px] leading-tight text-gray-400"
+        >
+          kept by default — never archived automatically
+        </span>
+      ) : null}
+      {error ? <span className="text-[10px] text-red-600">{error}</span> : null}
+    </span>
+  )
 }
 
 function CategoryRow({
@@ -167,6 +248,7 @@ function CategoryRow({
   onDrop,
   onNameChange,
   onActionChange,
+  onThresholdChange,
 }: CategoryRowProps) {
   const [editing, setEditing] = useState(false)
   const [nameValue, setNameValue] = useState(category.name)
@@ -280,6 +362,9 @@ function CategoryRow({
           <option key={a} value={a}>{ACTION_LABELS[a]}</option>
         ))}
       </select>
+
+      {/* Phase 7 — per-category autonomy bar */}
+      <ThresholdInput category={category} onThresholdChange={onThresholdChange} />
     </li>
   )
 }
@@ -372,6 +457,11 @@ export function TaxonomyEditor() {
     setCategories(prev => prev ? prev.map(c => c.id === id ? updated : c) : prev)
   }, [])
 
+  const handleThresholdChange = useCallback(async (id: string, threshold: number | null) => {
+    const updated = await api.categories.patch(id, { auto_act_threshold: threshold })
+    setCategories(prev => prev ? prev.map(c => c.id === id ? updated : c) : prev)
+  }, [])
+
   const handleAdd = useCallback(async (name: string) => {
     const created = await api.categories.create(name, 'keep')
     setCategories(prev => prev ? [...prev, created] : [created])
@@ -430,7 +520,7 @@ export function TaxonomyEditor() {
       <div className="flex items-center justify-between gap-2">
         <div>
           <h3 className="text-sm font-semibold text-gray-800">Taxonomy editor</h3>
-          <p className="text-[11px] text-gray-500">Click a name to rename · drag ⠿ to reorder · dropdown sets the default action</p>
+          <p className="text-[11px] text-gray-500">Click a name to rename · drag ⠿ to reorder · dropdown sets the default action · the number is the confidence the agent must reach to archive that category on its own (blank = the global bar)</p>
         </div>
         <button
           type="button"
@@ -464,6 +554,7 @@ export function TaxonomyEditor() {
               onDrop={() => void handleDrop()}
               onNameChange={handleNameChange}
               onActionChange={handleActionChange}
+              onThresholdChange={handleThresholdChange}
             />
           ))}
         </ul>

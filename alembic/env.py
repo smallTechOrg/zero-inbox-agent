@@ -16,7 +16,15 @@ from db.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is load-bearing, not cosmetic. The default
+    # (True) permanently sets .disabled on every logger created before this
+    # runs — which, when alembic is invoked IN-PROCESS (the migration tests),
+    # silences every `zero_inbox.*` logger for the rest of the process. That
+    # cost slice 3 four real test failures that only appeared in full-suite
+    # order, and in an app whose whole transparency story is "every log line
+    # reaches the user", a silent global logger kill is the worst possible
+    # default.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

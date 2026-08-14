@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
@@ -40,6 +41,17 @@ __all__ = [
 ]
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
+def _log() -> Any:
+    """Structured logger. Every line here is bridged to the user's SSE feed by
+    ``observability.logging.activity_bus_processor`` — a single LLM call over a
+    whole batch must not be a silent minute in the UI. ``run_id``/``user_id``
+    come from the structlog contextvars the caller bound; without a ``user_id``
+    the bridge drops the event, which is the intended default off-run."""
+    from observability.logging import get_logger
+
+    return get_logger("zero_inbox.llm")
 
 _BATCH_SYSTEM = (
     "You are a precise classification engine. You classify a batch of items in a "
@@ -90,15 +102,37 @@ class LLMClient:
         disable_thinking: bool = False,
     ) -> LLMResult:
         """One completion. Returns text plus token/cost/latency accounting."""
-        return await self._provider.call_model(
-            prompt,
-            system=system,
-            model=model or self._default_model,
-            json_schema=json_schema,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            disable_thinking=disable_thinking,
+        model_id = model or self._default_model
+        log = _log()
+        started = time.perf_counter()
+        log.info("llm.call_started", model=model_id, prompt_chars=len(prompt or ""))
+        try:
+            result = await self._provider.call_model(
+                prompt,
+                system=system,
+                model=model_id,
+                json_schema=json_schema,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                disable_thinking=disable_thinking,
+            )
+        except Exception as exc:
+            log.warning(
+                "llm.call_failed",
+                model=model_id,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                error=type(exc).__name__,
+            )
+            raise
+        log.info(
+            "llm.call_finished",
+            model=result.model,
+            prompt_tokens=result.tokens_in,
+            completion_tokens=result.tokens_out,
+            latency_ms=result.latency_ms
+            or int((time.perf_counter() - started) * 1000),
         )
+        return result
 
     def call_model_sync(self, prompt: str, **kwargs: Any) -> LLMResult:
         """Blocking convenience wrapper for synchronous callers (e.g. sync graph nodes).
@@ -167,14 +201,50 @@ class LLMClient:
                 break
             attempts = attempt
             attempt_prompt = prompt if attempt == 1 else _retry_prompt(prompt, missing, id_field)
-            result = await self._provider.call_model(
-                attempt_prompt,
-                system=system or _BATCH_SYSTEM,
+            log = _log()
+            if attempt > 1:
+                log.info(
+                    "llm.retry",
+                    model=model_id,
+                    attempt=attempt,
+                    missing=len(missing),
+                    error=type(last_error).__name__ if last_error else None,
+                    backoff_ms=0,
+                )
+            started = time.perf_counter()
+            log.info(
+                "llm.call_started",
                 model=model_id,
-                json_schema=_batch_schema(item_schema),
-                disable_thinking=True,
-                temperature=temperature,
-                max_tokens=budget,
+                batch_size=len(missing),
+                attempt=attempt,
+            )
+            try:
+                result = await self._provider.call_model(
+                    attempt_prompt,
+                    system=system or _BATCH_SYSTEM,
+                    model=model_id,
+                    json_schema=_batch_schema(item_schema),
+                    disable_thinking=True,
+                    temperature=temperature,
+                    max_tokens=budget,
+                )
+            except Exception as exc:
+                log.warning(
+                    "llm.call_failed",
+                    model=model_id,
+                    attempt=attempt,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    error=type(exc).__name__,
+                )
+                raise
+            log.info(
+                "llm.call_finished",
+                model=result.model,
+                prompt_tokens=result.tokens_in,
+                completion_tokens=result.tokens_out,
+                attempt=attempt,
+                latency_ms=result.latency_ms
+                or int((time.perf_counter() - started) * 1000),
             )
             tokens_in += result.tokens_in
             tokens_out += result.tokens_out

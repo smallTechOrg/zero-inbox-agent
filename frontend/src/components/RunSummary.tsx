@@ -194,6 +194,27 @@ export function RunSummaryCard({ runId, onViewHistory }: RunSummaryCardProps) {
         </p>
       )}
 
+      {/* Phase 7 — what actually happened in Gmail, not just what was proposed.
+          `applied_count` is the number of decisions that really reached
+          `applied`; `distance_to_zero` is what the agent decided should leave
+          the inbox but is still sitting in it. */}
+      {summary.applied_count != null || summary.distance_to_zero != null ? (
+        <p data-testid="run-summary-applied" className="mb-3 text-xs text-gray-700">
+          <span className="font-semibold">{(summary.applied_count ?? 0).toLocaleString()}</span>{' '}
+          archived in Gmail
+          <span className="text-gray-400"> · </span>
+          distance to zero:{' '}
+          <span
+            data-testid="run-summary-distance"
+            className={`font-semibold ${
+              (summary.distance_to_zero ?? 0) > 0 ? 'text-rose-700' : 'text-emerald-700'
+            }`}
+          >
+            {(summary.distance_to_zero ?? 0).toLocaleString()}
+          </span>
+        </p>
+      ) : null}
+
       {/* Auto-kept low confidence badge */}
       {summary.needs_your_call_count > 0 && (
         <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2">

@@ -141,7 +141,7 @@ Changes to existing routes:
 | Method | Path | Body / Query | Returns |
 |--------|------|--------------|---------|
 | `GET` | `/api/runs/{run_id}/remainder` | — | The remainder ledger — the single honest answer to *"how far from zero am I, and why?"*. Shape below. Computed **live** from `decisions`, never from cached counts. `404` if the run does not exist for the session user. |
-| `POST` | `/api/runs/{run_id}/apply` | — | Re-runs the apply pass for a `completed` run in the background, without re-classifying a single thread. Returns the apply ledger. Idempotent: already-`applied` decisions are counted in `already_applied` and never mutated twice. `409 not_appliable` if the run's status is not `completed`. This is the recovery path for a transient Gmail/auth failure. |
+| `POST` | `/api/runs/{run_id}/apply` | — | Re-runs the apply pass for a `completed` run **in the background**, without re-classifying a single thread. Because the pass is backgrounded, no apply ledger exists synchronously: the response is the **remainder ledger as it stands right now** (the same object `GET /remainder` returns) plus `"queued": bool` — `false` when a pass for this run is already in flight, so a double-click never starts a second pass. The finished result arrives on the SSE bus (`apply_progress`, then `inbox_zero_report` or `run_apply_failed`); the card refetches on those. Idempotent: already-`applied` decisions are never mutated twice. `409 {"error": {"code": "not_appliable"}}` if the run's status is not `completed`. This is the recovery path for a transient Gmail/auth failure. |
 
 `GET /api/runs/{run_id}/remainder` response `data`:
 
@@ -165,6 +165,8 @@ Changes to existing routes:
 }
 ```
 
+`POST /api/runs/{run_id}/apply` response `data` is that **same object plus** `"queued": true|false`.
+
 `inbox_remaining == sum(remainder.*) + distance_to_zero`. `unclassified` counts decisions written
 before Phase 7 (`autonomy_state IS NULL`); it is always reported, never folded into another bucket.
 Bucket definitions are in
@@ -186,12 +188,15 @@ Changes to existing routes:
   updated settings — the measured model ceiling is ~0.94, so anything above 0.90 acts on almost
   nothing. The default for a new user is `0.80`.
 - `GET /api/events` gains the event types:
-  - `apply_progress` — `{run_id, applied, total_to_apply, failed}`, emitted every 25 applied decisions
-    and once at the end of the pass.
-  - `run_apply_failed` — `{run_id, reason, distance_to_zero}`, emitted when the apply pass could not
-    run or did not reach zero.
-  - `inbox_zero_report` — `{run_id, applied, distance_to_zero, remainder}`, emitted once per run at
-    the end, mirroring the `triage.inbox_zero_report` structured log line.
+  - `apply_progress` — `{type, run_id, applied, total_to_apply, failed}`, emitted every 25 applied
+    decisions and once at the end of the pass.
+  - `run_apply_failed` — `{type, run_id, reason, distance_to_zero}`, emitted when the apply pass could
+    not run or did not reach zero.
+  - `inbox_zero_report` — `{type, run_id, applied, distance_to_zero, remainder}` where `remainder` is
+    the same five-key `{bucket: int}` object as above; emitted once per run at the end, mirroring the
+    `triage.inbox_zero_report` structured log line.
+
+  Every event carries its own `type` field in the JSON body as well as in the SSE `event:` line.
 
   - `activity_heartbeat` — `{run_id, phase, detail, batch_n, batch_total, batch_size, model,
     elapsed_s, silent_for_s}`, published by the watchdog whenever **nothing** has been published for

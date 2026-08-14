@@ -13,6 +13,9 @@ import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
 import { RunSummaryCard } from '@/components/RunSummary'
 import { ResumeBanner } from '@/components/ResumeBanner'
+import { InboxZeroCard } from '@/components/InboxZeroCard'
+import { LiveRunFeed } from '@/components/LiveRunFeed'
+import { openActivityDrawer } from '@/components/ActivityDrawer'
 
 /**
  * In flight = not terminal AND not `resumable`.
@@ -255,6 +258,13 @@ export default function Dashboard() {
             <>
               <InboxSummary refreshKey={refreshKey} />
 
+              {/* Phase 7 — how far from zero, and why (ui.md screen 16) */}
+              <InboxZeroCard
+                runId={run?.id ?? null}
+                autoActThreshold={me?.settings.auto_act_threshold ?? null}
+                confidenceFloor={me?.settings.confidence_floor ?? null}
+              />
+
               {run && !RUN_ACTIVE(run.status) ? (
                 <RunSummaryCard
                   runId={run.id}
@@ -286,6 +296,24 @@ export default function Dashboard() {
                   cancelling={cancelling}
                   fetchedSoFar={fetchedSoFar}
                 />
+              ) : null}
+
+              {/* Phase 7 — THE live run feed (ui.md screen 18).
+                  Inline, under the progress bar, above the cluster list, with
+                  no click and no toggle. Phase 6 shipped this same feed into a
+                  drawer that is closed by default, so the user never saw the
+                  run happen. Delivered is not shipped; visible is shipped. */}
+              {run ? (
+              <LiveRunFeed
+                active={RUN_ACTIVE(run.status)}
+                threadCount={run.items_total || fetchedSoFar}
+                onSeeAllActivity={openActivityDrawer}
+                idleSummary={
+                  run.finished_at
+                    ? `Last run: ${(run.counts?.applied ?? run.items_decided ?? 0).toLocaleString()} decisions · ${run.status}`
+                    : null
+                }
+              />
               ) : null}
 
               <section aria-label="Triage history" className="space-y-2">

@@ -18,10 +18,15 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from graph.autonomy import DEFAULT_AUTO_ACT_THRESHOLD
+from observability.events import get_logger
 from tools.rules import DEFAULT_TAXONOMY
 
+log = get_logger("triage")
+
 DEFAULT_CONFIDENCE_FLOOR = 0.75
-DEFAULT_AUTO_ACT_THRESHOLD = 0.95
+#: Re-exported, never redefined: ``graph.autonomy`` is the single source of truth for
+#: the global autonomy bar (spec/capabilities/drive-to-inbox-zero.md Rule B).
 
 
 class SchemaMissing(RuntimeError):
@@ -99,10 +104,19 @@ def load_context(session: Session, user_id: str) -> dict:
                     "name": getattr(row, "name", row.key),
                     "description": getattr(row, "description", "") or "",
                     "default_action": getattr(row, "default_action", "keep"),
+                    # Phase 7 autonomy policy (nullable = inherit the global bar).
+                    # `graph.autonomy.effective_threshold` reads this key.
+                    "auto_act_threshold": (
+                        float(getattr(row, "auto_act_threshold", None))
+                        if getattr(row, "auto_act_threshold", None) is not None
+                        else None
+                    ),
                 }
             )
     if not categories:
-        categories = [dict(c) for c in DEFAULT_TAXONOMY]
+        categories = [
+            {"auto_act_threshold": None, **dict(c)} for c in DEFAULT_TAXONOMY
+        ]
 
     rules: list[dict] = []
     rule_cls = model_for("rules")
@@ -326,16 +340,25 @@ def already_decided_item_ids(session: Session, run_id: str) -> set[str]:
     graph state's ``item["id"]`` is the channel's thread id on first ingest but the
     persisted row id afterwards. ``fetch_items`` filters on either, so a resumed run
     never re-classifies a thread it already decided.
+
+    Phase 7, Rule F1: a row that is ``decided_by="error"`` or
+    ``review_state="review_failed"`` was **never really decided** — the tier could not
+    reach a verdict, or the never-miss reviewer could not audit it. Those threads are
+    deliberately NOT reported as decided, so a resume picks them back up and the error
+    tail converges instead of being abandoned (run ``fbeed060`` left 179 of them).
+    ``insert_provisional_decisions`` overwrites the stale row in place when the
+    re-classification lands — F1 without F2 would silently discard the new answer.
     """
     decision_cls = model_for("decisions")
     item_cls = model_for("items")
     if decision_cls is None:
         return set()
-    decided = set(
-        session.execute(
-            select(decision_cls.item_id).where(decision_cls.run_id == run_id)
-        ).scalars()
-    )
+    stmt = select(decision_cls.item_id).where(decision_cls.run_id == run_id)
+    if hasattr(decision_cls, "decided_by"):
+        stmt = stmt.where(decision_cls.decided_by != "error")
+    if hasattr(decision_cls, "review_state"):
+        stmt = stmt.where(decision_cls.review_state != "review_failed")
+    decided = set(session.execute(stmt).scalars())
     if not decided or item_cls is None:
         return {d for d in decided if d}
     externals = set(
@@ -471,7 +494,16 @@ def insert_provisional_decisions(
 
     Durable, not final. Skips any ``(run_id, item_id)`` that already exists — the
     UniqueConstraint is the idempotency guard, so a re-decided thread is never
-    inserted twice and never double-counted. Returns the number of rows written.
+    inserted twice and never double-counted. Returns the number of rows **inserted**.
+
+    Phase 7, Rule F2: the one exception is an existing row with
+    ``decided_by == "error"`` — a thread the interrupted leg could not decide.
+    ``already_decided_item_ids`` (F1) deliberately re-queues those threads, so the
+    re-classification MUST be written onto the stale row instead of being dropped by
+    the skip above; F1 without F2 silently discards the new answer and the tail never
+    converges. An overwrite is NOT counted in the return value — the row was already
+    counted in ``triage_runs.items_decided`` when it was first inserted, and counting
+    it again would double-count the run's progress.
     """
     if not decisions:
         return 0
@@ -487,13 +519,38 @@ def insert_provisional_decisions(
 
     decision_cls = require_model("decisions")
     existing = {
-        row.item_id for row in _rows(session, decision_cls, run_id=run_id)
+        row.item_id: row for row in _rows(session, decision_cls, run_id=run_id)
     }
 
     written = 0
+    overwritten = 0
     for decision in decisions:
         db_item_id = id_map.get(decision["item_id"])
-        if db_item_id is None or db_item_id in existing:
+        if db_item_id is None:
+            continue
+        stale = existing.get(db_item_id)
+        if stale is not None:
+            # Rule F2 — only an unresolved `error` row may be overwritten in place.
+            if getattr(stale, "decided_by", None) != "error":
+                continue
+            _assign(
+                stale,
+                decision_cls,
+                {
+                    "category_id": category_ids.get(decision.get("category") or ""),
+                    "proposed_action": decision["proposed_action"],
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reasoning": decision.get("reasoning") or "",
+                    "decided_by": decision.get("decided_by") or "llm",
+                    "rule_id": decision.get("rule_id"),
+                    "time_sensitive": bool(decision.get("time_sensitive")),
+                    "status": decision.get("status", "proposed"),
+                    # Back to provisional: the new verdict has not been reviewed yet,
+                    # so it must go through the never-miss gate like any other.
+                    "review_state": "provisional",
+                },
+            )
+            overwritten += 1
             continue
         row = _new(
             decision_cls,
@@ -513,7 +570,7 @@ def insert_provisional_decisions(
             },
         )
         session.add(row)
-        existing.add(db_item_id)
+        existing[db_item_id] = row
         written += 1
 
     for call in llm_calls or []:
@@ -538,6 +595,13 @@ def insert_provisional_decisions(
         )
 
     session.flush()
+    if overwritten:
+        log.info(
+            "triage.error_rows_reclassified",
+            run_id=run_id,
+            overwritten=overwritten,
+            inserted=written,
+        )
     return written
 
 
@@ -647,6 +711,16 @@ def finalise_review(
             row.review_state = "reviewed"
             reviewed += 1
     session.flush()
+    # Rule I2 granularity: the never-miss reviewer's verdict is durable at exactly
+    # this point. Logged (never hand-emitted) so `activity_bus_processor` bridges it
+    # to the user's live feed — `user_id` comes from the run's bound contextvars.
+    log.info(
+        "triage.reviewer_finished",
+        run_id=run_id,
+        reviewed=reviewed,
+        review_failed=failed,
+        flipped=len(flipped),
+    )
     return {"reviewed": reviewed, "review_failed": failed, "flipped": flipped}
 
 
@@ -732,6 +806,14 @@ def persist_run_results(
                     "status": decision.get("status", "proposed"),
                 },
             )
+            # Phase 7: why the agent did (or did not) act on its own. Written for
+            # every row that carries one — never blanked back to NULL, because a NULL
+            # is reported as `unclassified` by the remainder ledger rather than being
+            # folded into a healthy bucket.
+            if decision.get("autonomy_state"):
+                _assign(
+                    row, decision_cls, {"autonomy_state": decision["autonomy_state"]}
+                )
             if decision.get("review_state"):
                 row.review_state = decision["review_state"]
             continue
@@ -751,6 +833,7 @@ def persist_run_results(
                 "time_sensitive": bool(decision.get("time_sensitive")),
                 "status": decision.get("status", "proposed"),
                 "review_state": decision.get("review_state") or "provisional",
+                "autonomy_state": decision.get("autonomy_state"),
             },
         )
         session.add(row)

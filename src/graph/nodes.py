@@ -556,6 +556,13 @@ def fetch_items(state: TriageState) -> dict:
                 after_dt = after_dt.replace(tzinfo=timezone.utc)
 
         def _on_fetch_page(page_num: int, fetched_so_far: int) -> None:
+            # Rule I2: a full-inbox fetch is minutes of otherwise silent work.
+            log.info(
+                "triage.page_fetched",
+                run_id=run_id,
+                page=page_num,
+                fetched_so_far=fetched_so_far,
+            )
             try:
                 from events import bus as _bus
                 _bus.emit(user_id, {
@@ -762,6 +769,42 @@ def _harvest_sender_stats(adapter, user_id: str) -> dict[str, dict]:
     return stats
 
 
+# ------------------------------------------- Rule I2: not one beat without a log
+#
+# These lines exist so the live feed never goes quiet. They are LOGGED, never
+# hand-emitted: `observability.logging.activity_bus_processor` bridges every
+# structlog line carrying a bound `user_id` onto the user's SSE stream, so a new
+# log line can never drift out of feed coverage the way a hand-placed
+# `bus.emit(...)` call site did (Gmail 429s and LLM retries were invisible for two
+# phases). `run_id`/`user_id` are bound once per run in `graph.runner`.
+
+
+def _tier_started(state: TriageState, *, tier: int, name: str, **fields) -> None:
+    log.info("triage.tier_started", run_id=state.get("run_id"), tier=tier, tier_name=name, **fields)
+
+
+def _tier_finished(state: TriageState, *, tier: int, name: str, **fields) -> None:
+    log.info("triage.tier_finished", run_id=state.get("run_id"), tier=tier, tier_name=name, **fields)
+
+
+def _batch_position(state: TriageState, batch: list[dict]) -> tuple[int, int]:
+    """``(batch_n, batch_total)`` for one tier-3 batch — 1-based, for the feed header.
+
+    Tier 3 fans out, so a batch has no intrinsic index; it is located by its first
+    thread inside ``state["batches"]``. Unknown position degrades to ``(0, total)``
+    rather than raising: a log line must never be able to fail a run.
+    """
+    batches = state.get("batches") or []
+    total = len(batches)
+    if not batch or not batches:
+        return 0, total
+    head = batch[0].get("id")
+    for index, candidate in enumerate(batches, start=1):
+        if candidate and candidate[0].get("id") == head:
+            return index, total
+    return 0, total
+
+
 def redact_items(state: TriageState) -> dict:
     """The single egress chokepoint — nothing reaches an LLM unredacted."""
     items = _redact_all(list(state.get("items") or []))
@@ -769,6 +812,7 @@ def redact_items(state: TriageState) -> dict:
 
 
 def apply_deterministic_rules(state: TriageState) -> dict:
+    _tier_started(state, tier=1, name="deterministic_rules", queued=len(state.get("items") or []))
     decisions, unresolved = rules_tool.apply_rules(
         state.get("items") or [], state.get("rules") or []
     )
@@ -776,6 +820,8 @@ def apply_deterministic_rules(state: TriageState) -> dict:
         "triage.tier1", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
+    _tier_finished(state, tier=1, name="deterministic_rules", resolved=len(decisions),
+                   remaining=len(unresolved))
     # Durable the instant the tier decides: the rows land provisional and the
     # per-thread event is emitted from the same checkpoint.
     checkpoint.record_batch(state, decisions, tier="rule")
@@ -783,6 +829,7 @@ def apply_deterministic_rules(state: TriageState) -> dict:
 
 
 def apply_sender_history(state: TriageState) -> dict:
+    _tier_started(state, tier=2, name="sender_history", queued=len(state.get("llm_queue") or []))
     decisions, unresolved = rules_tool.apply_sender_history(
         state.get("llm_queue") or [], state.get("sender_stats") or {}
     )
@@ -790,6 +837,8 @@ def apply_sender_history(state: TriageState) -> dict:
         "triage.tier2", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
+    _tier_finished(state, tier=2, name="sender_history", resolved=len(decisions),
+                   remaining=len(unresolved))
     checkpoint.record_batch(state, decisions, tier="sender_history")
     return {"resolved": decisions, "llm_queue": unresolved}
 
@@ -840,7 +889,22 @@ def llm_classify_batch(state: TriageState) -> dict:
     last_error = "unknown error"
     failed_calls: list[dict] = []
     circuit_open = _circuit_open_error()
+    batch_n, batch_total = _batch_position(state, batch)
+    _tier_started(
+        state, tier=3, name="llm_classify", batch_n=batch_n, batch_total=batch_total,
+        batch_size=len(batch),
+    )
     for model in _model_candidates(state) or [None]:
+        # Logged BEFORE the call, not after: a 60s tier-3 batch is exactly the dead-air
+        # window that made a working run look hung.
+        log.info(
+            "triage.batch_dispatched",
+            run_id=run_id,
+            batch_n=batch_n,
+            batch_total=batch_total,
+            batch_size=len(batch),
+            model=model,
+        )
         try:
             result = _run_async(
                 get_llm_client().classify_batch(
@@ -851,6 +915,15 @@ def llm_classify_batch(state: TriageState) -> dict:
                     model=model,
                     max_attempts=2,
                 )
+            )
+            log.info(
+                "triage.batch_returned",
+                run_id=run_id,
+                batch_n=batch_n,
+                batch_total=batch_total,
+                batch_size=len(batch),
+                model=model,
+                verdicts=len(result.results),
             )
             break
         except circuit_open as exc:
@@ -886,6 +959,10 @@ def llm_classify_batch(state: TriageState) -> dict:
         log.error("triage.tier3_failed", run_id=state.get("run_id"), error=last_error)
         degraded = _degraded(batch, last_error)
         checkpoint.record_batch(state, degraded, tier="error", llm_calls=failed_calls, items=batch)
+        _tier_finished(
+            state, tier=3, name="llm_classify", batch_n=batch_n,
+            batch_total=batch_total, decided=0, failed=len(batch),
+        )
         return {
             "llm_decisions": degraded,
             "deep_queue": [],
@@ -935,6 +1012,10 @@ def llm_classify_batch(state: TriageState) -> dict:
         invalid=len(result.invalid),
         unsure=len(deep),
     )
+    _tier_finished(
+        state, tier=3, name="llm_classify", batch_n=batch_n, batch_total=batch_total,
+        decided=len(decisions), unsure=len(deep),
+    )
     return {"llm_decisions": decisions, "deep_queue": deep, "llm_calls": calls}
 
 
@@ -957,6 +1038,7 @@ def deep_read_escalation(state: TriageState) -> dict:
     circuit_open = _circuit_open_error()
     sender_stats = state.get("sender_stats") or {}
 
+    _tier_started(state, tier=4, name="deep_read", queued=len(queue))
     decisions: list[dict] = []
     calls: list[dict] = []
     for item in queue:
@@ -1024,6 +1106,7 @@ def deep_read_escalation(state: TriageState) -> dict:
                 )
 
     log.info("triage.tier4", run_id=state.get("run_id"), deep_reads=len(decisions))
+    _tier_finished(state, tier=4, name="deep_read", deep_reads=len(decisions))
     return {"llm_decisions": decisions, "llm_calls": calls}
 
 
@@ -1098,6 +1181,21 @@ def cluster_decisions(state: TriageState) -> dict:
         log.info(
             "triage.clustered", run_id=state.get("run_id"), decisions=len(decisions),
             clusters=len(clusters),
+        )
+        # Rule I2. `cluster_decisions` is the node immediately before the never-miss
+        # chain (align_to_category_default -> second_pass_reviewer), which lives in
+        # `graph/nodes_review.py` — a file this slice does not own. The matching
+        # `triage.reviewer_finished` is logged by `graph.persistence.finalise_review`.
+        log.info(
+            "triage.reviewer_started",
+            run_id=state.get("run_id"),
+            to_review=sum(
+                1
+                for d in decisions
+                if d.get("proposed_action") == "archive"
+                and d.get("status") != "needs_your_call"
+            ),
+            decisions=len(decisions),
         )
         return {
             "decisions": decisions,
@@ -1344,107 +1442,326 @@ def _build_mutator_for_user(user_id: str, channel_account_id: str, session):
     return GmailMutator(service), GmailLabelManager(service)
 
 
-def _auto_apply_decisions(state: TriageState, counts: dict) -> None:
-    """Apply all non-keep, non-needs_your_call decisions for this run.
+#: An ``apply_progress`` event every N applied decisions (plus one at the end), so a
+#: long apply pass is visibly moving rather than a frozen bar (Rule D8).
+APPLY_PROGRESS_EVERY = 25
 
-    Called from ``finalize`` when dry_run is off. Each decision is applied
-    independently — one failure never blocks the others.
+#: A decision in one of these states has already left the appliable set for good.
+_TERMINAL_STATUSES = ("applied", "undone", "rejected")
+
+
+def _empty_apply_ledger(dry_run: bool) -> dict:
+    """The ledger shape pinned in spec/roadmap.md. Always returned, never omitted."""
+    return {
+        "applied": 0,
+        "already_applied": 0,
+        "not_reviewed": 0,
+        "kept": 0,
+        "needs_your_call": 0,
+        "below_threshold": 0,
+        "failed": 0,
+        "failures": [],
+        "distance_to_zero": 0,
+        "apply_failed_reason": None,
+        "dry_run": bool(dry_run),
+    }
+
+
+def _apply_session():
+    """The session used by the apply pass — a seam so the outer-failure path is testable."""
+    from db.session import create_db_session
+
+    return create_db_session()
+
+
+def distance_to_zero(run_id: str, user_id: str) -> int:
+    """Decisions the agent itself decided should leave the inbox and that are still in it.
+
+    ``count(decisions WHERE run_id = :id AND autonomy_state = 'auto_act'
+    AND status != 'applied')``. On a healthy completed run this is 0. Best-effort:
+    it is read in failure paths, so it never raises.
     """
-    run_id = state.get("run_id")
-    user_id = state["user_id"]
-    channel_account_id = state.get("channel_account_id") or ""
-
-    applied = 0
-    kept = 0
-    auto_kept_low_confidence = 0
-    errors: list[str] = []
-
     try:
-        from db.session import create_db_session
-        from db.models import Decision as DecisionModel
-        from sqlalchemy import select as sa_select
-        from tools.actions import apply_decision, ActionsError, NeedsYourCallError, NotApprovedError
-        from channels.base import ChannelError, DryRunViolation
+        from sqlalchemy import func, select as sa_select
 
+        from db.session import create_db_session
+        from graph.persistence import model_for
+
+        decision_cls = model_for("decisions")
+        if decision_cls is None or not hasattr(decision_cls, "autonomy_state"):
+            return 0
         with create_db_session() as session:
+            return int(
+                session.execute(
+                    sa_select(func.count(decision_cls.id)).where(
+                        decision_cls.run_id == run_id,
+                        decision_cls.user_id == user_id,
+                        decision_cls.autonomy_state == "auto_act",
+                        decision_cls.status != "applied",
+                    )
+                ).scalar_one()
+                or 0
+            )
+    except Exception as exc:  # pragma: no cover - never fail a run over a count
+        log.warning("triage.distance_to_zero_failed", run_id=run_id, error=str(exc))
+        return 0
+
+
+def _emit_apply_progress(user_id: str, **payload) -> None:
+    """Slice 3 owns the typed helper; import defensively and never raise."""
+    try:
+        from events.bus import emit_apply_progress
+    except (ImportError, AttributeError):  # pragma: no cover - slice 3 not landed
+        return
+    try:
+        emit_apply_progress(user_id, **payload)
+    except Exception:  # pragma: no cover - the bus must never fail an apply
+        pass
+
+
+def apply_run_decisions(
+    *, run_id: str, user_id: str, channel_account_id: str, dry_run: bool
+) -> dict:
+    """Apply every decision this run is allowed to act on, and always report a ledger.
+
+    Rule D of spec/capabilities/drive-to-inbox-zero.md. A decision is applied only when
+    ALL of these hold:
+
+    * ``review_state == "reviewed"`` — the Phase 6 never-miss gate, which
+      ``tools.actions.apply_decision`` re-checks first and which is **never** bypassed;
+    * ``autonomy_state == "auto_act"`` — the per-category autonomy policy said so;
+    * ``proposed_action in ("archive", "digest")``;
+    * ``status not in ("needs_your_call", "applied", "undone", "rejected")``.
+
+    ``force=True`` is NEVER passed: a ``keep`` is resolved at decision time by
+    ``align_to_category_default``, never force-archived here (Rule D2). ``review_state``
+    is NEVER written by this function — only the never-miss chain may set it (Rule D3).
+
+    **It never returns early without a ledger and never raises** (Rule D6). The two
+    paths that used to `return` silently — a failure building the Gmail mutator and the
+    outer ``except`` — now record ``apply_failed_reason``, which ``finalize`` turns into
+    ``triage_runs.error_message``, a ``run_apply_failed`` event and ``apply_ok=false``.
+    """
+    ledger = _empty_apply_ledger(dry_run)
+    try:
+        _apply_pass(
+            ledger,
+            run_id=run_id,
+            user_id=user_id,
+            channel_account_id=channel_account_id,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        # The outer path. This used to `return` silently too.
+        ledger["apply_failed_reason"] = f"{type(exc).__name__}: {exc}"
+        log.error("triage.auto_apply_outer_failed", run_id=run_id, error=str(exc))
+
+    # Re-read from the database rather than trusting the loop's arithmetic: this is
+    # the number the gate asserts and the UI renders, and on every path — including
+    # every failure path — it must be the true remaining count. The tail after an
+    # early `return` inside the pass is exactly what used to be skipped.
+    measured = distance_to_zero(run_id, user_id)
+    if measured or not ledger["apply_failed_reason"]:
+        ledger["distance_to_zero"] = measured
+    return ledger
+
+
+def _apply_pass(
+    ledger: dict, *, run_id: str, user_id: str, channel_account_id: str, dry_run: bool
+) -> None:
+    """The apply pass itself. Fills ``ledger`` in place; may raise (the caller records)."""
+    from channels.base import ChannelError, DryRunViolation
+    from sqlalchemy import select as sa_select
+
+    from graph.persistence import model_for
+    # Imported as a module, not as a name, so the call site is a single
+    # observable seam (`tools.actions.apply_decision`) that the gate spies on to
+    # assert `force=False` on every call.
+    from tools import actions as actions_module
+    from tools.actions import ActionsError
+
+    decision_cls = model_for("decisions")
+    if decision_cls is None:  # pragma: no cover - schema always present
+        ledger["apply_failed_reason"] = "SchemaMissing: no `decisions` table"
+        return
+
+    with _apply_session() as session:
+        rows = list(
+            session.execute(
+                sa_select(decision_cls).where(
+                    decision_cls.run_id == run_id,
+                    decision_cls.user_id == user_id,
+                )
+            ).scalars()
+        )
+
+        eligible = []
+        for row in rows:
+            status = getattr(row, "status", "proposed")
+            if status == "applied":
+                ledger["already_applied"] += 1
+                continue
+            if status == "needs_your_call":
+                ledger["needs_your_call"] += 1
+                continue
+            if status in _TERMINAL_STATUSES:
+                ledger["kept"] += 1
+                continue
+            if getattr(row, "proposed_action", "keep") not in ("archive", "digest"):
+                ledger["kept"] += 1
+                continue
+            if getattr(row, "review_state", "reviewed") != "reviewed":
+                # The Phase 6 gate. Counted, left completely alone — this function
+                # never upgrades review_state to get past it.
+                ledger["not_reviewed"] += 1
+                continue
+            autonomy_state = getattr(row, "autonomy_state", None)
+            if autonomy_state != "auto_act":
+                # `below_threshold` is its own bucket; everything else (including a
+                # NULL/unclassified row) stays in the inbox and is counted as kept.
+                if autonomy_state == "below_threshold":
+                    ledger["below_threshold"] += 1
+                else:
+                    ledger["kept"] += 1
+                continue
+            eligible.append(row)
+
+        ledger["distance_to_zero"] = len(eligible)
+
+        if dry_run:
+            # Rule D4 — absolute. Zero mutations, zero Gmail credentials built.
+            log.info(
+                "triage.apply_skipped_dry_run",
+                run_id=run_id,
+                would_apply=len(eligible),
+            )
+            return
+
+        if not eligible:
+            return
+
+        try:
+            mutator, label_lookup = _build_mutator_for_user(
+                user_id, channel_account_id, session
+            )
+        except Exception as exc:
+            # Silent-abort path 1 of 2 on run `fbeed060`: this used to log and
+            # `return` with no ledger, so a run that applied nothing reported
+            # itself `completed`.
+            #
+            # MEASURED (tests/integration/test_apply_diagnosis.py, run read-only
+            # against the very account of `fbeed060` — connection
+            # 3ef143f1 / user 6b4ab0f4): the stored refresh token decrypts and
+            # `_build_mutator_for_user` + `labels().list()` SUCCEED today. So this
+            # path is EXCLUDED as the cause of that run. The remaining candidates
+            # (the outer `except`, or a Gmail failure on every one of the 615
+            # archives) are indistinguishable from the persisted state — because
+            # the old code recorded nothing about either. That un-diagnosability
+            # IS the defect: from here on, every path names itself in
+            # `apply_failed_reason` / `failures[]` / `triage_runs.error_message`.
+            ledger["apply_failed_reason"] = f"{type(exc).__name__}: {exc}"
+            log.error(
+                "triage.auto_apply_build_mutator_failed",
+                run_id=run_id,
+                error=str(exc),
+            )
+            return
+
+        total = len(eligible)
+        for index, row in enumerate(eligible, start=1):
+            decision_id = row.id
             try:
-                mutator, label_lookup = _build_mutator_for_user(user_id, channel_account_id, session)
-            except Exception as exc:
-                log.error(
-                    "triage.auto_apply_build_mutator_failed",
+                # `approved` is the apply-eligibility status; review_state is
+                # untouched, so the never-miss gate still binds inside
+                # apply_decision and an un-reviewed row can never slip through.
+                row.status = "approved"
+                session.flush()
+                actions_module.apply_decision(
+                    session,
+                    user_id,
+                    decision_id,
+                    mutator=mutator,
+                    label_lookup=label_lookup,
+                    dry_run=False,
+                    force=False,  # Rule D2 — never a side door around a `keep`.
+                )
+                session.commit()
+                ledger["applied"] += 1
+            except (ActionsError, ChannelError, DryRunViolation) as exc:
+                # ActionsError covers NeedsYourCall / NotApproved / NotArchivable /
+                # NotReviewed — every business-rule refusal, none of them bypassed.
+                session.rollback()
+                ledger["failed"] += 1
+                ledger["failures"].append(
+                    {"decision_id": str(decision_id), "error": f"{type(exc).__name__}: {exc}"}
+                )
+                log.warning(
+                    "triage.auto_apply_decision_failed",
                     run_id=run_id,
+                    decision_id=str(decision_id),
                     error=str(exc),
                 )
-                return
+            except Exception as exc:
+                # Rule D7 — one thread's failure never blocks the rest.
+                session.rollback()
+                ledger["failed"] += 1
+                ledger["failures"].append(
+                    {"decision_id": str(decision_id), "error": f"{type(exc).__name__}: {exc}"}
+                )
+                log.warning(
+                    "triage.auto_apply_unexpected_error",
+                    run_id=run_id,
+                    decision_id=str(decision_id),
+                    error=str(exc),
+                )
+            if index % APPLY_PROGRESS_EVERY == 0 or index == total:
+                log.info(
+                    "triage.apply_progress",
+                    run_id=run_id,
+                    applied=ledger["applied"],
+                    total_to_apply=total,
+                    failed=ledger["failed"],
+                )
+                _emit_apply_progress(
+                    user_id,
+                    run_id=run_id,
+                    applied=ledger["applied"],
+                    total_to_apply=total,
+                    failed=ledger["failed"],
+                )
 
-            decisions = list(
-                session.execute(
-                    sa_select(DecisionModel).where(
-                        DecisionModel.run_id == run_id,
-                        DecisionModel.user_id == user_id,
-                    )
-                ).scalars()
-            )
 
-            for decision in decisions:
-                if decision.status == "needs_your_call":
-                    auto_kept_low_confidence += 1
-                    continue
-                if decision.proposed_action not in ("archive", "digest"):
-                    kept += 1
-                    continue
-                # Mark approved so apply_decision accepts it.
-                decision.status = "approved"
-                session.flush()
-                try:
-                    apply_decision(
-                        session,
-                        user_id,
-                        decision.id,
-                        mutator=mutator,
-                        label_lookup=label_lookup,
-                        dry_run=False,
-                    )
-                    session.commit()
-                    applied += 1
-                except (ActionsError, NeedsYourCallError, NotApprovedError) as exc:
-                    session.rollback()
-                    errors.append(str(exc))
-                    log.warning(
-                        "triage.auto_apply_decision_failed",
-                        run_id=run_id,
-                        decision_id=decision.id,
-                        error=str(exc),
-                    )
-                except (ChannelError, DryRunViolation) as exc:
-                    session.rollback()
-                    errors.append(str(exc))
-                    log.warning(
-                        "triage.auto_apply_gmail_failed",
-                        run_id=run_id,
-                        decision_id=decision.id,
-                        error=str(exc),
-                    )
-                except Exception as exc:
-                    session.rollback()
-                    errors.append(str(exc))
-                    log.warning(
-                        "triage.auto_apply_unexpected_error",
-                        run_id=run_id,
-                        decision_id=decision.id,
-                        error=str(exc),
-                    )
-    except Exception as exc:
-        log.error("triage.auto_apply_outer_failed", run_id=run_id, error=str(exc))
-        return
+
+def _auto_apply_decisions(state: TriageState, counts: dict) -> dict:
+    """Thin wrapper over :func:`apply_run_decisions` for the graph's ``finalize``.
+
+    Keeps the ``triage.auto_apply_complete`` log line and the ``auto_apply_complete``
+    SSE event (extended with the full ledger) so no existing subscriber breaks.
+    """
+    run_id = state.get("run_id") or ""
+    user_id = state["user_id"]
+    ledger = apply_run_decisions(
+        run_id=run_id,
+        user_id=user_id,
+        channel_account_id=state.get("channel_account_id") or "",
+        dry_run=bool(state.get("dry_run", True)),
+    )
+    counts["apply"] = ledger
 
     log.info(
         "triage.auto_apply_complete",
         run_id=run_id,
-        applied=applied,
-        kept=kept,
-        auto_kept_low_confidence=auto_kept_low_confidence,
-        errors=len(errors),
+        applied=ledger["applied"],
+        kept=ledger["kept"],
+        # Retained key name: existing subscribers read it.
+        auto_kept_low_confidence=ledger["needs_your_call"],
+        not_reviewed=ledger["not_reviewed"],
+        below_threshold=ledger["below_threshold"],
+        already_applied=ledger["already_applied"],
+        errors=ledger["failed"],
+        distance_to_zero=ledger["distance_to_zero"],
+        apply_failed_reason=ledger["apply_failed_reason"],
+        dry_run=ledger["dry_run"],
     )
 
     try:
@@ -1457,18 +1774,66 @@ def _auto_apply_decisions(state: TriageState, counts: dict) -> None:
                 "type": "auto_apply_complete",
                 "ts": time.time(),
                 "run_id": run_id,
-                "applied": applied,
-                "kept": kept,
-                "auto_kept_low_confidence": auto_kept_low_confidence,
+                "applied": ledger["applied"],
+                "kept": ledger["kept"],
+                "auto_kept_low_confidence": ledger["needs_your_call"],
+                "ledger": {k: v for k, v in ledger.items() if k != "failures"},
             },
         )
     except Exception:  # pragma: no cover - event bus must never fail
         pass
 
+    return ledger
+
+
+def _remainder_ledger(run_id: str, user_id: str) -> dict | None:
+    """Slice 3 owns ``graph.remainder``; import defensively and never raise."""
+    try:
+        from graph.remainder import remainder_ledger
+    except (ImportError, AttributeError):  # pragma: no cover - slice 3 not landed
+        return None
+    try:
+        from db.session import create_db_session
+
+        with create_db_session() as session:
+            return remainder_ledger(session, run_id=run_id, user_id=user_id)
+    except Exception as exc:  # pragma: no cover - a report must never fail a run
+        log.warning("triage.remainder_ledger_failed", run_id=run_id, error=str(exc))
+        return None
+
+
+def _persist_counts(run_id: str, counts: dict) -> None:
+    """Write ``counts`` onto the run row. Never raises — a report never fails a run."""
+    try:
+        from db.session import create_db_session
+        from graph.persistence import update_run
+
+        with create_db_session() as session:
+            update_run(session, run_id=run_id, counts=counts)
+    except Exception as exc:  # pragma: no cover
+        log.warning("triage.apply_counts_persist_failed", run_id=run_id, error=str(exc))
+
+
+def _apply_failure_sentence(ledger: dict) -> str:
+    """The human-readable line written to ``triage_runs.error_message`` (Rule D6)."""
+    remaining = ledger["distance_to_zero"]
+    if ledger["apply_failed_reason"]:
+        return (
+            f"Archiving failed and {remaining} thread(s) the agent had decided to "
+            f"archive are still in your inbox: {ledger['apply_failed_reason']}. "
+            "Nothing was left half-applied — use Retry archiving to try again."
+        )
+    return (
+        f"{remaining} thread(s) the agent had decided to archive are still in your "
+        f"inbox ({ledger['failed']} failed on Gmail). Use Retry archiving to try again."
+    )
+
 
 def finalize(state: TriageState) -> dict:
     counts = state.get("counts") or _counts(state.get("decisions") or [])
     cost = state.get("cost") or _cost(state)
+    run_id = state.get("run_id") or ""
+    user_id = state["user_id"]
     try:
         from db.session import create_db_session
         from graph.persistence import update_run
@@ -1491,11 +1856,79 @@ def finalize(state: TriageState) -> dict:
         log.info("triage.finished_cancelled", run_id=state.get("run_id"))
         return {"status": "cancelled", "counts": counts, "cost": cost}
 
-    # Auto-apply: apply all archive/digest decisions that are not needs_your_call.
-    # Skip when dry_run is on; each apply is wrapped individually so one failure
-    # never blocks the rest.
-    if not state.get("dry_run", True):
-        _auto_apply_decisions(state, counts)
+    # Apply. Always called — `dry_run` is enforced INSIDE apply_run_decisions so the
+    # ledger exists either way, and a run that applied nothing can never again be
+    # rendered as a clean success (Rule D6).
+    ledger = _auto_apply_decisions(state, counts)
+    # The apply ledger MUST be on the run row before the remainder is computed:
+    # `remainder_ledger` re-reads `run.counts["apply"]` from the DB to source
+    # `apply_failed_reason`/`apply_ok`. Persisting it afterwards produced a snapshot
+    # that always read `apply_ok: true` even when the apply pass genuinely failed —
+    # exactly the false-clean this phase exists to eliminate.
+    _persist_counts(run_id, counts)
+    remainder = _remainder_ledger(run_id, user_id)
+    if remainder is not None:
+        counts["remainder"] = remainder
+
+    apply_failed = bool(ledger["apply_failed_reason"]) or ledger["distance_to_zero"] > 0
+    # Rule D4: a dry run archives nothing by design — that is not a failure.
+    if apply_failed and not ledger["dry_run"]:
+        message = _apply_failure_sentence(ledger)
+        log.error(
+            "triage.run_apply_failed",
+            run_id=run_id,
+            reason=ledger["apply_failed_reason"] or "not_all_applied",
+            distance_to_zero=ledger["distance_to_zero"],
+            failed=ledger["failed"],
+        )
+        try:
+            from db.session import create_db_session
+            from graph.persistence import update_run
+
+            with create_db_session() as session:
+                update_run(session, run_id=run_id, error=message)
+        except Exception as exc:  # pragma: no cover
+            log.warning("triage.apply_error_message_failed", run_id=run_id, error=str(exc))
+        try:
+            from events.bus import emit_run_apply_failed
+
+            emit_run_apply_failed(
+                user_id,
+                run_id=run_id,
+                reason=ledger["apply_failed_reason"] or "not_all_applied",
+                distance_to_zero=ledger["distance_to_zero"],
+            )
+        except (ImportError, AttributeError):  # pragma: no cover - slice 3 not landed
+            pass
+        except Exception:  # pragma: no cover - the bus never fails a run
+            pass
+
+    # Rule E4 — the report is always produced, healthy or not.
+    log.info(
+        "triage.inbox_zero_report",
+        run_id=run_id,
+        applied=ledger["applied"],
+        distance_to_zero=ledger["distance_to_zero"],
+        remainder=(remainder or {}).get("remainder"),
+        apply_ok=not apply_failed,
+    )
+    try:
+        from events.bus import emit_inbox_zero_report
+
+        emit_inbox_zero_report(
+            user_id,
+            run_id=run_id,
+            applied=ledger["applied"],
+            distance_to_zero=ledger["distance_to_zero"],
+            remainder=(remainder or {}).get("remainder") or {},
+        )
+    except (ImportError, AttributeError):  # pragma: no cover - slice 3 not landed
+        pass
+    except Exception:  # pragma: no cover
+        pass
+
+    # Persist the remainder ledger onto the run row (apply was persisted above).
+    _persist_counts(run_id, counts)
 
     log.info(
         "triage.completed",

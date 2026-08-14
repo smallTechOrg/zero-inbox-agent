@@ -17,11 +17,14 @@
 
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import type {
+  ActivityHeartbeatEvent,
+  FeedErrorEvent,
   ModelFallbackEvent,
   ProviderDegradedEvent,
   RunResumableEvent,
   SseEvent,
   SseEventType,
+  ThreadArchivedEvent,
   ThreadClassifiedEvent,
 } from '@/lib/types'
 import { sseLive } from '@/lib/sseLive'
@@ -39,17 +42,32 @@ export const SSE_EVENT_TYPES: SseEventType[] = [
   'provider_degraded',
   'run_resumable',
   'model_fallback',
+  'apply_progress',
+  'run_apply_failed',
+  'inbox_zero_report',
+  'activity_heartbeat',
   'error',
   'heartbeat',
+  'log',
 ]
 
-const MAX_EVENTS = 200
+/**
+ * Phase 7 raised the backend's log granularity (Rule I2), so a run publishes
+ * hundreds of `log` lines alongside the `thread_classified` events. The ring is
+ * sized to the backend's replay buffer (1000) so classification rows are not
+ * evicted by log noise before the inline feed can render them.
+ */
+const MAX_EVENTS = 1000
 
 // ── singleton connection ─────────────────────────────────────────────────────
 
 type Snapshot = {
   events: SseEvent[]
   reconnecting: boolean
+  /** `Date.now()` of the most recent event of any kind, or 0 if none yet.
+   * The stale line and the "last update {x}s ago" stamp are derived from this —
+   * the UI never polls the server to find out whether the run is alive. */
+  lastEventAt: number
 }
 
 type Listener = (s: Snapshot) => void
@@ -60,7 +78,7 @@ const genId = () => `evt-${++nextId}`
 /** Exponential back-off capped at 30 s. */
 const backoff = (attempt: number) => Math.min(1000 * Math.pow(2, attempt), 30_000)
 
-let _snapshot: Snapshot = { events: [], reconnecting: false }
+let _snapshot: Snapshot = { events: [], reconnecting: false, lastEventAt: 0 }
 const _listeners = new Set<Listener>()
 let _es: EventSource | null = null
 let _timer: ReturnType<typeof setTimeout> | null = null
@@ -79,8 +97,12 @@ function addEvent(type: SseEventType, payload: Record<string, unknown>) {
   if (type === 'run_completed' || type === 'run_started') {
     sseLive.setFetchedSoFar(0)
   }
-  const ev: SseEvent = { id: genId(), type, ts: Date.now(), payload }
-  publish({ events: [ev, ..._snapshot.events].slice(0, MAX_EVENTS) })
+  const now = Date.now()
+  const ev: SseEvent = { id: genId(), type, ts: now, payload }
+  // The transport keepalive (`heartbeat`) is deliberately NOT counted above:
+  // it ticks whether or not a run is alive, so counting it would mask real
+  // silence. `activity_heartbeat` is a real observation and does count.
+  publish({ events: [ev, ..._snapshot.events].slice(0, MAX_EVENTS), lastEventAt: now })
 }
 
 function connect() {
@@ -140,10 +162,33 @@ function subscribe(listener: Listener): () => void {
 
 export type FeedRow =
   | { kind: 'thread'; key: string; ts: number; data: ThreadClassifiedEvent }
+  /** `event` is carried alongside `data` so the drawer keeps rendering these
+   *  through its generic branch exactly as before — the inline feed is the only
+   *  surface that changes. */
+  | { kind: 'thread_archived'; key: string; ts: number; data: ThreadArchivedEvent; event: SseEvent }
+  | { kind: 'error'; key: string; ts: number; data: FeedErrorEvent; event: SseEvent }
   | { kind: 'model_fallback'; key: string; ts: number; data: ModelFallbackEvent }
   | { kind: 'run_resumable'; key: string; ts: number; data: RunResumableEvent }
-  /** Any other event (run_progress, log, error, …) — rendered as a plain row. */
+  /** Any other event (run_progress, log, …) — rendered as a plain row in the drawer. */
   | { kind: 'event'; key: string; ts: number; event: SseEvent }
+
+/**
+ * The row kinds the INLINE feed admits (`LiveRunFeed`). This is an ALLOW-LIST on
+ * purpose: a deny-list (`kind !== 'event'`) silently swallows every future event
+ * type by default, which is exactly how `thread_archived` and `error` ended up
+ * drawer-only after Phase 6 shipped them. Adding a kind here is a deliberate act.
+ */
+export const INLINE_FEED_KINDS: ReadonlyArray<FeedRow['kind']> = [
+  'thread',
+  'thread_archived',
+  'error',
+  'model_fallback',
+  'run_resumable',
+]
+
+export function isInlineFeedRow(row: FeedRow): boolean {
+  return INLINE_FEED_KINDS.includes(row.kind)
+}
 
 function toThread(p: Record<string, unknown>): ThreadClassifiedEvent {
   return {
@@ -186,6 +231,33 @@ export function buildFeed(events: SseEvent[]): FeedRow[] {
         indexByItem.set(data.item_id, rows.length)
         rows.push(row)
       }
+    } else if (ev.type === 'thread_archived') {
+      const p = ev.payload
+      rows.push({
+        kind: 'thread_archived',
+        key: ev.id,
+        ts: ev.ts,
+        event: ev,
+        data: {
+          run_id: String(p.run_id ?? ''),
+          item_id: String(p.item_id ?? ''),
+          subject: String(p.subject ?? ''),
+          category: String(p.category ?? ''),
+          label_name: String(p.label_name ?? ''),
+        },
+      })
+    } else if (ev.type === 'error') {
+      const p = ev.payload
+      rows.push({
+        kind: 'error',
+        key: ev.id,
+        ts: ev.ts,
+        event: ev,
+        data: {
+          run_id: String(p.run_id ?? ''),
+          message: String(p.message ?? p.error ?? 'unknown error'),
+        },
+      })
     } else if (ev.type === 'model_fallback') {
       const p = ev.payload
       rows.push({
@@ -212,8 +284,14 @@ export function buildFeed(events: SseEvent[]): FeedRow[] {
           reason: String(p.reason ?? ''),
         },
       })
-    } else if (ev.type !== 'heartbeat' && ev.type !== 'provider_degraded') {
-      // provider_degraded is a pinned banner, not a scrolling row (ui.md #14).
+    } else if (
+      ev.type !== 'heartbeat' &&
+      ev.type !== 'provider_degraded' &&
+      ev.type !== 'activity_heartbeat'
+    ) {
+      // provider_degraded is a pinned banner, not a scrolling row (ui.md #14),
+      // and activity_heartbeat is the pinned line at the foot of the inline
+      // feed (ui.md #18) — neither ever becomes a scrolling row.
       rows.push({ kind: 'event', key: ev.id, ts: ev.ts, event: ev })
     }
   }
@@ -243,6 +321,35 @@ export function currentDegraded(events: SseEvent[]): ProviderDegradedEvent | nul
   return null
 }
 
+/**
+ * The newest `activity_heartbeat`, cleared by any `run_completed` /
+ * `run_resumable` that arrived after it — a finished run has no live state to
+ * report, so the pinned line must not linger with stale numbers.
+ */
+export function currentHeartbeat(events: SseEvent[]): ActivityHeartbeatEvent | null {
+  for (const ev of events) {
+    if (ev.type === 'run_completed' || ev.type === 'run_resumable') return null
+    if (ev.type === 'activity_heartbeat') {
+      const p = ev.payload
+      const num = (v: unknown): number | null =>
+        v === null || v === undefined || v === '' ? null : Number(v)
+      return {
+        run_id: String(p.run_id ?? ''),
+        phase: String(p.phase ?? ''),
+        detail: String(p.detail ?? ''),
+        batch_n: num(p.batch_n),
+        batch_total: num(p.batch_total),
+        batch_size: num(p.batch_size),
+        // Nullable on the wire — kept null, never coerced to "".
+        model: p.model === null || p.model === undefined ? null : String(p.model),
+        elapsed_s: Number(p.elapsed_s ?? 0),
+        silent_for_s: Number(p.silent_for_s ?? 0),
+      }
+    }
+  }
+  return null
+}
+
 // ── React surface ────────────────────────────────────────────────────────────
 
 export type SseContextValue = {
@@ -252,6 +359,10 @@ export type SseContextValue = {
   feed: FeedRow[]
   /** Non-null while the provider is degraded for the current run. */
   degraded: ProviderDegradedEvent | null
+  /** Phase 7 — the newest watchdog heartbeat; the pinned line of the inline feed. */
+  heartbeat: ActivityHeartbeatEvent | null
+  /** Phase 7 — `Date.now()` of the newest event, or 0. Derived, never polled. */
+  lastEventAt: number
   reconnecting: boolean
 }
 
@@ -267,6 +378,8 @@ function useSseConnection(): SseContextValue {
       events: snap.events,
       feed: buildFeed(snap.events),
       degraded: currentDegraded(snap.events),
+      heartbeat: currentHeartbeat(snap.events),
+      lastEventAt: snap.lastEventAt,
       reconnecting: snap.reconnecting,
     }),
     [snap],

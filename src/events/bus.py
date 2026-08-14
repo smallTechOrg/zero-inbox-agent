@@ -217,3 +217,93 @@ def emit_model_fallback(
         )
     except Exception:
         _log.warning("events.emit_failed type=model_fallback run_id=%s", run_id, exc_info=True)
+
+
+# ── typed emit helpers (Phase 7 — drive to inbox zero) ────────────────────────
+#
+# Counts, ids and reasons ONLY. No subject, no sender, no snippet, no body — the
+# apply pass never needs content to be legible, so none is put on the bus.
+# ``tests/unit/events/test_apply_events.py`` asserts the payload keys exactly.
+
+
+def emit_apply_progress(
+    user_id: str,
+    *,
+    run_id: str,
+    applied: int,
+    total_to_apply: int,
+    failed: int,
+) -> None:
+    """Progress of the apply pass, every 25 decisions and once at the end.
+
+    A long apply pass must be visible rather than a frozen progress bar. Never raises.
+    """
+    try:
+        emit(
+            user_id,
+            {
+                "type": "apply_progress",
+                "run_id": str(run_id),
+                "applied": int(applied),
+                "total_to_apply": int(total_to_apply),
+                "failed": int(failed),
+            },
+        )
+    except Exception:
+        _log.warning("events.emit_failed type=apply_progress run_id=%s", run_id, exc_info=True)
+
+
+def emit_run_apply_failed(
+    user_id: str,
+    *,
+    run_id: str,
+    reason: str,
+    distance_to_zero: int,
+) -> None:
+    """The apply pass could not run, or did not reach zero. Never raises.
+
+    This is the event that makes the motivating defect impossible to miss: the run
+    that reported itself ``completed`` with 615 unapplied archives would have fired
+    it with ``distance_to_zero=615``.
+    """
+    try:
+        emit(
+            user_id,
+            {
+                "type": "run_apply_failed",
+                "run_id": str(run_id),
+                "reason": _truncate(reason, _REASONING_MAX),
+                "distance_to_zero": int(distance_to_zero),
+            },
+        )
+    except Exception:
+        _log.warning("events.emit_failed type=run_apply_failed run_id=%s", run_id, exc_info=True)
+
+
+def emit_inbox_zero_report(
+    user_id: str,
+    *,
+    run_id: str,
+    applied: int,
+    distance_to_zero: int,
+    remainder: dict[str, Any],
+) -> None:
+    """The end-of-run remainder ledger, once per run. Never raises.
+
+    ``remainder`` is coerced to ``{bucket: int}`` here so no call site can smuggle a
+    non-count value (a subject, a snippet) onto the bus through this door.
+    """
+    try:
+        buckets = {str(key): int(value or 0) for key, value in (remainder or {}).items()}
+        emit(
+            user_id,
+            {
+                "type": "inbox_zero_report",
+                "run_id": str(run_id),
+                "applied": int(applied),
+                "distance_to_zero": int(distance_to_zero),
+                "remainder": buckets,
+            },
+        )
+    except Exception:
+        _log.warning("events.emit_failed type=inbox_zero_report run_id=%s", run_id, exc_info=True)

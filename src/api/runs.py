@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -11,6 +13,9 @@ from sqlalchemy.orm import Session
 from api._common import DRY_RUN_VIOLATION, NOT_FOUND, PROVIDER_ERROR, VALIDATION_ERROR, api_error, iso, not_found, ok
 from api.session import require_user_id
 from db.session import get_session
+from graph.remainder import remainder_ledger
+
+_log = logging.getLogger("zero_inbox.api.runs")
 
 router = APIRouter()
 
@@ -23,11 +28,28 @@ RESUMABLE_STATUS = "resumable"
 #: spec/api.md "Error codes" — 409, the run has no partial work to resume.
 NOT_RESUMABLE = "not_resumable"
 
+#: spec/api.md "Error codes" — 409, the run is not ``completed`` so its decisions
+#: cannot be applied.
+NOT_APPLIABLE = "not_appliable"
 
-def run_payload(run) -> dict:
+#: Run ids whose retry-apply pass is currently in flight in this process. A second
+#: POST while the first is still working is a no-op rather than a second worker
+#: racing the same rows (the pass is idempotent per decision, but two passes would
+#: still double the Gmail calls).
+_apply_in_flight: set[str] = set()
+_apply_lock = threading.Lock()
+
+
+def run_payload(run, session: Session) -> dict:
     items_total = run.items_total or 0
     items_decided = run.items_decided or 0
+    # spec/api.md: every run surface carries how far from zero it is and whether the
+    # apply pass actually worked, so no surface can render a run that archived
+    # nothing as a clean success. Computed live — never from cached counts.
+    ledger = remainder_ledger(session, run_id=run.id, user_id=run.user_id)
     return {
+        "distance_to_zero": ledger["distance_to_zero"],
+        "apply_ok": ledger["apply_ok"],
         "id": run.id,
         "status": run.status,
         "resumable": run.status == RESUMABLE_STATUS,
@@ -83,7 +105,7 @@ def get_latest_run(
     ).scalar_one_or_none()
     if run_id is None:
         return ok(None)
-    return ok(run_payload(load_run(session, run_id, user_id)))
+    return ok(run_payload(load_run(session, run_id, user_id), session))
 
 
 @router.get("/api/runs/{run_id}")
@@ -92,7 +114,7 @@ def get_run(
     user_id: str = Depends(require_user_id),
     session: Session = Depends(get_session),
 ) -> dict:
-    return ok(run_payload(load_run(session, run_id, user_id)))
+    return ok(run_payload(load_run(session, run_id, user_id), session))
 
 
 @router.get("/api/runs/{run_id}/summary")
@@ -148,11 +170,19 @@ def get_run_summary(
         )
     ).scalar_one()
 
+    # spec/api.md Phase 7: the summary reflects what was DONE. ``applied_count`` was
+    # specified in Phase 3 and never implemented; it is closed here from the live
+    # ledger rather than from run.counts, so it can never drift from the decisions.
+    ledger = remainder_ledger(session, run_id=run_id, user_id=user_id)
+
     return ok(
         {
             "run_id": run_id,
             "status": run.status,
             "total_threads": run.items_total or 0,
+            "applied_count": ledger["applied"],
+            "distance_to_zero": ledger["distance_to_zero"],
+            "remainder": ledger["remainder"],
             "categories": categories,
             "top_clusters": top_clusters,
             "needs_your_call_count": needs_your_call_count or 0,
@@ -161,6 +191,91 @@ def get_run_summary(
         }
     )
 
+
+@router.get("/api/runs/{run_id}/remainder")
+def get_run_remainder(
+    run_id: str,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """The honest answer to "how far from zero am I, and why?".
+
+    Computed live from ``decisions`` on every call. ``404`` when the run does not
+    exist **or belongs to another user** — a run id is not a capability.
+    """
+    load_run(session, run_id, user_id)  # 404s if absent or another user's
+    return ok(remainder_ledger(session, run_id=run_id, user_id=user_id))
+
+
+def _retry_apply_task(*, run_id: str, user_id: str, channel_account_id: str, dry_run: bool) -> None:
+    """Re-run the apply pass for one completed run. Never raises into the server."""
+    try:
+        from graph.nodes import apply_run_decisions
+
+        ledger = apply_run_decisions(
+            run_id=run_id,
+            user_id=user_id,
+            channel_account_id=channel_account_id,
+            dry_run=dry_run,
+        )
+        _log.info(
+            "runs.retry_apply_complete run_id=%s applied=%s already_applied=%s failed=%s",
+            run_id,
+            (ledger or {}).get("applied"),
+            (ledger or {}).get("already_applied"),
+            (ledger or {}).get("failed"),
+        )
+    except Exception:
+        # Loud, never silent: the ledger surfaces on the next GET /remainder, and the
+        # failure is on the record here rather than swallowed by the task runner.
+        _log.warning("runs.retry_apply_failed run_id=%s", run_id, exc_info=True)
+    finally:
+        with _apply_lock:
+            _apply_in_flight.discard(run_id)
+
+
+@router.post("/api/runs/{run_id}/apply")
+def apply_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Re-run the apply pass for a ``completed`` run — no thread is re-classified.
+
+    The recovery path for a transient Gmail/auth failure: it spends no tokens.
+    Idempotent — already-``applied`` decisions are counted in ``already_applied``
+    and never mutated twice, so calling it twice in a row is a no-op the second
+    time. ``409 not_appliable`` when the run's status is not ``completed``.
+    """
+    run = load_run(session, run_id, user_id)  # 404s if absent or another user's
+    if run.status != "completed":
+        raise api_error(
+            NOT_APPLIABLE,
+            f"only a completed run can be applied (status={run.status!r})",
+            409,
+        )
+
+    with _apply_lock:
+        queued = run_id not in _apply_in_flight
+        if queued:
+            _apply_in_flight.add(run_id)
+
+    if queued:
+        background_tasks.add_task(
+            _retry_apply_task,
+            run_id=run.id,
+            user_id=user_id,
+            channel_account_id=run.channel_account_id,
+            dry_run=bool(run.dry_run),
+        )
+
+    # The pass runs in the background; the response is the ledger as it stands right
+    # now, which is what the Inbox-Zero card re-renders from. The finished ledger
+    # arrives on the SSE bus (apply_progress / inbox_zero_report).
+    payload = remainder_ledger(session, run_id=run_id, user_id=user_id)
+    payload["queued"] = queued
+    return ok(payload)
 
 
 @router.post("/api/runs/{run_id}/resume")

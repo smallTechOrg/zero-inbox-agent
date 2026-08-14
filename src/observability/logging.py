@@ -125,9 +125,18 @@ def activity_bus_processor(
     triage run) or from the event's own fields. Events with no resolvable user
     are dropped rather than broadcast — never leak one tenant's activity to
     another.
+
+    It is also where the activity watchdog **arms itself**: every forwarded
+    event is a publication, so the watchdog knows exactly when a run last
+    published something without any graph code starting or stopping it.
     """
     user_id = event_dict.get("user_id")
     if user_id:
+        fields = {
+            k: v
+            for k, v in event_dict.items()
+            if k not in ("event", "level", "logger", "timestamp", "run_id", "user_id")
+        }
         try:
             from events import bus
 
@@ -141,20 +150,23 @@ def activity_bus_processor(
                     "timestamp": event_dict.get("timestamp"),
                     "run_id": event_dict.get("run_id"),
                     # Everything else the call site logged, minus the keys above.
-                    "fields": {
-                        k: v
-                        for k, v in event_dict.items()
-                        if k
-                        not in (
-                            "event",
-                            "level",
-                            "logger",
-                            "timestamp",
-                            "run_id",
-                            "user_id",
-                        )
-                    },
+                    "fields": fields,
                 },
+            )
+        except Exception:  # pragma: no cover — telemetry must never break logging
+            pass
+
+        # Arm/refresh the no-silent-beat watchdog off the same stream. Kept
+        # separate from the emit above so a bus failure still updates activity
+        # (and vice versa); note_activity never raises.
+        try:
+            from events import heartbeat
+
+            heartbeat.note_activity(
+                str(user_id),
+                run_id=event_dict.get("run_id"),
+                phase=event_dict.get("event"),
+                fields=fields,
             )
         except Exception:  # pragma: no cover — telemetry must never break logging
             pass

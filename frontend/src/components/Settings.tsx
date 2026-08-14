@@ -278,6 +278,8 @@ export default function SettingsPanel({
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<unknown>(null)
   const [savedOk, setSavedOk] = useState(false)
+  /** Set when PATCH /api/settings answers `warning: "above_model_ceiling"`. */
+  const [ceilingWarning, setCeilingWarning] = useState(false)
 
   useEffect(() => {
     setDraft(settings)
@@ -306,6 +308,7 @@ export default function SettingsPanel({
         timezone: draft.timezone,
       })
       onSettingsChange(updated)
+      setCeilingWarning(updated?.warning === 'above_model_ceiling')
       setSavedOk(true)
     } catch (e) {
       setSaveError(e)
@@ -339,21 +342,46 @@ export default function SettingsPanel({
         }}
       />
 
-      {/* Auto-act threshold — real in Phase 2 */}
-      <SliderRow
-        label="Auto-act threshold"
-        value={draft.auto_act_threshold}
-        min={0.5}
-        max={0.99}
-        step={0.01}
-        unit="%"
-        testid="slider-auto-act-threshold"
-        hint="When dry-run is off, approving a cluster at or above this confidence archives for real."
-        onChange={v => {
-          setDraft({ ...draft, auto_act_threshold: v })
-          setSavedOk(false)
-        }}
-      />
+      {/* Autonomy bar — ui.md screen 17.
+          This slider was DEAD CONFIG until Phase 7: persisted, defaulted and
+          sliderised, but read by no decision or apply code path. It now really
+          governs which archives the agent performs on its own, so it is
+          relabelled and annotated with its measured consequence. */}
+      <div className="space-y-1">
+        <SliderRow
+          label="Act on its own above this confidence"
+          value={draft.auto_act_threshold}
+          // The floor is the hard lower bound: this slider can only raise the bar.
+          min={draft.confidence_floor}
+          max={0.99}
+          step={0.01}
+          unit=""
+          testid="slider-auto-act-threshold"
+          onChange={v => {
+            setDraft({ ...draft, auto_act_threshold: Math.max(v, draft.confidence_floor) })
+            setSavedOk(false)
+            setCeilingWarning(false)
+          }}
+        />
+        <p data-testid="autonomy-sub-label" className="text-[10px] leading-tight text-gray-500">
+          Below this the agent proposes but doesn’t archive. Your never-miss floor (
+          {draft.confidence_floor.toFixed(2)}) always wins — this slider can only raise the bar,
+          never lower it.
+        </p>
+        <p data-testid="autonomy-calibration-note" className="text-[10px] leading-tight text-gray-600">
+          Your model’s real confidence tops out around 0.94. Above 0.90 the agent will archive
+          almost nothing.
+        </p>
+        {draft.auto_act_threshold > 0.9 || ceilingWarning ? (
+          <p
+            role="alert"
+            data-testid="autonomy-ceiling-warning"
+            className="rounded border border-rose-300 bg-rose-50 px-2 py-1.5 text-[11px] font-bold text-rose-800"
+          >
+            At this setting the agent will archive almost nothing — your inbox will not reach zero.
+          </p>
+        ) : null}
+      </div>
 
       {/* Dry-run toggle — real in Phase 2 */}
       <div className="flex items-center justify-between gap-3">
