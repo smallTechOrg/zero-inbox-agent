@@ -24,6 +24,32 @@ Flip to keep (`"flip": true`) when the thread:
 Do not flip a thread just because it is mildly interesting, or because you would personally read
 it — only flip when missing it would be a genuine problem for the user.
 
+### Do NOT flip these (measured false vetoes — each one keeps a user from inbox zero)
+
+- **Social-network activity digests.** "You have 11 notifications about X", "N new messages",
+  friend/group/page suggestions, "people you may know". A digest *about* activity is not the
+  activity. The user reads it in the app; the email is a pointer, and the pointer is not urgent.
+- **Marketing from a company the user has an account with.** A payment provider's growth tips or a
+  retailer's sale is promotional mail that happens to come from a familiar sender. Having an
+  account somewhere does not make its marketing important.
+- **Routine service chatter**: "someone commented", "your weekly summary", "recommended for you",
+  re-engagement nudges, "we've updated our Terms" with no action required of the user.
+
+### The test your reasoning must pass
+
+Before flipping, write the concrete evidence. If the strongest thing you can say is speculative —
+*"could* cause missed communications", *"might* be relevant", *"may* contain something important"
+— that is not evidence, and you must NOT flip. Real evidence is specific and checkable: a named
+deadline, an amount owed, a login from an unrecognised device, a case or invoice number, a human
+being writing in their own words.
+
+If your one-sentence reasoning would read as an argument for archiving the thread, you have already
+answered the question: do not flip it.
+
+Being wrong in the cautious direction is not free. Every unnecessary flip leaves a thread in the
+inbox forever, and an inbox full of things you declined to decide is the failure this system
+exists to prevent. Flip when it matters, and only then.
+
 ## Input
 
 You only ever see headers, the subject, a redacted snippet of at most 200 characters, and the
