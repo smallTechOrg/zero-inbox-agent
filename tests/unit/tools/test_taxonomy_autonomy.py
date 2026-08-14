@@ -163,3 +163,65 @@ def test_the_default_taxonomy_seeds_the_documented_per_category_bars():
 
 def test_the_seed_table_matches_the_spec_exactly():
     assert SEEDED_AUTO_ACT_THRESHOLDS == {"outreach": 0.85, "receipts": 0.85}
+
+
+# --- never-archive guard (found live: a real account had people -> archive) ---
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("key", ["urgent", "people", "legal"])
+def test_a_human_facing_category_can_never_be_set_to_archive(_isolated_db, key):
+    """Regression, found on a real account: `psykrsna@gmail.com` held
+    `people -> archive` and `legal -> archive`. Only Urgent was guarded, so
+    anything that writes a category — the taxonomy editor, the LLM propose
+    endpoint, an import — could silently flip the one category meaning "a human
+    wrote to you", after which first-contact mail from real people would be
+    auto-archived. `categories` has no timestamps, so it left no audit trail."""
+    from db.session import create_db_session
+    from tools.taxonomy import TaxonomyError, create_category
+
+    with create_db_session() as session:
+        with _pytest.raises(TaxonomyError, match="can never carry default_action=archive"):
+            create_category(
+                session,
+                "u-guard",
+                key=key,
+                name=key.title(),
+                description="",
+                default_action="archive",
+            )
+
+
+@_pytest.mark.parametrize("key", ["urgent", "people", "legal"])
+def test_the_guard_also_blocks_an_update_not_just_a_create(_isolated_db, key):
+    """The live flip happened to an EXISTING row, so create-time validation
+    alone would not have prevented it."""
+    from db.session import create_db_session
+    from tools.taxonomy import TaxonomyError, create_category, update_category
+
+    with create_db_session() as session:
+        cat = create_category(
+            session, "u-guard2", key=key, name=key.title(), description="",
+            default_action="keep",
+        )
+        session.commit()
+        cat_id = cat.id
+
+    with create_db_session() as session:
+        with _pytest.raises(TaxonomyError, match="can never carry default_action=archive"):
+            update_category(session, "u-guard2", cat_id, default_action="archive")
+
+
+def test_an_ordinary_category_may_still_archive(_isolated_db):
+    """The guard must not become a blanket ban — archiving is the whole point."""
+    from db.session import create_db_session
+    from tools.taxonomy import create_category
+
+    with create_db_session() as session:
+        cat = create_category(
+            session, "u-guard3", key="newsletters", name="Newsletters",
+            description="", default_action="archive",
+        )
+        assert cat.default_action == "archive"

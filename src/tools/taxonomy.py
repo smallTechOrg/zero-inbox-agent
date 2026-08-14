@@ -27,6 +27,18 @@ from tools.rules import DEFAULT_TAXONOMY, VALID_ACTIONS
 
 URGENT_KEY = "urgent"
 
+#: Categories that may NEVER carry ``default_action="archive"``.
+#:
+#: Urgent was guarded from the start; People and Legal were not — and that gap
+#: was found live, with a real account holding ``people -> archive``. Anything
+#: that writes a category (the taxonomy editor, the LLM propose endpoint, a
+#: future import) could silently flip the one category that means "a human
+#: wrote to you", after which the agent would auto-archive first-contact mail
+#: from real people. The never-miss layer would still hold anyone previously
+#: replied to, any VIP and anything time-sensitive — but a stranger's genuine
+#: first email is exactly the mail this product must never lose.
+NEVER_ARCHIVE_KEYS: frozenset[str] = frozenset({URGENT_KEY, "people", "legal"})
+
 
 class _Unset:
     """Sentinel: "this field was not supplied" — distinct from an explicit None."""
@@ -87,8 +99,11 @@ def list_categories(session: Session, user_id: str) -> list:
 def _validate_action(key: str, default_action: str) -> None:
     if default_action not in VALID_ACTIONS:
         raise TaxonomyError(f"default_action must be one of {list(VALID_ACTIONS)}")
-    if key == URGENT_KEY and default_action == "archive":
-        raise TaxonomyError("The Urgent category can never carry default_action=archive")
+    if key in NEVER_ARCHIVE_KEYS and default_action == "archive":
+        raise TaxonomyError(
+            f"The {key.title()} category can never carry default_action=archive — "
+            "it is mail a human must see."
+        )
 
 
 def validate_auto_act_threshold(value: float | None) -> float | None:
