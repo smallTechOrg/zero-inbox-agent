@@ -73,6 +73,13 @@ class TriageState(TypedDict, total=False):
 `llm_decisions` and `resolved` use `operator.add` reducers so parallel `Send` branches merge without
 clobbering each other. Everything else is last-write-wins (written by exactly one node).
 
+**Phase 7 adds no new `TriageState` key.** It adds one key *inside* each decision dict —
+`autonomy_state` — written by `mark_autonomy_state` and persisted to `decisions.autonomy_state` by
+`persist_decisions`. It also requires that each entry of `state["categories"]` carries
+`default_action` and `auto_act_threshold` (a pinned cross-slice contract on
+`graph.persistence._load_context_rows`), and that `state["settings"]["auto_act_threshold"]` is the
+user's real persisted value — which, from Phase 7, is finally read by something.
+
 ---
 
 ## Nodes
@@ -90,13 +97,20 @@ clobbering each other. Everything else is last-write-wins (written by exactly on
 | `second_pass_reviewer` | **2** | Reflection. Takes every decision proposing archive and asks a reviewer prompt (`prompts/reviewer.md`) one question only: *is this a false negative — something the user would be upset to miss?* Any flip becomes `keep` with `decided_by="reviewer"` and the reviewer's reasoning appended. Batched 20–50 |
 | `apply_never_miss_floor` | **2** | Enforces: (a) confidence < `confidence_floor` → `needs_your_call`; (b) sender in VIP or `ever_replied` and no explicit override → force `keep`; (c) `time_sensitive` true → force `keep` unless a user-promoted rule explicitly says otherwise |
 | `cluster_decisions` | 1 | `tools.clustering.cluster()` groups decisions by mailing-list id → sender → domain → category, emitting `Cluster` rows with counts, a suggested bulk action and the minimum confidence in the cluster |
+| `align_to_category_default` | **7** | `graph/nodes_autonomy.py`. **The only stage in the system permitted to move a decision from `keep` toward `archive`**, and it runs *before* every never-miss safeguard so the reviewer, the floor and the VIP/reply-history guards still audit and can veto the result. Sets `proposed_action` to the category's `default_action` when the category is `archive`/`digest`, `confidence >= effective_threshold(category, settings)`, and none of the exclusions apply (`needs_your_call`, `decided_by="error"`, `decided_by="rule"`, `time_sensitive`, `unsure`, `ever_replied`, VIP). Also refreshes each cluster's `suggested_action` in place, since `cluster_decisions` ran before it. Never lowers confidence, never rewrites `decided_by`, never touches `status` or `review_state`. Rules C1–C5 in [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#c-category-default-decides-the-action--align_to_category_default) |
+| `mark_autonomy_state` | **7** | `graph/nodes_autonomy.py`. Runs at the *end* of the never-miss chain, when every verdict is final. Stamps each decision with exactly one `autonomy_state`: `needs_your_call` (status is `needs_your_call`) → `held_by_never_miss` (`decided_by="reviewer"`, VIP, `ever_replied`, or `time_sensitive`) → `category_keep` (category `default_action` is `keep`, or the keep came from a user rule) → `auto_act` (action is `archive`/`digest` and `confidence >= effective_threshold`) → `below_threshold` (otherwise). Evaluated in that fixed precedence, so the value always names the *first* rule that stopped the agent acting. This is the grouping key of the remainder ledger and the sole basis of `distance_to_zero` |
 | `persist_decisions` | 1 | Writes `Decision`, `Cluster`, `LlmCall` rows; updates `TriageRun` counts/cost. Idempotent on `(run_id, item_id)` so a resumed run never double-decides. **Phase 6:** no longer the first write — it finalises clusters, upgrades `review_state`, and reconciles counts over rows already checkpointed |
 | `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible. **Phase 6:** closes the run `resumable` instead of `failed` when ≥ 1 decision is already persisted, or when the cause is `ProviderCircuitOpen` |
-| `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event |
+| `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event. **Phase 7:** calls `apply_run_decisions(...)` (unless `dry_run`), writes the apply + remainder ledgers into `triage_runs.counts`, sets `error_message` and emits `run_apply_failed` when the apply pass failed or `distance_to_zero > 0`, and emits `inbox_zero_report` |
 
 `second_pass_reviewer` and `apply_never_miss_floor` are wired in Phase 2. Phase 1 applied a simple
 floor inside `persist_decisions` (confidence < 0.75 → `needs_your_call`) which Phase 2 replaces with
 the full reviewer + floor + VIP-guard cascade.
+
+`align_to_category_default` and `mark_autonomy_state` are wired in Phase 7 and bracket the never-miss
+chain: the first runs immediately before `second_pass_reviewer`, the second immediately after
+`apply_never_miss_floor`. That ordering is the safety argument — nothing the autonomy policy proposes
+escapes the reviewer, and nothing is stamped `auto_act` before the reviewer has had its say.
 
 ---
 
@@ -114,15 +128,20 @@ apply_sender_history → route_after_history:
 prepare_llm_batches → Send(*) → llm_classify_batch   (fan-out, max concurrency 4)
 llm_classify_batch  → route_after_llm:
         "deep"      → deep_read_escalation
-        "done"      → second_pass_reviewer           (Phase 1: → cluster_decisions)
-deep_read_escalation → second_pass_reviewer          (Phase 1: → cluster_decisions)
+deep_read_escalation → cluster_decisions
+cluster_decisions   → align_to_category_default      (Phase 7; Phase 2-6: → second_pass_reviewer)
+align_to_category_default → second_pass_reviewer     (Phase 7)
 second_pass_reviewer → apply_never_miss_floor        (Phase 2+)
-apply_never_miss_floor → cluster_decisions           (Phase 2+)
-cluster_decisions   → persist_decisions              | error → handle_error
+apply_never_miss_floor → mark_autonomy_state         (Phase 7; Phase 2-6: → persist_decisions)
+mark_autonomy_state → persist_decisions              (Phase 7)
 persist_decisions   → finalize
 finalize            → END
 handle_error        → END
 ```
+
+Every edge from `cluster_decisions` onward is `edges.guard(...)`-wrapped, so an `error` in state at any
+point short-circuits to `handle_error`. The two Phase 7 nodes are inserted **inside** that guarded
+chain, not around it.
 
 Routing functions (`src/graph/edges.py`):
 
@@ -171,6 +190,17 @@ never converted.
 structlog event: `run_id`, `total`, `by_tier`, `needs_your_call`, `llm_calls`, `usd`, `duration_ms`.
 That event is the source for the Phase 3 cost panel.
 
+**Phase 7 — finalize also finishes the job.** Unless `dry_run` is on it calls
+`graph.nodes.apply_run_decisions(...)`, which applies every `autonomy_state="auto_act"`,
+`review_state="reviewed"` archive through the *unmodified* `tools.actions.apply_decision` gate
+(never `force=True`, never writing `review_state`). It then writes the apply and remainder ledgers into
+`triage_runs.counts`, and emits `triage.inbox_zero_report`. **`apply_run_decisions` never returns
+early and silently** — every failure path populates `ledger.apply_failed_reason`; `finalize` turns a
+non-null reason, or any `distance_to_zero > 0`, into a human-readable `triage_runs.error_message`, a
+`run_apply_failed` SSE event, and `apply_ok=false` on the run payload. A run that archived nothing can
+never render as a clean success. See
+[drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#d-apply--through-the-review-gate-never-around-it-never-silent).
+
 ## Graph Assembly (pseudocode)
 
 ```python
@@ -191,6 +221,13 @@ def _build_triage_graph():
     # Phase 2 adds:
     # g.add_node("second_pass_reviewer", nodes_review.second_pass_reviewer)
     # g.add_node("apply_never_miss_floor", nodes_review.apply_never_miss_floor)
+
+    # Phase 7 adds (src/graph/agent.py, owned by the autonomy-policy slice):
+    # g.add_node("align_to_category_default", nodes_autonomy.align_to_category_default)
+    # g.add_node("mark_autonomy_state", nodes_autonomy.mark_autonomy_state)
+    # cluster_decisions -> align_to_category_default -> second_pass_reviewer
+    # apply_never_miss_floor -> mark_autonomy_state -> persist_decisions
+    # Both edges are edges.guard(...)-wrapped, exactly like the nodes they sit between.
 
     g.add_edge(START, "load_context")
     g.add_conditional_edges("load_context", edges.guard("fetch_items"),

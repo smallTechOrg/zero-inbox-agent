@@ -36,8 +36,8 @@ the reviewer has upgraded it.
 | Reviewed decision rows | `decisions` with `review_state="reviewed"` | `decisions` |
 | Run status `resumable` | enum value | `triage_runs.status` |
 | Resume summary | `{run_id, items_total, items_decided, remaining}` | `GET /api/runs/{run_id}` |
-| `thread_classified` SSE event (per thread, incl. `review_state`) | JSON | SSE bus → Activity drawer |
-| `provider_degraded` / `run_resumable` / `model_fallback` SSE events | JSON | SSE bus → Activity drawer |
+| `thread_classified` SSE event (per thread, incl. `review_state`) | JSON | SSE bus → main-page live feed (primary) + Activity drawer history |
+| `provider_degraded` / `run_resumable` / `model_fallback` SSE events | JSON | SSE bus → main-page live feed (primary) + Activity drawer history |
 | `llm_calls.model` = the model that actually served the call | string | `llm_calls` |
 
 ## External Calls
@@ -111,8 +111,10 @@ the reviewer has upgraded it.
 - The LLM client maintains a per-run health counter: `calls`, `retries`, `consecutive_failures`.
 - **Degraded** (surface, do not stop): when `retries / max(calls, 1) >= 1.0` **or**
   `retries >= 50`, emit a `provider_degraded` event once per 50 further retries with
-  `{provider, model, retries, calls, consecutive_failures}`. The Activity drawer pins a banner:
+  `{provider, model, retries, calls, consecutive_failures}`. A banner pins to the top of the **main
+  dashboard page**, visible without the user opening any drawer or taking any action:
   *"NVIDIA is failing — N retries. This run is degraded and may take much longer than usual."*
+  (The Activity drawer keeps a copy in its history; the on-page banner is the binding one.)
 - **Circuit open** (stop fast): after **5 consecutive** fully-failed LLM calls (every retry exhausted),
   the circuit opens. The client raises `ProviderCircuitOpen` on the next call instead of attempting it.
 - The circuit is tracked **per model**. On `ProviderCircuitOpen` for the run's current model, the run

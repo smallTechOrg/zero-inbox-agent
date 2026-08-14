@@ -48,6 +48,14 @@ ever replied to.
   staying in the inbox.
 - The order is fixed: reviewer → floor → reply-history/VIP/time-sensitive overrides. Later stages can
   only make an outcome *more* conservative.
+- **Phase 7 does not weaken this, and the ordering is the reason.** `align_to_category_default` — the
+  only stage in the system permitted to move a decision from `keep` toward `archive` — runs
+  **immediately before** the reviewer. Every archive it produces is therefore audited by the reviewer,
+  floored, and vetoable by the reply-history and VIP guards, exactly like an archive the classifier
+  proposed itself. Moving that stage after the never-miss chain, or performing the same conversion at
+  apply time, would archive mail the reviewer never saw and is forbidden. Auto-apply never passes
+  `force=True` and never writes `review_state`. See
+  [drive-to-inbox-zero](drive-to-inbox-zero.md#g-safety-invariants-this-capability-does-not-weaken-binding-restated-because-it-is-easy-to-erode).
 - **Durability never implies finality.** Decisions are persisted incrementally as
   `review_state="provisional"` (see [durable-resumable-runs](durable-resumable-runs.md)); the reviewer
   pass is what upgrades them to `review_state="reviewed"`. A batch the reviewer could not process
@@ -68,3 +76,9 @@ ever replied to.
 - [ ] A run whose reviewer pass is forced to fail applies **zero** Gmail mutations: every decision row
       is `review_state="review_failed"` and `apply_decision()` refuses each one with
       `NotReviewedError` without calling the mutator — including when called with `force=True`.
+- [ ] Over the 220-thread fixture **with `align_to_category_default` live**, the reviewer still flips
+      the seeded false-negative bait thread back to `keep`, and zero `ever_replied`, VIP or
+      `time_sensitive` threads are applied — proving the Phase 7 autonomy stage runs before, not
+      around, the never-miss chain.
+- [ ] Across a whole run, `apply_decision` is never called with `force=True` by any auto-apply path,
+      and `Decision.review_state` is never written outside `finalise_review` / `upgrade_review_state`.

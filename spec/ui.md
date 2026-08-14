@@ -64,7 +64,8 @@ model, and the **model dropdown** listing NVIDIA free models (persisted per user
 ### 8. Settings *(partly stub in Phase 1)*
 Auto-act threshold slider, confidence floor slider, dry-run toggle (off by default; shows amber banner
 when enabled), timezone, digest hour, taxonomy editor, **VIP / never-hide list** editor, and the
-plain-English **priorities profile** textarea.
+plain-English **priorities profile** textarea. The autonomy slider is made honest in Phase 7
+(screen 17) — until then it rendered a control that no code path read.
 
 ---
 
@@ -157,9 +158,20 @@ whenever `GET /api/runs/latest` returns `status === "resumable"`.
 - On `409 not_resumable` the banner clears and shows the standard envelope error with Retry.
 - Never shown for `running`, `completed`, `cancelled` or `failed` runs.
 
-### 14. Live classification feed *(Phase 6 — inside the Activity drawer)*
+### 14. Classification history *(the Activity drawer — full-history / archive surface only)*
 
-The drawer becomes the live classification surface, not just a progress counter.
+The drawer is the **complete scrollback**: every event of the run, retained beyond what fits on the
+main page. It is **not** the live surface. The live surface is
+[screen 18](#18-live-run-feed-on-the-main-page-phase-7), rendered inline on the main page.
+
+> **Binding rule: nothing user-critical may live only inside the drawer.** The drawer is
+> `useState(false)` — closed by default — so anything visible only there is, from the user's seat,
+> not visible at all. Every state a user must notice (classification rows arriving, degraded
+> provider, model fallback, run interrupted, staleness) renders on the **main page** without any
+> click; the drawer merely *also* holds it, with deeper history.
+>
+> The per-row, badge, chip and system-row detail below applies to **both** surfaces — screen 18
+> renders the same rows from the same `ThreadFeedRow.tsx`. It is specified once here.
 
 - One row per decided thread, keyed by `item_id`, newest first, arriving as the run proceeds:
   **tier badge** (`RULE` / `SENDER HISTORY` / `LLM` / `DEEP READ` / `REVIEWER` / `ERROR`) ·
@@ -169,9 +181,12 @@ The drawer becomes the live classification surface, not just a progress counter.
   Only `reviewed` rows render at full contrast with no chip. A later event for the same `item_id`
   (a reviewer flip) **replaces** the earlier row in place, so the user watches provisional become
   final. A provisional row must never read as a final decision.
-- **Degraded-provider banner:** a `provider_degraded` event pins a red banner to the **top** of the
-  drawer (above the feed, not scrolling with it) and auto-opens the drawer:
+- **Degraded-provider banner:** a `provider_degraded` event pins a red banner to the **top of the
+  main dashboard page** (above the live feed, not scrolling with it), visible without the user
+  opening any drawer or taking any action:
   **"NVIDIA is failing — 2,774 retries. This run is degraded and may take much longer than usual."**
+  The drawer *also* pins a copy at the top of its scrollback, but the on-page banner is the binding
+  one — auto-opening a drawer is **not** an acceptable substitute for on-page visibility.
   It clears on `run_completed` or `run_resumable`.
 - **Model-fallback row:** a `model_fallback` event renders a distinct amber system row (not a thread
   row, never keyed by `item_id`) — *"Switched model: `nvidia/nemotron-3-nano-30b-a3b` →
@@ -192,9 +207,122 @@ The drawer becomes the live classification surface, not just a progress counter.
 ### 15. Review state in the history view *(Phase 6)*
 
 The Triage History thread rows render `review_state` alongside the existing tier badge. A
-`provisional` or `review_failed` thread shows the same chip as the drawer and its per-decision Undo /
+`provisional` or `review_failed` thread shows the same chip as the live feed and its per-decision Undo /
 apply affordances are **disabled** with the tooltip *"Not yet reviewed — the never-miss reviewer has
 not seen this decision, so it was never applied."*
+
+## Phase 7 screens
+
+### 16. Inbox-Zero card *(Phase 7 — top of the primary screen, above the cluster list)*
+
+`frontend/src/components/InboxZeroCard.tsx`, mounted in `page.tsx` directly under `InboxSummary`.
+Loaded from `GET /api/runs/{run_id}/remainder` for the latest run (refetched on `apply_progress`,
+`inbox_zero_report` and `run_apply_failed` SSE events; no polling).
+
+**Headline row** — three numbers, largest first:
+`{applied} archived this run` · `{inbox_remaining} still in your inbox` · `distance to zero: {n}`.
+
+**The definition, stated plainly and always visible** (not behind a tooltip, not in a modal — a user
+who thinks "zero" means one thing and gets another has been misled):
+
+> **Inbox zero means your inbox holds only what needs a human.**
+> Newsletters, Notifications and Outreach are archived — never deleted, always undoable — when the
+> agent is confident enough to act alone. **People, Urgent and Receipts always stay**, along with
+> anyone you've replied to, anyone on your VIP list, anything time-sensitive, anything it wasn't
+> confident about, and anything one of your own rules kept.
+> *Change which categories leave →* (link to **Settings → Taxonomy**)
+
+**The remainder ledger** — one row per bucket, count + plain-English reason, in this fixed order:
+
+| Row | Copy |
+|-----|------|
+| `needs_your_call` | "**213** need your call — below the confidence floor, or the agent couldn't decide" |
+| `category_keep` | "**1,314** kept by category — People, Urgent, Receipts" (category names read from the live taxonomy, never hardcoded) |
+| `below_threshold` | "**71** not confident enough to archive on its own" — with an inline hint naming the current bar, e.g. *"the bar is 0.80; these scored 0.75–0.79"* |
+| `held_by_never_miss` | "**34** held by VIP or reply history" |
+| `unclassified` | "**N** decided before this policy existed" — **only rendered when `> 0`** |
+
+Buckets at zero are rendered greyed with the count `0`, never hidden — a disappearing row reads as a
+bug and hides the shape of the remainder.
+
+**The failure state is loud, not a toast.** When `apply_ok === false`, a red bar sits at the top of the
+card, above the headline:
+
+> **The agent decided {distance_to_zero} threads should leave your inbox but could not archive them.**
+> {apply_failed_reason}
+> **[ Retry archiving ]**
+
+The button calls `POST /api/runs/{run_id}/apply`, disables with a spinner while in flight, and on
+success refetches the ledger. When `distance_to_zero > 0` with a null `apply_failed_reason`, the same
+bar shows *"…{n} archives did not complete — see the action log."* A run that archived nothing must
+**never** render in the green/neutral state.
+
+**Dry-run state:** when `dry_run` is true the card shows the ledger with an amber
+*"DRY RUN — nothing was archived"* chip and the Retry button is hidden, not disabled-with-a-tooltip
+(there is nothing to retry).
+
+Loading: skeleton rows. Empty (no run yet): "Run triage to see how far you are from zero."
+Error: standard envelope error + Retry.
+
+### 17. Honest autonomy controls *(Phase 7 — Settings)*
+
+The existing auto-act threshold slider becomes real. It is relabelled and annotated:
+
+- **Label:** "Act on its own above this confidence" (was an unlabelled "auto act threshold").
+- **Sub-label:** "Below this the agent proposes but doesn't archive. Your never-miss floor
+  ({confidence_floor}) always wins — this slider can only raise the bar, never lower it."
+- **Calibration note, always visible:** *"Your model's real confidence tops out around 0.94.
+  Above 0.90 the agent will archive almost nothing."*
+- **Above-ceiling warning:** when the slider is above `0.90`, or when `PATCH /api/settings` returns
+  `warning: "above_model_ceiling"`, a red inline warning appears: **"At this setting the agent will
+  archive almost nothing — your inbox will not reach zero."** Saving is still permitted; it is the
+  user's call, made with the consequence named.
+- The slider's minimum is the user's `confidence_floor` (it can never be dragged below it) and `0` is
+  rejected by the API.
+
+**Per-category bars** are shown in the existing **Settings → Taxonomy** editor
+(`TaxonomyEditor.tsx`, real since Phase 3). Each row whose `default_action` is `archive` or `digest`
+gains an `auto_act_threshold` number input (step 0.01, blank = "inherit global"), saved via
+`PATCH /api/categories/{id}`. Rows whose `default_action` is `keep` show the input **disabled** with
+the note *"kept by default — never archived automatically"*, so the inertness is visible rather than
+confusing. The `Urgent` row's `default_action` dropdown continues to omit `archive` entirely.
+
+### 18. Live run feed on the main page *(Phase 7)*
+
+*Visible without a click — that is the whole point of this screen.*
+
+Rendered by `frontend/src/app/page.tsx` **inline**, directly under the progress bar and above the
+cluster list. Not a drawer, not a modal, not behind a toggle. It appears **by itself** the moment a
+run becomes active and is the most prominent thing on screen for the duration of the run — for a
+triage agent, watching it think is the product.
+
+- **Source:** `useSse()` from `frontend/src/lib/SseContext.tsx`, rendering `feed` rows with the
+  existing `frontend/src/components/ThreadFeedRow.tsx`. No second `EventSource`, no second renderer.
+- **Header row:** `Watching {n} threads classify · tier {t} · {model}` plus a live "last update
+  {x}s ago" stamp, so movement is legible even when rows are identical in shape.
+- **Body:** the newest **12** feed rows, newest first, each row identical to screen 14's — tier badge
+  · subject · `→` category · action · confidence % · reasoning (truncated), with the same
+  `NOT YET REVIEWED` / `REVIEW FAILED — kept` chips. New rows animate in at the top; a reviewer flip
+  replaces its row in place. **"See all activity →"** opens the Activity drawer (screen 11/14) for
+  the complete scrollback.
+- **Heartbeat line, pinned at the bottom of the feed:** the newest `activity_heartbeat` rendered as
+  plain text — *"classifying batch 12/75 — 29 threads, 18s elapsed, nvidia/nemotron-3-nano-30b-a3b"*.
+  It always names real state; it is never a bare spinner.
+- **Stale state (the anti-silence rule):** if no event has arrived for **8 seconds** while a run is
+  active, an amber line replaces the heartbeat line — *"No activity for 12s — still waiting on
+  {last phase}."* A user must always be able to tell working-but-slow from stuck. A visually static
+  feed with no explanation is a defect.
+- **Mid-run load / reload:** the feed is populated on first paint from the SSE replay buffer
+  (`GET /api/events` replays up to 1000 events before streaming live), so a user joining late sees
+  recent history immediately rather than an empty box that slowly fills.
+- **Degraded provider:** the `provider_degraded` banner renders as a red line pinned above the inline
+  feed on the **main page**, visible with no drawer opened and nothing clicked. The drawer keeps a
+  copy in its scrollback (screen 14); the on-page line is the one the criterion is judged on.
+- **Idle state:** with no active run the feed collapses to one line — *"Last run: 142 archived ·
+  2m ago"* with the **See all activity** link. It never renders an empty box, and never a progress
+  bar for work that is not running.
+- Rows and chips carry text, never colour alone; the feed is a landmark region and is keyboard
+  reachable.
 
 ## States (required for every list surface)
 
@@ -205,6 +333,7 @@ not seen this decision, so it was never applied."*
 | Error | the error code and message from the envelope, plus a Retry button; `reauth_required` renders a "Reconnect Gmail" button |
 | Partial/failed run | the banner "This run failed partway — undecided threads were kept in your inbox and counted as auto-kept (low confidence)" |
 | Resumable run | the Resume banner (screen 13) — never the failed-run banner |
+| Completed run that archived nothing | the red apply-failure bar on the Inbox-Zero card (screen 16) with the reason and **Retry archiving** — never the neutral "run complete" state |
 
 ## Accessibility & build constraints
 
@@ -216,3 +345,12 @@ not seen this decision, so it was never applied."*
 - Playwright smoke (`tests/e2e/`) asserts, against the live app: the page renders **styled**, the
   triage history view shows real clusters with tier badges after a run, a cluster expands to real
   reasoning text, and the "Undo this run" button is present on a completed run's summary card.
+- Phase 7 Playwright (`tests/e2e/phase7/`) additionally asserts, against the live app: the Inbox-Zero
+  card renders the definition text and every remainder bucket including zero-count ones; a run with
+  `apply_ok === false` renders the red bar with a working **Retry archiving** button and never the
+  neutral state; and the Settings slider shows the above-ceiling warning when dragged above 0.90.
+- Phase 7 Playwright also asserts the **live feed** (screen 18) against a real active run, **with no
+  drawer opened and nothing clicked**: classification rows are present on the main page within 2 s of
+  first paint, and the row count **strictly increases** across three polls ≥ 3 s apart. A screenshot
+  of the mid-run main page is captured as an artifact. Asserting only that SSE events arrived is not
+  acceptable evidence.

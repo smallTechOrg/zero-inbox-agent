@@ -43,10 +43,23 @@ token for every mutation so any action can be fully reversed in one click.
   `decisions.status = rejected`; it is never passed to `actions.apply_decision()` and never reaches the
   adapter. The thread stays exactly as it was — still in the inbox, no label change, no Gmail API call.
   Only `approved` decisions are eligible for `POST /api/actions/apply`.
-- **Nothing acts without approval** unless a rule has been explicitly promoted to `automatic` by the
-  user, and even then only above `auto_act_threshold`.
+- **Autonomous action is bounded by an enforced confidence bar.** From Phase 7 the agent applies a
+  decision on its own only when it is stamped `autonomy_state = "auto_act"` — meaning its category's
+  `default_action` is `archive`/`digest` and its confidence cleared
+  `max(category.auto_act_threshold ?? settings.auto_act_threshold, confidence_floor)`. Before Phase 7
+  `auto_act_threshold` was persisted and rendered but read by no code path; it is now real and
+  calibrated. See
+  [drive-to-inbox-zero](drive-to-inbox-zero.md#a-the-autonomy-instrument-is-real-and-it-is-per-category).
+- **Auto-apply never passes `force=True`** and never writes `review_state`. `force` remains what it
+  has always been: the single, deliberate, user-initiated "archive everything except what I have to
+  look at" sweep. A `keep`-proposed decision is never archived behind the user's back.
+- **A failed apply pass is loud.** It sets `triage_runs.error_message`, emits `run_apply_failed`,
+  returns `apply_ok = false`, and is recoverable via `POST /api/runs/{run_id}/apply`, which re-applies
+  without re-classifying and is idempotent. A silent early `return` is a defect, not a degradation.
 - No mutation runs while `dry_run` is true — the attempt raises `dry_run_violation` (409).
 - No mutation runs for a decision that did not pass all three never-miss safeguards.
+- No mutation runs for a decision whose `review_state != "reviewed"` — `apply_decision()` raises
+  `NotReviewedError` before the mutator is touched, and `force=True` does not bypass it.
 - Every mutation writes an `action_logs` row **before** the decision is marked `applied`, containing the
   exact request parameters and an undo token describing the precise inverse operation.
 - Undo restores the prior label state exactly (re-adds `INBOX`, removes the added category label), sets

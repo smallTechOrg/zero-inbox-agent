@@ -50,6 +50,14 @@ of the full thread for borderline cases — so most threads are resolved without
 - Only the redacted snippet, subject and headers are sent by default; body escalation happens only in
   tier 4.
 - Decisions are idempotent on `(run_id, item_id)`, so a resumed run never decides a thread twice.
+- **A `decided_by="error"` row is not a decision — it is unfinished work.** From Phase 7,
+  `already_decided_item_ids()` excludes rows with `decided_by="error"` or
+  `review_state="review_failed"`, so resuming a run re-classifies exactly that tail rather than
+  treating it as done, and `insert_provisional_decisions()` **overwrites** such a row in place instead
+  of skipping it (skipping would silently discard the re-classification). Every other already-decided
+  thread is still skipped, and `items_decided` is never double-counted. Inbox zero means the tail is
+  finished, not abandoned — run `fbeed060` left 179 such rows stranded as un-triaged keeps. See
+  [drive-to-inbox-zero](drive-to-inbox-zero.md#f-converge--the-tail-is-finished-not-abandoned).
 
 ## Success Criteria
 - [ ] A run over 220 real-shaped threads produces exactly 220 decisions, each with a category,
@@ -60,3 +68,6 @@ of the full thread for borderline cases — so most threads are resolved without
 - [ ] A forced LLM failure results in `needs_your_call` decisions, never `archive` decisions.
 - [ ] A thread whose sender the user has replied to is never proposed for archive.
 - [ ] The same run resumed after interruption produces no duplicate decision rows.
+- [ ] A run containing 20 `decided_by="error"` rows, when resumed, re-classifies exactly those 20
+      (none ends `decided_by="error"`), produces zero duplicate `(run_id, item_id)` pairs, and re-sends
+      no already-`reviewed` thread to the LLM.

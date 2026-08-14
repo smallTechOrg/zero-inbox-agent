@@ -45,7 +45,7 @@ for the phase plan and slices.
 
 | Capability | What it does |
 |------------|--------------|
-| [triage-transparency](triage-transparency.md) | Per-thread SSE events (`thread_classified`, `thread_archived`) surfaced in the Activity drawer; shared `SseContext` eliminates duplicate EventSource |
+| [triage-transparency](triage-transparency.md) | Per-thread SSE events (`thread_classified`, `thread_archived`) surfaced on the main dashboard page (drawer = history only); shared `SseContext` eliminates duplicate EventSource |
 
 ## Phase 6 — Durable, Resumable, Transparent Runs
 
@@ -55,3 +55,13 @@ for the phase plan and slices.
 | [never-miss-safeguards](never-miss-safeguards.md) | Extended: `review_state` gate — only `reviewed` decisions are appliable, enforced in `apply_decision()` |
 | [triage-transparency](triage-transparency.md) | Extended: per-thread coverage guarantee, `reasoning` + `review_state` on every event, provisional labelling, degraded-provider banner |
 | [decision-audit-trail](decision-audit-trail.md) | Extended: decisions and `llm_calls` survive an interrupted run |
+
+## Phase 7 — Drive to Inbox Zero
+
+| Capability | What it does |
+|------------|--------------|
+| [drive-to-inbox-zero](drive-to-inbox-zero.md) | Makes `auto_act_threshold` a real, calibrated, per-category autonomy control; converts confident archive-category keeps at decision time so the reviewer still audits them; applies them through the Phase 6 review gate (never around it, never with `force`); makes a failed apply loud instead of a silent `return`; finishes the `decided_by="error"` tail on resume; and reports `distance_to_zero` plus a remainder ledger explaining every thread still in the inbox |
+| [never-miss-safeguards](never-miss-safeguards.md) | Unchanged and binding: `align_to_category_default` runs **before** the reviewer, so every category-driven archive is audited, floored and VIP/reply-history-guarded |
+| [cost-tiered-triage](cost-tiered-triage.md) | Extended: `decided_by="error"` rows are not treated as decided — a resume re-classifies the tail |
+| [gmail-actions-and-undo](gmail-actions-and-undo.md) | Extended: retry-apply (`POST /api/runs/{run_id}/apply`) recovers a failed apply pass without re-classifying |
+| [triage-transparency](triage-transparency.md) | Extended (rules H/I/J): the live classification feed renders **inline on the main page with no clicks** while a run is active (the drawer stays as full history); continuity is guaranteed by logging at the right granularity through the structlog→bus bridge plus a self-arming watchdog, so no gap exceeds 3 s — including inside a single 29-thread tier-3 LLM call; and replay-on-connect is verified so a mid-run load or reload paints a populated feed |

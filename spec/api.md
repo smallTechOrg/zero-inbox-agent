@@ -136,10 +136,90 @@ Changes to existing routes:
   `thread_classified` gains the `reasoning` and `review_state` fields
   (shapes in [triage-transparency](capabilities/triage-transparency.md)).
 
+## Phase 7 — Drive to Inbox Zero
+
+| Method | Path | Body / Query | Returns |
+|--------|------|--------------|---------|
+| `GET` | `/api/runs/{run_id}/remainder` | — | The remainder ledger — the single honest answer to *"how far from zero am I, and why?"*. Shape below. Computed **live** from `decisions`, never from cached counts. `404` if the run does not exist for the session user. |
+| `POST` | `/api/runs/{run_id}/apply` | — | Re-runs the apply pass for a `completed` run in the background, without re-classifying a single thread. Returns the apply ledger. Idempotent: already-`applied` decisions are counted in `already_applied` and never mutated twice. `409 not_appliable` if the run's status is not `completed`. This is the recovery path for a transient Gmail/auth failure. |
+
+`GET /api/runs/{run_id}/remainder` response `data`:
+
+```json
+{
+  "run_id": "…",
+  "inbox_remaining": 1632,
+  "distance_to_zero": 0,
+  "applied": 544,
+  "apply_ok": true,
+  "apply_failed_reason": null,
+  "dry_run": false,
+  "remainder": {
+    "needs_your_call": 213,
+    "category_keep": 1314,
+    "held_by_never_miss": 34,
+    "below_threshold": 71,
+    "unclassified": 0
+  },
+  "failures": [{"decision_id": "…", "error": "…"}]
+}
+```
+
+`inbox_remaining == sum(remainder.*) + distance_to_zero`. `unclassified` counts decisions written
+before Phase 7 (`autonomy_state IS NULL`); it is always reported, never folded into another bucket.
+Bucket definitions are in
+[drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#the-inbox-zero-definition-written-down-and-stated-in-the-ui).
+
+Changes to existing routes:
+
+- `GET /api/runs/{run_id}` and `GET /api/runs/latest` gain `distance_to_zero: int` and
+  `apply_ok: bool`. `apply_ok` is `false` when the run's apply pass recorded an
+  `apply_failed_reason` **or** `distance_to_zero > 0`. A run that archived nothing can never render as
+  a clean success.
+- `GET /api/runs/{run_id}/summary` gains `applied_count`, `distance_to_zero` and the `remainder`
+  object. (`applied_count` was specified in Phase 3 but never implemented — Phase 7 closes that drift.)
+- `GET /api/categories` returns `auto_act_threshold` (nullable float) per category.
+  `PATCH /api/categories/{id}` accepts `auto_act_threshold`; `0 < v <= 1` or `validation_error`.
+  `default_action = "archive"` on the `urgent` key is still rejected.
+- `PATCH /api/settings` validates `auto_act_threshold` as `0 < v <= 1` (`validation_error` otherwise)
+  and, when the accepted value is `> 0.90`, returns `warning: "above_model_ceiling"` alongside the
+  updated settings — the measured model ceiling is ~0.94, so anything above 0.90 acts on almost
+  nothing. The default for a new user is `0.80`.
+- `GET /api/events` gains the event types:
+  - `apply_progress` — `{run_id, applied, total_to_apply, failed}`, emitted every 25 applied decisions
+    and once at the end of the pass.
+  - `run_apply_failed` — `{run_id, reason, distance_to_zero}`, emitted when the apply pass could not
+    run or did not reach zero.
+  - `inbox_zero_report` — `{run_id, applied, distance_to_zero, remainder}`, emitted once per run at
+    the end, mirroring the `triage.inbox_zero_report` structured log line.
+
+  - `activity_heartbeat` — `{run_id, phase, detail, batch_n, batch_total, batch_size, model,
+    elapsed_s, silent_for_s}`, published by the watchdog whenever **nothing** has been published for
+    a run for `HEARTBEAT_INTERVAL_SECONDS = 3.0`. It carries real observed state (derived from the
+    most recent log line for that run), never a content-free tick. Counts, ids, phase names, model
+    ids and elapsed times only — no subject, sender or body. Shape and rules in
+    [triage-transparency Rule I](capabilities/triage-transparency.md#rules--i-not-one-beat-without-a-log).
+
+  The existing `auto_apply_complete` event is **retained**, extended with the full apply ledger. No
+  existing subscriber breaks.
+
+- `GET /api/events` **replay-on-connect is load-bearing and verified in Phase 7.** On every
+  connection the endpoint first flushes `bus.replay_buffer(user_id)` — the last **1000** events for
+  that user — and only then streams live events. A client joining or reloading mid-run therefore
+  paints a populated feed immediately. This behaviour already exists (`src/api/events.py`); Phase 7
+  adds the end-to-end verification, not a rewrite.
+
+- The `log` event type (every structlog line for the bound user, forwarded by
+  `src/observability/logging.py::activity_bus_processor`) is the **primary** transport for run
+  granularity — `{type: "log", event, level, logger, timestamp, run_id, fields: {...}}`. Phase 7
+  raises the granularity of what the graph and the LLM client log rather than adding hand-placed
+  emits; see [triage-transparency Rule I2](capabilities/triage-transparency.md#rules--i-not-one-beat-without-a-log)
+  for the required log events.
+
 ## Error codes
 
 `unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `already_undone` (409) ·
 `reauth_required` (409, the Gmail refresh token is invalid) · `rate_limited` (429) ·
 `provider_error` (502) · `validation_error` (422) · `not_resumable` (409, the run has no partial work
 to resume) · `not_reviewed` (422, the decision has not passed the never-miss reviewer and can never be
-applied).
+applied) · `not_appliable` (409, the run is not `completed` so its decisions cannot be applied).

@@ -92,9 +92,10 @@ Materialises **1:1 as a real Gmail label**.
 | `channel_label_name` | str | e.g. `ZeroInbox/Newsletters` |
 | `channel_label_id` | str \| null | filled when the label is created in Gmail (Phase 2) |
 | `default_action` | str | `keep` \| `archive` \| `digest` |
+| `auto_act_threshold` | float \| null | **Phase 7.** The confidence bar at or above which the agent acts on its own **for this category**. `NULL` inherits `user_settings.auto_act_threshold`. Inert while `default_action = keep`. Validation `0 < v <= 1`. Seeded: `outreach` and `receipts` = `0.85`; all others NULL. See [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#a-the-autonomy-instrument-is-real-and-it-is-per-category) |
 | `is_default`, `sort_order` | bool, int | |
 
-Unique on `(user_id, key)`.
+Unique on `(user_id, key)`. `key = "urgent"` can never carry `default_action = archive`.
 
 ### `rules`
 | Field | Type | Notes |
@@ -143,10 +144,23 @@ Unique on `(user_id, key)`.
 | `time_sensitive` | bool | forces toward keep |
 | `status` | str | `proposed` \| `approved` \| `rejected` \| `applied` \| `undone` \| `needs_your_call` |
 | `review_state` | str NOT NULL, default `provisional` | `provisional` \| `reviewed` \| `review_failed` — **the never-miss finality gate** |
+| `autonomy_state` | str \| null | **Phase 7.** `auto_act` \| `below_threshold` \| `held_by_never_miss` \| `category_keep` \| `needs_your_call` — **why this thread is or is not leaving the inbox**. Written by `mark_autonomy_state` (see [agent.md](agent.md)); the grouping key of the remainder ledger and the sole basis of `distance_to_zero`. NULL only on rows written before Phase 7, reported as `unclassified` |
 | `created_at`, `decided_at` | ts | |
 
 Unique on `(run_id, item_id)` — makes resume idempotent.
 Index on `(run_id, review_state)` — the resume query and the apply-eligibility query both use it.
+Index on `(run_id, autonomy_state)` — the remainder ledger and the `distance_to_zero` query use it.
+
+`autonomy_state` is orthogonal to both `status` and `review_state`. `status` is the user/action
+lifecycle, `review_state` is the never-miss lifecycle, `autonomy_state` is the **autonomy** lifecycle:
+whether the agent was permitted to act on this thread by itself, and if not, which rule stopped it.
+Exactly one value per decision; the five values partition the run.
+
+```
+distance_to_zero = count(decisions WHERE run_id = :id
+                                     AND autonomy_state = 'auto_act'
+                                     AND status != 'applied')
+```
 
 `review_state` is orthogonal to `status`. `status` is the *user/action* lifecycle; `review_state` is
 the *never-miss* lifecycle. A row is written `provisional` the instant its tier decides it and is
@@ -180,8 +194,8 @@ eligible for apply/approve**, checked independently of `status` and not bypassab
 | Field | Type | Default |
 |-------|------|---------|
 | `user_id` PK FK | | |
-| `auto_act_threshold` | float | `0.95` |
-| `confidence_floor` | float | `0.75` — below this the agent never archives |
+| `auto_act_threshold` | float | **`0.80`** (Phase 7; was `0.95`) — the **global** confidence bar at or above which the agent acts on its own. Overridden per category by `categories.auto_act_threshold`. Enforced from Phase 7 onward; before Phase 7 this column was persisted and rendered but read by no decision or apply path. Calibration in [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#b-calibration--why-080-justified-against-the-measured-distribution) |
+| `confidence_floor` | float | `0.75` — below this the agent never archives; a hard lower bound on the effective autonomy threshold |
 | `dry_run` | bool | `true` (Phase 1: forced true) |
 | `llm_model` | str | `nvidia/nemotron-3-nano-30b-a3b` |
 | `digest_hour_local` | int | `8` |
@@ -254,12 +268,56 @@ Downgrade drops the index and the column.
 
 ---
 
+## Phase 7 migration
+
+Alembic revision `0006_autonomy_policy` (single migration, required). **It touches real user rows —
+`zero_inbox.db` holds 11,449 real decisions for 2 real accounts — so every statement is spelled out.**
+
+1. `ALTER TABLE categories ADD COLUMN auto_act_threshold FLOAT NULL`.
+2. **Seed the per-category overrides for existing users** (new users get them from `db.seed`):
+   `UPDATE categories SET auto_act_threshold = 0.85 WHERE key IN ('outreach', 'receipts')`.
+   All other categories stay NULL and inherit the global value.
+3. `ALTER TABLE decisions ADD COLUMN autonomy_state VARCHAR NULL`.
+   **No backfill.** A pre-Phase-7 decision was made under a policy that did not exist; inventing an
+   `autonomy_state` for it would fabricate history. Every such row is reported by the remainder ledger
+   under the explicit `unclassified` bucket, never folded into a healthy one.
+4. `CREATE INDEX ix_decisions_run_autonomy ON decisions (run_id, autonomy_state)`.
+5. **Migrate the persisted global threshold** — this is the load-bearing statement:
+   `UPDATE user_settings SET auto_act_threshold = 0.80 WHERE auto_act_threshold > 0.90`.
+   - Rationale: a value above 0.90 was never read by any decision or apply code path, so it never
+     expressed a real user preference — it was the unused shipped default (`0.95`), and it sits above
+     the model's entire measured output range (ceiling ~0.94). Resetting it cannot regress behaviour,
+     because no behaviour was ever derived from it. Leaving it would mean the fix silently does nothing
+     for the very account that reported the problem (that account holds `0.95`).
+   - Values at or below 0.90 are **left exactly as they are**. The second real account holds `0.75`;
+     that is a deliberate "act on everything above the floor" setting and it survives untouched (the
+     effective bar is then `max(0.75, confidence_floor) = 0.75`).
+   - After this statement, **no `user_settings` row may hold a value above 0.90** — asserted by the
+     migration test.
+6. `ALTER COLUMN user_settings.auto_act_threshold SET DEFAULT 0.80` (and the ORM default in
+   `src/db/models.py`, plus the hardcoded `0.95` fallbacks at `src/api/session.py:143` and `:187`, and
+   `DEFAULT_AUTO_ACT_THRESHOLD` in `src/graph/persistence.py:139`).
+
+Downgrade drops `ix_decisions_run_autonomy`, `decisions.autonomy_state` and
+`categories.auto_act_threshold`, and restores the `0.95` column default. It does **not** restore
+per-row `auto_act_threshold` values — step 5 is a deliberate one-way data migration and the downgrade
+says so in a comment rather than guessing at the prior value.
+
+---
+
 ## Lifecycle
 
 ```
 Item ingested ──▶ Decision(review_state=provisional, proposed | needs_your_call)   ← durable immediately
                       │
+    align_to_category_default ──▶ keep→archive where the category says so          ← Phase 7; the ONLY
+                      │            (only above the effective autonomy threshold)      keep→archive stage,
+                      │                                                                and it runs FIRST
     second-pass reviewer + never-miss floor ──▶ Decision(review_state=reviewed)     ← now final
+                      │
+    mark_autonomy_state ──▶ Decision(autonomy_state ∈ auto_act | below_threshold |  ← Phase 7; why this
+                      │      held_by_never_miss | category_keep | needs_your_call)     thread does/doesn't
+                      │                                                                leave the inbox
                       │  (reviewer unavailable ──▶ review_state=review_failed, never applied)
                       ▼
                   Decision(proposed | needs_your_call)

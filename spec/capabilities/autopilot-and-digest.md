@@ -86,7 +86,9 @@ without opening Gmail. Also replaces the taxonomy settings stub with a real inli
 - [ ] After undo, the "Undo this run" button is replaced with "Run undone" (disabled).
 - [ ] The Digest tab renders data from `GET /api/digest/latest` with `time_sensitive_kept`,
       `vip_mail`, `auto_kept_low_confidence`, and `auto_archived` sections.
-- [ ] The Activity drawer subscribes to `GET /api/events` on page load and renders each event with
-      an icon and timestamp; the `run_completed` event row has an "Undo run" button.
+- [ ] The app subscribes to `GET /api/events` on page load and renders each event with an icon and
+      timestamp; run activity is **visible on the main dashboard page without the user opening any
+      drawer or taking any action** (the Activity drawer holds the full history), and the
+      `run_completed` row has an "Undo run" button.
 - [ ] Settings → Taxonomy renders a real inline editor (not a stub): each category row supports
       rename, default-action dropdown, and drag-to-reorder; changes persist via `PATCH /api/categories/{id}`.
