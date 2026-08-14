@@ -834,9 +834,10 @@ That is the whole phase.
 | Decision | Value | Justification |
 |----------|-------|---------------|
 | Inbox-zero definition | The inbox holds only what needs a human: `category_keep` + `held_by_never_miss` + `below_threshold` + `needs_your_call`. Everything else is archived + labelled + undoable. | Written in full in the capability file and rendered **verbatim** in the Inbox-Zero card, so the user's meaning of "zero" and the system's are the same. |
-| Autonomy instrument | Per-category, with a global fallback: `max(category.auto_act_threshold ?? settings.auto_act_threshold, confidence_floor)` | A Newsletters archive at 0.85 is a different risk from an Outreach archive at 0.85. `default_action` already carries most of the risk decision (People/Urgent/Receipts never auto-act at any confidence); the threshold refines the rest. Newsletters/Notifications inherit the global, so the global slider stays load-bearing. |
+| Autonomy instrument | Per-category, with a global fallback: `max(category.auto_act_threshold ?? settings.auto_act_threshold, confidence_floor)` | A Newsletters archive at 0.85 is a different risk from an Outreach archive at 0.85. `default_action` already carries most of the risk decision (People/Urgent/Legal never auto-act at any confidence); the threshold refines the rest. Newsletters/Notifications inherit the global, so the global slider stays load-bearing. |
 | Global default | **`0.80`** (was `0.95`) | The elbow of the measured distribution: `0.95` → 0 archives, `0.90` → 22, **`0.80` → 544 of 615 (88.5%)**, `0.75` → identical to `confidence_floor` and therefore redundant. |
-| Per-category seeds | `outreach` = `0.85`, `receipts` = `0.85`, rest NULL | Outreach is the one archive-by-default category where a false archive costs a real opportunity. Receipts is `keep` today so its bar is inert — seeded so flipping it in the taxonomy editor is conservative by default. |
+| Per-category seeds | `outreach` = `0.85`, `receipts` = `0.85`, rest NULL | Both are **live** bars. Outreach's 0.85 is a recorded **judgement call, not a measurement**: a real business inquiry wrongly archived costs far more than a promo wrongly kept, and that asymmetry justifies the margin above the 0.80 global — do not optimise it down to 0.80. Receipts is `archive` as of this phase, so its 0.85 is live too: Receipts archives only at `>= 0.85`, a notch more conservative than the global. |
+| **Receipts `default_action`** | **`keep` → `archive`** (decided; was an open flag) | Measured by category on `fbeed060`: Notifications 703, Newsletters 456, People 354, **Receipts 283**, Outreach 122, Urgent 68, Legal 10. Keeping Receipts puts a **~715-thread floor** under the inbox (Receipts + People + Urgent + Legal) — the product could not reach its own stated definition of inbox zero. Receipts are archival records, not work: you search for an invoice, you don't action it from the inbox. Nothing is lost — labelled `ZeroInbox/Receipts`, searchable, one-click undoable, never trashed. **The safety net still binds and is the right instrument for the exception:** a genuinely time-sensitive receipt is flagged `time_sensitive` and held by `held_by_never_miss`, staying visible regardless of the category default — which is why this flip is safe. It also matches the user's revealed preference ("archive everything except needs_your_call"). **People, Urgent and Legal remain `keep`.** Full reasoning in [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#decision--receipts-is-archive-was-an-open-question-now-decided). |
 | Migration of the persisted `0.95` | `UPDATE user_settings SET auto_act_threshold = 0.80 WHERE auto_act_threshold > 0.90` | A value above 0.90 was never read by any code path, so it never expressed a preference — and it sits above the model's ceiling. Leaving it would mean the fix silently does nothing for the exact account that reported the problem. The other real account's `0.75` is a deliberate setting and is **left untouched**. |
 | The `keep` question | The category default is applied **at decision time, before the reviewer** — the decision *becomes* `archive` — never as an apply-time override of a `keep`. | Converting before the reviewer means the reviewer audits it, the floor binds, and VIP/reply-history can veto. Overriding at apply time would archive mail the reviewer never saw, through the `force` door built for a deliberate user sweep. The "keeps are not force-archived" invariant is preserved exactly. |
 | The dead slider | Made real and relabelled, with an above-ceiling warning | Shipping a no-op control is not acceptable. It is not deleted, because it is now the bar governing Newsletters + Notifications — the bulk of the mail. |
@@ -949,7 +950,11 @@ SseEventType gains "activity_heartbeat"   # frontend/src/lib/types.ts + SseConte
 - `src/db/models.py`: `Category.auto_act_threshold` (nullable Float),
   `Decision.autonomy_state` (nullable String), `UserSettings.auto_act_threshold` default `0.80`.
 - `src/db/seed.py`: seed `outreach` and `receipts` at `0.85`; leave the rest NULL.
-- `alembic/versions/0006_autonomy_policy.py`: the six statements in
+- `src/tools/rules.py` — **owned by slice 1 for this one-line change only** (no other Phase 7 slice
+  touches this file): in `DEFAULT_TAXONOMY`, the `receipts` entry becomes
+  `"default_action": "archive"` (was `"keep"`). This is where the seeded `default_action` values live —
+  **not** `src/db/seed.py`. Nothing else in the file changes.
+- `alembic/versions/0006_autonomy_policy.py`: the statements in
   [data.md § Phase 7 migration](data.md#phase-7-migration), exactly as written. **This touches real
   user rows — no ad-hoc scripts, no improvisation, and the downgrade documents the one-way step.**
 - `src/tools/taxonomy.py`: validate `0 < auto_act_threshold <= 1`; `Urgent` still cannot be `archive`.
@@ -959,10 +964,13 @@ SseEventType gains "activity_heartbeat"   # frontend/src/lib/types.ts + SseConte
 - **Tests:** `test_autonomy.py` (threshold resolution incl. the floor lower bound; the fixed
   precedence of `classify_autonomy_state`); `test_align_to_category_default.py` (every exclusion in
   C1 individually — `needs_your_call`, `error`, `rule`, `time_sensitive`, `unsure`, `ever_replied`,
-  VIP; People/Urgent at 0.99 unmoved; Newsletters at 0.88 moved and at 0.79 not; cluster
+  VIP; People/Urgent at 0.99 unmoved; Newsletters at 0.88 moved and at 0.79 not; **Receipts at 0.86
+  moved and at 0.82 not — the live 0.85 bar; and a `time_sensitive` Receipt at 0.95 unmoved**; cluster
   `suggested_action` refreshed); `test_taxonomy_autonomy.py`; `test_autonomy_migration.py` (upgrade on
   a seeded DB containing a `0.95` row and a `0.75` row: the first becomes `0.80`, the second is
-  unchanged, **no row is left above 0.90**, `outreach`/`receipts` are `0.85`, pre-existing decisions
+  unchanged, **no row is left above 0.90**, `outreach`/`receipts` are `0.85`, **a seeded `receipts`
+  category with `default_action = 'keep'` becomes `'archive'` while one a user already set to `digest`
+  is untouched**, pre-existing decisions
   are `autonomy_state IS NULL`; then downgrade + upgrade again); `test_settings_validation.py`.
 
 ##### Slice 2 — `apply-and-converge`
@@ -1243,10 +1251,14 @@ unchanged — Phase 7 must not regress the Phase 6 durability or privacy guarant
    **"Act on its own above this confidence"** and sits at **0.80** — it was silently 0.95 and did
    nothing. Drag it to 0.95: a red warning appears — *"At this setting the agent will archive almost
    nothing — your inbox will not reach zero."* Drag it back to 0.80.
-3. Open **Settings → Taxonomy**. Newsletters, Notifications and Outreach show `archive`;
-   People, Urgent and Receipts show `keep` with their threshold input disabled and the note
-   *"kept by default — never archived automatically"*. Outreach shows `0.85`. **This is the control
-   that decides what "zero" means for you.**
+3. Open **Settings → Taxonomy**. Newsletters, Notifications, Outreach **and Receipts** show `archive`;
+   People, Urgent (and Legal, if you have it) show `keep` with their threshold input disabled and the
+   note *"kept by default — never archived automatically"*. Outreach **and Receipts** each show
+   `0.85` — a notch stricter than the 0.80 global. **Receipts changed from `keep` to `archive` in this
+   phase**: receipts are records you search for, not work you action, and keeping them put a ~700-thread
+   floor under your inbox. They are archived and labelled `ZeroInbox/Receipts`, never deleted, and a
+   time-sensitive one (invoice due, payment failed) is still held in the inbox by the never-miss layer.
+   If you disagree, flip it back here — **this is the control that decides what "zero" means for you.**
 4. Go back to the dashboard and click **Run triage (200 threads)**. **Do not open the Activity
    drawer. Do not click anything.** Within a second or two the **live feed appears by itself on the
    main page** and starts scrolling: one row per thread — tier badge · subject · → category · action ·
@@ -1270,7 +1282,9 @@ unchanged — Phase 7 must not regress the Phase 6 durability or privacy guarant
    enough / held by VIP or reply history. The live feed collapses to a one-line summary — it never
    leaves an empty box or a progress bar for work that is not running.
 9. **Check Gmail.** The archived threads are genuinely out of the inbox and carry their `ZeroInbox/…`
-   label. **Nothing is in Trash.** People, Urgent and Receipts threads are still in the inbox.
+   label. **Nothing is in Trash.** People, Urgent (and Legal) threads are still in the inbox — **and so
+   are any time-sensitive receipts**, held by the never-miss layer. Ordinary Receipts threads are
+   **gone from the inbox**, findable under the `ZeroInbox/Receipts` label and restored by Undo.
 10. Click **Undo this run** on the Run Summary card and confirm everything comes back — then re-run.
     The archives are real mutations with real undo tokens, not a report.
 11. **Test the loud-failure path deliberately:** temporarily rename your Gmail connection's refresh

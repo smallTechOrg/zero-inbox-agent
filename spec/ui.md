@@ -226,18 +226,23 @@ Loaded from `GET /api/runs/{run_id}/remainder` for the latest run (refetched on 
 who thinks "zero" means one thing and gets another has been misled):
 
 > **Inbox zero means your inbox holds only what needs a human.**
-> Newsletters, Notifications and Outreach are archived — never deleted, always undoable — when the
-> agent is confident enough to act alone. **People, Urgent and Receipts always stay**, along with
+> Newsletters, Notifications, Outreach and Receipts are archived — never deleted, always undoable —
+> when the agent is confident enough to act alone. **People, Urgent and Legal always stay**, along with
 > anyone you've replied to, anyone on your VIP list, anything time-sensitive, anything it wasn't
 > confident about, and anything one of your own rules kept.
 > *Change which categories leave →* (link to **Settings → Taxonomy**)
+
+Both category name lists in that text are **interpolated from the live taxonomy, never hardcoded**: the
+first list is every category with `default_action = archive`, the second every category with
+`default_action = keep`. The wording above shows them at the seeded defaults (Receipts is `archive` as
+of Phase 7; Legal is a user-added keep category and appears only if it exists).
 
 **The remainder ledger** — one row per bucket, count + plain-English reason, in this fixed order:
 
 | Row | Copy |
 |-----|------|
 | `needs_your_call` | "**213** need your call — below the confidence floor, or the agent couldn't decide" |
-| `category_keep` | "**1,314** kept by category — People, Urgent, Receipts" (category names read from the live taxonomy, never hardcoded) |
+| `category_keep` | "**1,031** kept by category — People, Urgent, Legal" (category names read from the live taxonomy, never hardcoded — this row lists exactly the categories whose `default_action` is `keep`; Receipts is **not** among them as of Phase 7) |
 | `below_threshold` | "**71** not confident enough to archive on its own" — with an inline hint naming the current bar, e.g. *"the bar is 0.80; these scored 0.75–0.79"* |
 | `held_by_never_miss` | "**34** held by VIP or reply history" |
 | `unclassified` | "**N** decided before this policy existed" — **only rendered when `> 0`** |

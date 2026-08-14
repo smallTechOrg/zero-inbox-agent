@@ -27,7 +27,10 @@ materialising every category **1:1 as a real Gmail label**.
 
 ## Business Rules
 - Default taxonomy: **Newsletters, Notifications, Receipts, Outreach, People, Urgent** — all editable
-  and deletable by the user.
+  and deletable by the user. Seeded `default_action`: `archive` for Newsletters, Notifications,
+  Outreach **and Receipts** (Receipts changed from `keep` to `archive` in Phase 7 — see
+  [drive-to-inbox-zero](drive-to-inbox-zero.md#decision--receipts-is-archive-was-an-open-question-now-decided));
+  `keep` for People and Urgent. A user-added category such as **Legal** typically stays `keep`.
 - Each category's plain-English `description` is used verbatim in the classifier prompt, so editing the
   description immediately changes classification behaviour.
 - Every category maps to exactly one mailbox label, namespaced `ZeroInbox/<Name>`. Creating a category

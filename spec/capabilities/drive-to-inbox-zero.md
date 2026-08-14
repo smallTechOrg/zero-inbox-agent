@@ -52,7 +52,7 @@ value always names the **first** rule that stopped the agent acting:
 
 | Bucket | `autonomy_state` | Why it is still in the inbox |
 |--------|------------------|------------------------------|
-| Category says keep | `category_keep` | Its category's `default_action` is `keep` — by default People, Urgent, Receipts |
+| Category says keep | `category_keep` | Its category's `default_action` is `keep` — by default People, Urgent and any user-added keep category (e.g. Legal). **Receipts is `archive` — see Rule B.** |
 | Held by never-miss | `held_by_never_miss` | Reviewer flip, VIP entry, ever-replied sender, or `time_sensitive` |
 | Not confident enough | `below_threshold` | An archive-category thread above the confidence floor but below its category's autonomy threshold |
 | Needs your call | `needs_your_call` | Below the confidence floor, or the tier could not decide it (`decided_by="error"`) |
@@ -76,7 +76,8 @@ makes cause 3 impossible to miss. It is not a soft metric; it is the assertion t
 ### Resolving the `keep` question (why keeps are converted, not overridden)
 
 A category's `default_action` — not a blanket rule and not a per-decision override — decides whether a
-confident thread stays visible. Newsletters/Notifications/Outreach leave; People/Urgent/Receipts stay.
+confident thread stays visible. Newsletters/Notifications/Outreach/Receipts leave; People/Urgent (and
+any user-added keep category such as Legal) stay.
 
 The honest place to apply that is **at decision time, before the reviewer**, not at apply time. If a
 Newsletters thread at 0.88 confidence belongs out of the inbox, the decision must **be** `archive` —
@@ -172,21 +173,52 @@ The 615 archive proposals from run `fbeed060`:
 > value is a setting, and the gate re-asserts the band arithmetic against a fixture that replays it, so
 > a model change that shifts the distribution fails the gate loudly rather than silently archiving more.
 
-**Seeded per-category thresholds** (`src/db/seed.py`):
+**Seeded per-category thresholds.** The thresholds are seeded by `src/db/seed.py`; the seeded
+`default_action` values live in `DEFAULT_TAXONOMY` in **`src/tools/rules.py`**.
 
-| Category | `default_action` (unchanged) | seeded `auto_act_threshold` | Why |
-|----------|------------------------------|-----------------------------|-----|
+| Category | `default_action` | seeded `auto_act_threshold` | Why |
+|----------|------------------|-----------------------------|-----|
 | Newsletters | `archive` | `NULL` → global `0.80` | Bulk, opted-in, undoable. This is the 522-strong `0.80–0.89` band. |
 | Notifications | `archive` | `NULL` → global `0.80` | Automated and reproducible at source. |
-| Outreach | `archive` | **`0.85`** | The one archive-by-default category where a false archive costs a real opportunity (a genuine intro reads like recruiter spam). One measured band up. |
-| Receipts | `keep` | `0.85` | Inert while `default_action = keep`; seeded so that a user who flips it to `archive` in the taxonomy editor gets the conservative bar, not the global one. |
+| Outreach | `archive` | **`0.85`** | See "Why Outreach sits at 0.85" below. |
+| Receipts | **`archive`** (changed this phase, was `keep`) | **`0.85`** — **live, not inert** | See "Why Receipts archives" below. Receipts archives only at `>= 0.85` — a notch more conservative than the 0.80 global. |
 | People | `keep` | `NULL` | Inert — never auto-acted (A4). |
 | Urgent | `keep` | `NULL` | Inert — and `archive` is forbidden for this key (A4). |
+| Legal (user-added, if present) | `keep` | `NULL` | Inert — never auto-acted (A4). |
 
-> **Assumed:** no seeded `default_action` changes in this phase. Receipts stays `keep` even though many
-> zero-inbox workflows archive it. Silently changing what happens to a real user's receipts is a
-> behaviour change they did not ask for; the taxonomy editor (real since Phase 3) is the honest control,
-> and the Inbox-Zero card names Receipts explicitly as a category that stays, with a link to change it.
+#### Decision — Receipts is `archive` (was an open question; now decided)
+
+Measured by category on run `fbeed060`: Notifications 703, Newsletters 456, People 354,
+**Receipts 283**, Outreach 122, Urgent 68, Legal 10. With Receipts kept, the **floor** of the inbox is
+~715 threads (Receipts + People + Urgent + Legal). The product would hand the user an "inbox zero"
+containing ~700 threads — **it could not reach its own stated definition of inbox zero**. That is the
+original broken promise in a new outfit, so the default changes.
+
+- **Receipts are archival records, not work.** You *search* for an invoice when you need it; you do not
+  action it from the inbox.
+- **Nothing is lost.** The thread is archived and labelled `ZeroInbox/Receipts` — fully searchable and
+  one-click undoable. It is moved out of the way, **not deleted**. No trash, no delete, no spam, ever
+  (unchanged).
+- **The safety net still binds, and it is the right instrument for the exception.** A genuinely
+  time-sensitive receipt (invoice due, payment failed) is flagged `time_sensitive` and held by
+  `held_by_never_miss`, so it **stays visible regardless of the category default**. That is exactly what
+  the never-miss layer exists for — which is why the category default does not need to do that job too,
+  and why this flip is safe.
+- **It matches the user's revealed preference:** offered precisely this tradeoff earlier, they chose
+  "archive everything except needs_your_call" and were satisfied.
+
+**People, Urgent and Legal remain `keep`** — those are the buckets where a human genuinely needs to look.
+
+Every safety invariant still binds on Receipts, unchanged: `confidence_floor`, VIP entries,
+reply-history (ever-replied senders), the Phase 6 review gate (`NotReviewedError`, **not** bypassable by
+`force=True`), no-trash-ever, undo tokens on every mutation, and absolute `dry_run`.
+
+#### Why Outreach sits at 0.85 (a judgement call, not a measurement)
+
+`outreach = 0.85` is **deliberate and recorded, not derived from the band table**. A real business
+inquiry wrongly archived costs far more than a promotional email wrongly kept; that asymmetry justifies
+the extra margin above the 0.80 global. **Do not "optimise" it down to 0.80** — the gap is the point,
+not an oversight.
 
 ### C. Category default decides the action — `align_to_category_default`
 
@@ -281,8 +313,11 @@ and before `second_pass_reviewer`**. It is the only stage in the system that may
   `distance_to_zero`. `unclassified` counts rows whose `autonomy_state` is NULL — always reported,
   never folded into a healthy bucket.
 - **E2.** The human-readable line the UI renders is built from the ledger and names every bucket:
-  *"544 archived · 213 need your call · 1,314 kept by category (People, Urgent, Receipts) · 71 not
-  confident enough · 34 held by VIP / reply history."*
+  *"827 archived · 213 need your call · 1,031 kept by category (People, Urgent, Legal) · 71 not
+  confident enough · 34 held by VIP / reply history."* (Illustrative shape, not a measured projection:
+  the 283 Receipts threads now enter the archive path and split across `archived` / `below_threshold` /
+  `held_by_never_miss` according to their own confidences and the 0.85 Receipts bar. The category names
+  are read from the live taxonomy, never hardcoded.)
 - **E3.** The Settings slider is relabelled and made honest (see
   [ui.md screen 17](../ui.md#17-honest-autonomy-controls-phase-7--settings)):
   it states what it controls, shows the resolved per-category bars, and warns above 0.90 that the
@@ -371,7 +406,9 @@ and before `second_pass_reviewer`**. It is the only stage in the system that may
       `already_applied == n`, `applied == 0`, performs zero Gmail calls, and is safe to call twice.
 - [ ] Migration `0006_autonomy_policy`: a `user_settings` row at `0.95` becomes `0.80`; a row at `0.75`
       is unchanged; new rows default to `0.80`; `categories.auto_act_threshold` is `0.85` for
-      `outreach` and `receipts` and NULL for the rest; every pre-existing `decisions` row has
+      `outreach` and `receipts` and NULL for the rest; a `receipts` category still at the seeded
+      `default_action = 'keep'` becomes `'archive'` while one the user already changed is left alone;
+      every pre-existing `decisions` row has
       `autonomy_state IS NULL` and is reported under `unclassified`, never miscounted.
 - [ ] `PATCH /api/settings` with `auto_act_threshold = 0` is rejected with `validation_error`; with
       `0.93` it is accepted and the response carries `warning: "above_model_ceiling"`.

@@ -91,8 +91,8 @@ Materialises **1:1 as a real Gmail label**.
 | `description` | str | plain English — used verbatim in the classifier prompt |
 | `channel_label_name` | str | e.g. `ZeroInbox/Newsletters` |
 | `channel_label_id` | str \| null | filled when the label is created in Gmail (Phase 2) |
-| `default_action` | str | `keep` \| `archive` \| `digest` |
-| `auto_act_threshold` | float \| null | **Phase 7.** The confidence bar at or above which the agent acts on its own **for this category**. `NULL` inherits `user_settings.auto_act_threshold`. Inert while `default_action = keep`. Validation `0 < v <= 1`. Seeded: `outreach` and `receipts` = `0.85`; all others NULL. See [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#a-the-autonomy-instrument-is-real-and-it-is-per-category) |
+| `default_action` | str | `keep` \| `archive` \| `digest`. Seeded (from `DEFAULT_TAXONOMY` in `src/tools/rules.py`): `archive` for Newsletters, Notifications, Outreach **and Receipts** (Receipts changed from `keep` in Phase 7); `keep` for People and Urgent. |
+| `auto_act_threshold` | float \| null | **Phase 7.** The confidence bar at or above which the agent acts on its own **for this category**. `NULL` inherits `user_settings.auto_act_threshold`. Inert only while `default_action = keep`. Validation `0 < v <= 1`. Seeded: `outreach` and `receipts` = `0.85` — **both live**, since both are `archive` categories; all others NULL. See [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#a-the-autonomy-instrument-is-real-and-it-is-per-category) |
 | `is_default`, `sort_order` | bool, int | |
 
 Unique on `(user_id, key)`. `key = "urgent"` can never carry `default_action = archive`.
@@ -277,6 +277,12 @@ Alembic revision `0006_autonomy_policy` (single migration, required). **It touch
 2. **Seed the per-category overrides for existing users** (new users get them from `db.seed`):
    `UPDATE categories SET auto_act_threshold = 0.85 WHERE key IN ('outreach', 'receipts')`.
    All other categories stay NULL and inherit the global value.
+2b. **Flip Receipts to `archive` for existing users** (new users get it from `DEFAULT_TAXONOMY` in
+   `src/tools/rules.py`): `UPDATE categories SET default_action = 'archive' WHERE key = 'receipts' AND
+   default_action = 'keep'`. Only the untouched seeded value is migrated — the `AND default_action =
+   'keep'` guard means a user who already changed it is never overwritten. Reasoning and safety argument
+   in [drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md#decision--receipts-is-archive-was-an-open-question-now-decided).
+   The downgrade reverses it (`'archive'` → `'keep'` for `key = 'receipts'`).
 3. `ALTER TABLE decisions ADD COLUMN autonomy_state VARCHAR NULL`.
    **No backfill.** A pre-Phase-7 decision was made under a policy that did not exist; inventing an
    `autonomy_state` for it would fabricate history. Every such row is reported by the remainder ledger
