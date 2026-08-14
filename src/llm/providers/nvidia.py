@@ -33,6 +33,7 @@ from openai import (
     RateLimitError,
 )
 
+from llm import health, throttle
 from llm.providers.base import LLMError, LLMResult, estimate_cost_usd
 from observability.logging import get_logger
 
@@ -121,8 +122,18 @@ class NvidiaProvider:
         if disable_thinking:
             kwargs["extra_body"] = {"chat_template_kwargs": {"thinking": False}}
 
+        # Rule E: a model whose circuit is open is not attempted at all — the caller
+        # advances the fallback chain instead of paying another full retry budget.
+        health.check_circuit(model=model_id)
+
         started = time.monotonic()
-        response, attempts = await self._request_with_retries(kwargs)
+        health.record_call()
+        try:
+            response, attempts = await self._request_with_retries(kwargs)
+        except LLMError as exc:
+            health.record_failure(model=model_id, error=str(exc))
+            raise
+        health.record_success(model=model_id)
         latency_ms = int((time.monotonic() - started) * 1000)
 
         choice = response.choices[0]
@@ -151,6 +162,10 @@ class NvidiaProvider:
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
+                # Rule G: the process-wide bucket gates EVERY outbound request —
+                # first attempts and retries alike. Waiting here is not a failure and
+                # is never counted as a retry.
+                await throttle.acquire()
                 # The wait_for deadline bounds total wall-clock per attempt. httpx's
                 # read timeout alone is per socket read, so a reasoning model that
                 # streams thought tokens slowly could otherwise run 2-3x past the
@@ -166,7 +181,8 @@ class NvidiaProvider:
                 if exc.status_code not in _RETRY_STATUS:
                     raise LLMError(
                         f"NVIDIA NIM call failed ({exc.status_code}) for model "
-                        f"{kwargs['model']!r}: {exc}"
+                        f"{kwargs['model']!r}: {exc}",
+                        model=kwargs.get("model"),
                     ) from exc
                 last_exc = exc
             if attempt < self._max_retries:
@@ -182,8 +198,10 @@ class NvidiaProvider:
                     backoff_seconds=round(delay, 2),
                     cause=type(last_exc).__name__,
                 )
+                health.record_retry(model=kwargs.get("model"))
                 await asyncio.sleep(delay)
         raise LLMError(
             f"NVIDIA NIM call failed after {self._max_retries} attempts for model "
-            f"{kwargs['model']!r}: {last_exc}"
+            f"{kwargs['model']!r}: {type(last_exc).__name__}: {last_exc}",
+            model=kwargs.get("model"),
         ) from last_exc

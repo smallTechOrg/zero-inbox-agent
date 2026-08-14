@@ -12,9 +12,16 @@ import { RunProgress } from '@/components/RunProgress'
 import { InboxSummary } from '@/components/InboxSummary'
 import { EmptyState, ErrorState, SkeletonRows } from '@/components/States'
 import { RunSummaryCard } from '@/components/RunSummary'
+import { ResumeBanner } from '@/components/ResumeBanner'
 
-/** Anything that is not a terminal status (completed / failed / cancelled). */
-const RUN_ACTIVE = isRunActive
+/**
+ * In flight = not terminal AND not `resumable`.
+ *
+ * `resumable` is non-terminal (one click puts it back to `running`) but nothing is
+ * executing, so it must not poll, must not show a progress bar and must not disable
+ * the Triage button — it shows the Resume banner (ui.md screen 13) instead.
+ */
+const RUN_ACTIVE = (status: string) => isRunActive(status) && status !== 'resumable'
 
 export default function Dashboard() {
   const [me, setMe] = useState<Me | null>(null)
@@ -137,6 +144,18 @@ export default function Dashboard() {
     [connection, loadClusters],
   )
 
+  /** After POST /api/runs/{id}/resume: re-read the row so the progress bar picks
+   *  up at items_decided, not 0, and the 1s poll restarts. */
+  const resumeRun = useCallback(async () => {
+    if (!run) return
+    try {
+      setRun(await api.run(run.id))
+      setRefreshKey(k => k + 1)
+    } catch (e) {
+      setRunError(e)
+    }
+  }, [run])
+
   const cancelRun = useCallback(async () => {
     if (!run) return
     setCancelling(true)
@@ -248,7 +267,19 @@ export default function Dashboard() {
 
               {runError ? <ErrorState error={runError} onRetry={() => void startTriage()} /> : null}
 
-              {run ? (
+              {run && run.status === 'resumable' ? (
+                <ResumeBanner
+                  run={{
+                    id: run.id,
+                    items_total: run.items_total,
+                    items_decided: run.items_decided,
+                  }}
+                  onResumed={() => void resumeRun()}
+                  onStartFresh={() => void startTriage(false)}
+                />
+              ) : null}
+
+              {run && run.status !== 'resumable' ? (
                 <RunProgress
                   run={run}
                   onCancel={() => void cancelRun()}

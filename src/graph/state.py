@@ -39,6 +39,15 @@ class TriageState(TypedDict, total=False):
     counts: dict
     cost: dict
 
+    # resume (Phase 6, spec/capabilities/durable-resumable-runs.md)
+    #: item ids (both persisted ids and channel thread ids) this run has already
+    #: decided — filtered out of every tier queue so they are never re-classified.
+    already_decided_item_ids: list[str]
+    #: how many threads the interrupted leg(s) already decided (progress denominator)
+    already_decided_count: int
+    #: item ids whose reviewer pass could not complete — never applied
+    review_failed_item_ids: list[str]
+
     # control
     error: str | None
     status: str

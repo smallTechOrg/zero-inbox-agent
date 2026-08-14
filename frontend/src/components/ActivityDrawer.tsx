@@ -1,11 +1,21 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '@/lib/api'
-import type { SseEvent, SseEventType } from '@/lib/types'
-import { sseLive } from '@/lib/sseLive'
+/**
+ * The Activity drawer — the live classification surface (ui.md screen 14).
+ *
+ * It no longer owns an `EventSource`: the single shared stream lives in
+ * `@/lib/SseContext`. The drawer renders the derived feed — one row per decided
+ * thread keyed by `item_id` (a reviewer flip replaces the earlier row in place),
+ * amber system rows for a mid-run `model_fallback`, a `run_resumable` row with a
+ * Resume button, and a pinned degraded-provider banner that auto-opens the
+ * drawer so a stretched run is never a silent backend condition.
+ */
 
-const MAX_EVENTS = 50
+import { useEffect, useRef, useState } from 'react'
+import { api } from '@/lib/api'
+import type { ModelFallbackEvent, RunResumableEvent, SseEvent, SseEventType } from '@/lib/types'
+import { useSse } from '@/lib/SseContext'
+import { ThreadFeedRow } from '@/components/ThreadFeedRow'
 
 function relativeTime(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000)
@@ -24,6 +34,9 @@ const EVENT_ICON: Record<SseEventType | string, string> = {
   auto_apply_complete: '⚡',
   thread_classified: '→',
   thread_archived: '✓',
+  provider_degraded: '!',
+  run_resumable: '⏸',
+  model_fallback: '⇄',
   error: '!',
   heartbeat: '♡',
   log: '·',
@@ -47,11 +60,10 @@ function eventLabel(ev: SseEvent): string | null {
     case 'error':
       return `Error: ${p.message ?? 'unknown error'}`
     case 'thread_classified': {
-      const action = String(p.action ?? '')
-      const cat = String(p.category ?? '')
+      // Only reached for a malformed event with no item_id — a well-formed one
+      // renders as a ThreadFeedRow.
       const subj = String(p.subject ?? '').slice(0, 50)
-      const verb = action === 'archive' ? 'archive' : action === 'keep' ? 'keep' : action
-      return `${subj || '(no subject)'} → ${cat} · ${verb}`
+      return `${subj || '(no subject)'} → ${p.category ?? ''} · ${p.action ?? ''}`
     }
     case 'thread_archived':
       return `Archived: ${String(p.subject ?? '').slice(0, 50) || '(no subject)'} → ${p.label_name ?? ''}`
@@ -73,16 +85,6 @@ function eventLabel(ev: SseEvent): string | null {
     default:
       return JSON.stringify(ev.payload)
   }
-}
-
-let nextId = 0
-function genId() {
-  return `evt-${++nextId}`
-}
-
-/** Exponential back-off capped at 30 s */
-function backoff(attempt: number) {
-  return Math.min(1000 * Math.pow(2, attempt), 30_000)
 }
 
 function UndoRunButton({ runId }: { runId: string }) {
@@ -127,11 +129,88 @@ function UndoRunButton({ runId }: { runId: string }) {
   )
 }
 
+/** Resume a run stopped mid-flight. Same call as the Resume banner (screen 13);
+ * the endpoint is owned by the durable-resume slice. */
+function ResumeRunButton({ runId }: { runId: string }) {
+  const [busy, setBusy] = useState(false)
+  const [done, setDone] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleResume = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' })
+      const body = (await res.json().catch(() => null)) as {
+        error?: { code?: string; message?: string } | null
+      } | null
+      if (!res.ok || body?.error) {
+        throw new Error(body?.error?.message ?? `Resume failed (${res.status})`)
+      }
+      setDone(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Resume failed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (done) {
+    return <span className="text-[11px] font-semibold text-emerald-700">Resumed ✓</span>
+  }
+
+  return (
+    <div className="mt-1 flex items-center gap-2">
+      <button
+        type="button"
+        data-testid="drawer-resume-run"
+        onClick={() => void handleResume()}
+        disabled={busy}
+        className="rounded border border-amber-400 bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900 hover:bg-amber-200 focus:ring-1 focus:ring-amber-500 focus:outline-none disabled:opacity-50"
+      >
+        {busy ? 'Resuming…' : 'Resume run'}
+      </button>
+      {error && <span className="text-[11px] text-rose-700">{error}</span>}
+    </div>
+  )
+}
+
+function ModelFallbackRow({ data, ts }: { data: ModelFallbackEvent; ts: number }) {
+  return (
+    <li
+      data-testid="model-fallback-row"
+      className="border-l-2 border-amber-400 bg-amber-50 px-4 py-2.5 text-xs"
+    >
+      <p className="leading-snug font-semibold text-amber-900">
+        Switched model: <span className="font-mono">{data.from_model || 'unknown'}</span> →{' '}
+        <span className="font-mono">{data.to_model || 'unknown'}</span>
+      </p>
+      {data.reason && <p className="mt-0.5 text-[11px] text-amber-800">{data.reason}</p>}
+      <p className="mt-0.5 text-[11px] text-amber-700/70">{relativeTime(ts)}</p>
+    </li>
+  )
+}
+
+function RunResumableRow({ data, ts }: { data: RunResumableEvent; ts: number }) {
+  return (
+    <li
+      data-testid="run-resumable-row"
+      className="border-l-2 border-amber-500 bg-amber-50 px-4 py-2.5 text-xs"
+    >
+      <p className="leading-snug font-semibold text-amber-900">
+        Run interrupted at {data.items_decided} of {data.items_total} — resumable
+      </p>
+      {data.reason && <p className="mt-0.5 text-[11px] text-amber-800">{data.reason}</p>}
+      {data.run_id ? <ResumeRunButton runId={data.run_id} /> : null}
+      <p className="mt-0.5 text-[11px] text-amber-700/70">{relativeTime(ts)}</p>
+    </li>
+  )
+}
+
 export function ActivityDrawer() {
-  const [events, setEvents] = useState<SseEvent[]>([])
+  const { feed, degraded, reconnecting, events } = useSse()
   const [open, setOpen] = useState(false)
-  const [unread, setUnread] = useState(0)
-  const [reconnecting, setReconnecting] = useState(false)
+  const [seen, setSeen] = useState(0)
   const [now, setNow] = useState(Date.now())
 
   // Update relative timestamps every 10 s
@@ -139,97 +218,33 @@ export function ActivityDrawer() {
     const id = setInterval(() => setNow(Date.now()), 10_000)
     return () => clearInterval(id)
   }, [])
-  // Suppress unused warning — now used as dep below
   void now
 
-  const attemptRef = useRef(0)
-  const esRef = useRef<EventSource | null>(null)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const unread = open ? 0 : Math.max(0, events.length - seen)
 
-  const addEvent = useCallback(
-    (type: SseEventType, payload: Record<string, unknown>) => {
-      if (type === 'heartbeat') return
-      if (type === 'fetch_progress') {
-        sseLive.setFetchedSoFar(Number(payload.fetched_so_far ?? 0))
-      }
-      if (type === 'run_completed' || type === 'run_started') {
-        sseLive.setFetchedSoFar(0)
-      }
-      const ev: SseEvent = { id: genId(), type, ts: Date.now(), payload }
-      setEvents(prev => [ev, ...prev].slice(0, MAX_EVENTS))
-      setUnread(n => n + 1)
-    },
-    [],
-  )
-
-  const connect = useCallback(() => {
-    if (esRef.current) esRef.current.close()
-    const es = new EventSource('/api/events')
-    esRef.current = es
-
-    es.onopen = () => {
-      attemptRef.current = 0
-      setReconnecting(false)
-    }
-
-    es.onmessage = e => {
-      try {
-        const parsed = JSON.parse(e.data as string) as { type: SseEventType; [k: string]: unknown }
-        const { type, ...rest } = parsed
-        addEvent(type, rest)
-      } catch {
-        // ignore malformed event
-      }
-    }
-
-    // Named event handlers for specific event types
-    const EVENT_TYPES: SseEventType[] = [
-      'run_started',
-      'run_progress',
-      'fetch_progress',
-      'gmail_mutation_applied',
-      'run_completed',
-      'auto_apply_complete',
-      'thread_classified',
-      'thread_archived',
-      'error',
-      'heartbeat',
-    ]
-    EVENT_TYPES.forEach(type => {
-      es.addEventListener(type, (e: MessageEvent) => {
-        try {
-          const payload = JSON.parse((e as MessageEvent).data as string) as Record<string, unknown>
-          addEvent(type, payload)
-        } catch {
-          addEvent(type, {})
-        }
-      })
-    })
-
-    es.onerror = () => {
-      es.close()
-      esRef.current = null
-      setReconnecting(true)
-      const delay = backoff(attemptRef.current++)
-      timerRef.current = setTimeout(() => {
-        connect()
-      }, delay)
-    }
-  }, [addEvent])
-
+  // A degraded provider auto-opens the drawer (ui.md screen 14) — once per
+  // degraded episode, so the user is never left staring at a stalled bar.
+  const lastDegradedRun = useRef<string | null>(null)
   useEffect(() => {
-    connect()
-    return () => {
-      if (esRef.current) esRef.current.close()
-      if (timerRef.current) clearTimeout(timerRef.current)
+    if (!degraded) {
+      lastDegradedRun.current = null
+      return
     }
-  }, [connect])
+    if (lastDegradedRun.current !== degraded.run_id) {
+      lastDegradedRun.current = degraded.run_id
+      setOpen(true)
+      setSeen(events.length)
+    }
+  }, [degraded, events.length])
 
   const handleOpen = () => {
     setOpen(true)
-    setUnread(0)
+    setSeen(events.length)
   }
-  const handleClose = () => setOpen(false)
+  const handleClose = () => {
+    setSeen(events.length)
+    setOpen(false)
+  }
 
   return (
     <>
@@ -256,11 +271,7 @@ export function ActivityDrawer() {
 
       {/* Overlay */}
       {open && (
-        <div
-          role="presentation"
-          className="fixed inset-0 z-40 bg-black/10"
-          onClick={handleClose}
-        />
+        <div role="presentation" className="fixed inset-0 z-40 bg-black/10" onClick={handleClose} />
       )}
 
       {/* Drawer */}
@@ -291,20 +302,48 @@ export function ActivityDrawer() {
           </div>
         </div>
 
+        {/* Pinned degraded-provider banner — above the feed, never scrolling */}
+        {degraded && (
+          <div
+            role="status"
+            data-testid="provider-degraded-banner"
+            className="border-b border-rose-300 bg-rose-100 px-4 py-2.5 text-xs text-rose-900"
+          >
+            <p className="font-bold">
+              {degraded.provider ? degraded.provider.toUpperCase() : 'The LLM provider'} is failing —{' '}
+              {degraded.retries} retries.
+            </p>
+            <p className="mt-0.5 text-[11px]">
+              This run is degraded and may take much longer than usual.
+              {degraded.model ? ` Model: ${degraded.model}.` : ''}
+            </p>
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto">
-          {events.length === 0 ? (
+          {feed.length === 0 ? (
             <p className="px-4 py-6 text-center text-xs text-gray-400">
               No activity yet — events appear here when a triage run is active.
             </p>
           ) : (
             <ul className="divide-y divide-gray-100">
-              {events.map(ev => {
+              {feed.map(row => {
+                if (row.kind === 'thread') {
+                  return <ThreadFeedRow key={row.key} event={row.data} />
+                }
+                if (row.kind === 'model_fallback') {
+                  return <ModelFallbackRow key={row.key} data={row.data} ts={row.ts} />
+                }
+                if (row.kind === 'run_resumable') {
+                  return <RunResumableRow key={row.key} data={row.data} ts={row.ts} />
+                }
+                const ev = row.event
                 const label = eventLabel(ev)
                 const isError = ev.type === 'error'
                 const runId = ev.payload.run_id as string | undefined
                 return (
                   <li
-                    key={ev.id}
+                    key={row.key}
                     className={`flex items-start gap-2 px-4 py-2.5 text-xs ${
                       isError ? 'bg-rose-50' : ''
                     }`}
@@ -320,9 +359,7 @@ export function ActivityDrawer() {
                         {label ?? ev.type}
                       </p>
                       <p className="mt-0.5 text-[11px] text-gray-400">{relativeTime(ev.ts)}</p>
-                      {ev.type === 'run_completed' && runId ? (
-                        <UndoRunButton runId={runId} />
-                      ) : null}
+                      {ev.type === 'run_completed' && runId ? <UndoRunButton runId={runId} /> : null}
                     </div>
                   </li>
                 )

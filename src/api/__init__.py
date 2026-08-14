@@ -21,6 +21,11 @@ VERSION = "0.1.0"
 def _reconcile_orphaned_runs() -> int:
     """Close out runs left ``running`` by a process that no longer exists.
 
+    Phase 6: a run that already persisted at least one decision is marked
+    **``resumable``**, not ``failed`` — every decided thread is durable and
+    ``POST /api/runs/{id}/resume`` continues it without re-classifying any of them.
+    Only a run with nothing persisted is ``failed``; there is nothing to resume.
+
     Triage runs execute as in-process background tasks, so a server restart (or
     a crash) kills them silently while their row still says ``running``. The UI
     polls that row and renders a live progress bar for work that stopped long
@@ -30,7 +35,9 @@ def _reconcile_orphaned_runs() -> int:
     """
     from datetime import datetime, timezone
 
-    from db.models import TriageRun
+    from sqlalchemy import func, select
+
+    from db.models import Decision, TriageRun
     from db.session import create_db_session
 
     closed = 0
@@ -40,13 +47,27 @@ def _reconcile_orphaned_runs() -> int:
                 session.query(TriageRun).filter(TriageRun.status == "running").all()
             )
             for run in orphans:
-                run.status = "failed"
-                run.error_message = (
-                    "Interrupted — the server restarted while this run was in "
-                    "flight, so it stopped. Nothing was left half-applied: only "
-                    "approved decisions ever mutate Gmail. Start a new run."
+                decided = int(
+                    session.execute(
+                        select(func.count(Decision.id)).where(Decision.run_id == run.id)
+                    ).scalar_one()
+                    or 0
                 )
-                run.finished_at = datetime.now(timezone.utc)
+                if decided > 0:
+                    run.status = "resumable"
+                    run.error_message = (
+                        f"Interrupted at {decided} of {run.items_total or decided} "
+                        "threads — nothing was left half-applied. Resume to continue."
+                    )
+                    # `resumable` is not terminal — no finished_at stamp.
+                else:
+                    run.status = "failed"
+                    run.error_message = (
+                        "Interrupted — the server restarted while this run was in "
+                        "flight, so it stopped. Nothing was left half-applied: only "
+                        "approved decisions ever mutate Gmail. Start a new run."
+                    )
+                    run.finished_at = datetime.now(timezone.utc)
                 closed += 1
     except Exception:  # noqa: BLE001 — never block startup on reconciliation
         return 0
@@ -151,6 +172,20 @@ def create_app() -> FastAPI:
     app.include_router(actions.router)
     app.include_router(events.router)
     app.include_router(digest.router)
+
+    # GET /api/provider-health (Phase 6, slice 3). Mounted defensively so the app
+    # still boots while that slice is in flight.
+    try:
+        from api import provider_health
+
+        app.include_router(provider_health.router)
+    except ImportError:  # pragma: no cover - only before the resilience slice lands
+        import sys
+
+        print(
+            "WARNING: api.provider_health not found — /api/provider-health is NOT mounted",
+            file=sys.stderr,
+        )
 
     # Google OAuth routes live in api/auth.py (gmail-adapter slice). Mounted at the
     # paths spec/api.md documents: /auth/google/start, /auth/google/callback, /auth/logout.

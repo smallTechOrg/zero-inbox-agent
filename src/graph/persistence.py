@@ -319,6 +319,337 @@ def upsert_items(
     return id_map
 
 
+def already_decided_item_ids(session: Session, run_id: str) -> set[str]:
+    """Every item id this run has already decided (Phase 6 resume).
+
+    Returns BOTH the database item ids and their ``external_thread_id``s, because a
+    graph state's ``item["id"]`` is the channel's thread id on first ingest but the
+    persisted row id afterwards. ``fetch_items`` filters on either, so a resumed run
+    never re-classifies a thread it already decided.
+    """
+    decision_cls = model_for("decisions")
+    item_cls = model_for("items")
+    if decision_cls is None:
+        return set()
+    decided = set(
+        session.execute(
+            select(decision_cls.item_id).where(decision_cls.run_id == run_id)
+        ).scalars()
+    )
+    if not decided or item_cls is None:
+        return {d for d in decided if d}
+    externals = set(
+        session.execute(
+            select(item_cls.external_thread_id).where(item_cls.id.in_(sorted(decided)))
+        ).scalars()
+    )
+    return {value for value in (decided | externals) if value}
+
+
+def load_provisional_for_review(
+    session: Session, *, run_id: str, user_id: str, only_item_ids: set[str] | None = None
+) -> tuple[list[dict], list[dict]]:
+    """Rehydrate a resumed run's already-persisted, not-yet-reviewed decisions.
+
+    Returns ``(items, decisions)`` in the graph's in-memory shape. Rule B: threads
+    decided by the interrupted leg are carried into the reviewer pass with the newly
+    decided ones, so the whole run's archive proposals are reviewed exactly once and
+    nothing is left permanently ``provisional``.
+    """
+    decision_cls = model_for("decisions")
+    item_cls = model_for("items")
+    category_cls = model_for("categories")
+    if decision_cls is None or item_cls is None:
+        return [], []
+    rows = list(
+        session.execute(
+            select(decision_cls).where(
+                decision_cls.run_id == run_id,
+                decision_cls.review_state == "provisional",
+            )
+        ).scalars()
+    )
+    if not rows:
+        return [], []
+    item_rows = {
+        row.id: row
+        for row in session.execute(
+            select(item_cls).where(item_cls.id.in_([r.item_id for r in rows]))
+        ).scalars()
+    }
+    category_keys: dict[str, str] = {}
+    if category_cls is not None:
+        for row in _rows(session, category_cls, user_id=user_id):
+            category_keys[row.id] = row.key
+
+    items: list[dict] = []
+    decisions: list[dict] = []
+    for row in rows:
+        item = item_rows.get(row.item_id)
+        if item is None:
+            continue
+        if only_item_ids is not None and not (
+            item.id in only_item_ids or item.external_thread_id in only_item_ids
+        ):
+            # This leg's own freshly checkpointed rows are already in state — carrying
+            # them again would put the same item_id in the reviewer batch twice.
+            continue
+        items.append(
+            {
+                "id": item.id,
+                "external_thread_id": item.external_thread_id,
+                "subject": item.subject,
+                "from_name": item.from_name,
+                "from_email": item.from_email,
+                "from_domain": item.from_domain,
+                "list_id": item.list_id,
+                "unsubscribe_url": item.unsubscribe_url,
+                "snippet_redacted": item.snippet_redacted,
+                "message_count": item.message_count,
+                "has_attachments": item.has_attachments,
+                "is_unread": item.is_unread,
+                "internal_date": item.internal_date,
+                "channel_labels": item.channel_labels,
+            }
+        )
+        decisions.append(
+            {
+                "item_id": item.id,
+                "category": category_keys.get(row.category_id or ""),
+                "proposed_action": row.proposed_action,
+                "confidence": float(row.confidence or 0.0),
+                "reasoning": row.reasoning or "",
+                "decided_by": row.decided_by,
+                "rule_id": row.rule_id,
+                "time_sensitive": bool(row.time_sensitive),
+                "status": row.status,
+                "unsure": False,
+            }
+        )
+    return items, decisions
+
+
+def run_cost_totals(session: Session, run_id: str) -> dict:
+    """Cost accrued by a run **from the persisted llm_calls rows**.
+
+    A resumed run's in-memory ``state["llm_calls"]`` only covers the resume, so cost
+    must be summed from the database or a resume would reset the run's spend to the
+    cost of its final leg (spec/capabilities/durable-resumable-runs.md, Rule B).
+    """
+    from sqlalchemy import func
+
+    call_cls = model_for("llm_calls")
+    if call_cls is None:
+        return {"tokens_in": 0, "tokens_out": 0, "usd": 0.0, "llm_calls": 0}
+    row = session.execute(
+        select(
+            func.coalesce(func.sum(call_cls.tokens_in), 0),
+            func.coalesce(func.sum(call_cls.tokens_out), 0),
+            func.coalesce(func.sum(call_cls.cost_usd), 0.0),
+            func.count(call_cls.id),
+        ).where(call_cls.run_id == run_id)
+    ).one()
+    return {
+        "tokens_in": int(row[0] or 0),
+        "tokens_out": int(row[1] or 0),
+        "usd": round(float(row[2] or 0.0), 6),
+        "llm_calls": int(row[3] or 0),
+    }
+
+
+def insert_provisional_decisions(
+    session: Session,
+    *,
+    run_id: str,
+    user_id: str,
+    channel_account_id: str,
+    items: list[dict],
+    decisions: list[dict],
+    llm_calls: list[dict] | None = None,
+) -> int:
+    """Insert one tier batch's decisions as ``review_state="provisional"``.
+
+    Durable, not final. Skips any ``(run_id, item_id)`` that already exists — the
+    UniqueConstraint is the idempotency guard, so a re-decided thread is never
+    inserted twice and never double-counted. Returns the number of rows written.
+    """
+    if not decisions:
+        return 0
+    id_map = upsert_items(
+        session, user_id=user_id, channel_account_id=channel_account_id, items=items
+    )
+
+    category_ids: dict[str, str] = {}
+    category_cls = model_for("categories")
+    if category_cls is not None:
+        for row in _rows(session, category_cls, user_id=user_id):
+            category_ids[row.key] = row.id
+
+    decision_cls = require_model("decisions")
+    existing = {
+        row.item_id for row in _rows(session, decision_cls, run_id=run_id)
+    }
+
+    written = 0
+    for decision in decisions:
+        db_item_id = id_map.get(decision["item_id"])
+        if db_item_id is None or db_item_id in existing:
+            continue
+        row = _new(
+            decision_cls,
+            {
+                "user_id": user_id,
+                "run_id": run_id,
+                "item_id": db_item_id,
+                "category_id": category_ids.get(decision.get("category") or ""),
+                "proposed_action": decision["proposed_action"],
+                "confidence": float(decision.get("confidence") or 0.0),
+                "reasoning": decision.get("reasoning") or "",
+                "decided_by": decision.get("decided_by") or "llm",
+                "rule_id": decision.get("rule_id"),
+                "time_sensitive": bool(decision.get("time_sensitive")),
+                "status": decision.get("status", "proposed"),
+                "review_state": "provisional",
+            },
+        )
+        session.add(row)
+        existing.add(db_item_id)
+        written += 1
+
+    for call in llm_calls or []:
+        call_cls = model_for("llm_calls")
+        if call_cls is None:
+            break
+        session.add(
+            _new(
+                call_cls,
+                {
+                    "user_id": user_id,
+                    "run_id": run_id,
+                    "purpose": call.get("purpose", "classify"),
+                    "model": call.get("model", ""),
+                    "items_in_batch": call.get("items_in_batch", 0),
+                    "tokens_in": call.get("tokens_in", 0),
+                    "tokens_out": call.get("tokens_out", 0),
+                    "cost_usd": call.get("cost_usd", 0.0),
+                    "latency_ms": call.get("latency_ms", 0),
+                },
+            )
+        )
+
+    session.flush()
+    return written
+
+
+def upgrade_review_state(
+    session: Session,
+    *,
+    run_id: str,
+    state: str = "reviewed",
+    item_ids: list[str] | None = None,
+    only_provisional: bool = True,
+) -> int:
+    """Move this run's decision rows onto the next never-miss review state.
+
+    ``item_ids`` (database item ids) narrows the upgrade; omitted, every row of the
+    run is upgraded. Returns the number of rows changed.
+    """
+    decision_cls = model_for("decisions")
+    if decision_cls is None:
+        return 0
+    stmt = select(decision_cls).where(decision_cls.run_id == run_id)
+    if only_provisional:
+        stmt = stmt.where(decision_cls.review_state == "provisional")
+    if item_ids is not None:
+        if not item_ids:
+            return 0
+        stmt = stmt.where(decision_cls.item_id.in_(list(item_ids)))
+    changed = 0
+    for row in session.execute(stmt).scalars():
+        row.review_state = state
+        changed += 1
+    session.flush()
+    return changed
+
+
+def finalise_review(
+    session: Session,
+    *,
+    run_id: str,
+    user_id: str,
+    decisions: list[dict],
+    review_failed_item_ids: list[str] | None = None,
+) -> dict:
+    """Write the reviewer's verdict onto the run's rows and upgrade ``review_state``.
+
+    This is the moment a decision stops being provisional and becomes final. Rows the
+    reviewer could not process become ``review_failed`` and are treated exactly like
+    un-reviewed rows: ``apply_decision`` refuses them forever.
+
+    Returns ``{"reviewed": n, "review_failed": n, "flipped": [state_item_id, ...]}``.
+    """
+    decision_cls = model_for("decisions")
+    item_cls = model_for("items")
+    if decision_cls is None or item_cls is None:
+        return {"reviewed": 0, "review_failed": 0, "flipped": []}
+
+    # Graph state ids are either the persisted item id or the channel thread id.
+    state_ids = {d["item_id"] for d in decisions}
+    db_id_of: dict[str, str] = {}
+    if state_ids:
+        for row in session.execute(
+            select(item_cls).where(
+                item_cls.user_id == user_id,
+                (item_cls.id.in_(sorted(state_ids)))
+                | (item_cls.external_thread_id.in_(sorted(state_ids))),
+            )
+        ).scalars():
+            db_id_of[row.id] = row.id
+            if row.external_thread_id:
+                db_id_of[row.external_thread_id] = row.id
+
+    failed_db_ids = {
+        db_id_of[i] for i in (review_failed_item_ids or []) if i in db_id_of
+    }
+    by_db_id = {
+        db_id_of[d["item_id"]]: d for d in decisions if d["item_id"] in db_id_of
+    }
+
+    reviewed = 0
+    failed = 0
+    flipped: list[str] = []
+    for row in session.execute(
+        select(decision_cls).where(decision_cls.run_id == run_id)
+    ).scalars():
+        decision = by_db_id.get(row.item_id)
+        if decision is not None:
+            if (
+                row.proposed_action != decision["proposed_action"]
+                or row.decided_by != decision.get("decided_by")
+                or row.status != decision.get("status", row.status)
+            ):
+                flipped.append(decision["item_id"])
+            _assign(
+                row,
+                decision_cls,
+                {
+                    "proposed_action": decision["proposed_action"],
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reasoning": decision.get("reasoning") or "",
+                    "decided_by": decision.get("decided_by") or row.decided_by,
+                    "status": decision.get("status", row.status),
+                },
+            )
+        if row.item_id in failed_db_ids:
+            row.review_state = "review_failed"
+            failed += 1
+        elif row.review_state == "provisional":
+            row.review_state = "reviewed"
+            reviewed += 1
+    session.flush()
+    return {"reviewed": reviewed, "review_failed": failed, "flipped": flipped}
+
+
 def persist_run_results(
     session: Session,
     *,
@@ -383,7 +714,27 @@ def persist_run_results(
         if db_item_id is None:
             continue
         if db_item_id in existing_decisions:
-            continue  # idempotent resume
+            # Idempotent resume/finalisation: the row was already checkpointed by its
+            # tier. Only the cluster membership (computed at the end of the graph)
+            # and the reviewer's final verdict are back-filled onto it.
+            row = existing_decisions[db_item_id]
+            cluster_id = cluster_of_item.get(decision["item_id"])
+            if cluster_id and not getattr(row, "cluster_id", None):
+                row.cluster_id = cluster_id
+            _assign(
+                row,
+                decision_cls,
+                {
+                    "proposed_action": decision["proposed_action"],
+                    "confidence": float(decision["confidence"]),
+                    "reasoning": decision["reasoning"],
+                    "decided_by": decision["decided_by"],
+                    "status": decision.get("status", "proposed"),
+                },
+            )
+            if decision.get("review_state"):
+                row.review_state = decision["review_state"]
+            continue
         row = _new(
             decision_cls,
             {
@@ -399,6 +750,7 @@ def persist_run_results(
                 "rule_id": decision.get("rule_id"),
                 "time_sensitive": bool(decision.get("time_sensitive")),
                 "status": decision.get("status", "proposed"),
+                "review_state": decision.get("review_state") or "provisional",
             },
         )
         session.add(row)
@@ -408,6 +760,10 @@ def persist_run_results(
     call_cls = model_for("llm_calls")
     if call_cls is not None:
         for call in llm_calls:
+            # Calls already written by graph.checkpoint.record_batch carry this
+            # marker — writing them again would double-count the run's spend.
+            if call.get("_checkpointed"):
+                continue
             session.add(
                 _new(
                     call_cls,
@@ -425,14 +781,18 @@ def persist_run_results(
                 )
             )
 
+    session.flush()
+    # Cost is summed from the persisted llm_calls rows, never from this leg's
+    # in-memory list: a resumed run's state only holds the calls it made itself, so
+    # taking the in-memory total would reset the run's spend instead of adding to it.
     update_run(
         session,
         run_id=run_id,
         status=status,
-        items_total=len(items),
-        items_decided=len(decisions),
+        items_total=max(len(items), len(existing_decisions)),
+        items_decided=len(existing_decisions),
         counts=counts,
-        cost=cost,
+        cost=run_cost_totals(session, run_id),
         error=error,
     )
     session.flush()
@@ -464,7 +824,9 @@ def update_run(
     if status is not None and current_status != "cancelled":
         values["status"] = status
     if items_total is not None:
-        values["items_total"] = items_total
+        # Never shrink the denominator: a resumed run only fetches the threads it
+        # still has to decide, so its leg-local total is smaller than the mailbox.
+        values["items_total"] = max(int(items_total), int(getattr(row, "items_total", 0) or 0))
     if items_decided is not None:
         values["items_decided"] = items_decided
     if counts is not None:
@@ -475,6 +837,8 @@ def update_run(
         values["cost_usd"] = cost.get("usd", 0.0)
     if error is not None:
         values["error_message"] = error
+    # `resumable` is NOT terminal — the run can be put back to `running` by
+    # POST /api/runs/{id}/resume — so it never gets a finished_at stamp.
     if status in ("completed", "failed", "cancelled") and current_status != "cancelled":
         from datetime import datetime, timezone
 

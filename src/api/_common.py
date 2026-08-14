@@ -19,6 +19,10 @@ REAUTH_REQUIRED = "reauth_required"
 RATE_LIMITED = "rate_limited"
 PROVIDER_ERROR = "provider_error"
 VALIDATION_ERROR = "validation_error"
+#: spec/api.md:133 — the decision has not passed the never-miss reviewer and
+#: can never be applied while provisional. Distinct from validation_error so
+#: the UI can say WHY, and never 404 (the decision plainly exists).
+NOT_REVIEWED = "not_reviewed"
 
 _STATUS_FOR_CODE = {
     UNAUTHENTICATED: 401,

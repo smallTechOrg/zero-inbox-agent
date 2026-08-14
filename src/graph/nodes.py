@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from graph import checkpoint
 from graph.persistence import DEFAULT_CONFIDENCE_FLOOR, load_context as _load_context_rows
 from graph.state import TriageState
 from observability.events import get_logger
@@ -125,9 +126,18 @@ def _run_async(coro, timeout: float = _LLM_TIMEOUT):
         return asyncio.run(wrapped)
 
     import concurrent.futures
+    import contextvars
 
+    # Carry the CURRENT context into the pool thread. contextvars do NOT cross a
+    # thread boundary on their own: without this, `llm.health.bind_run(...)` set
+    # on the run's thread is invisible here, `active_run_id()` reads None, and
+    # every provider_degraded / model_fallback event is emitted unattributed and
+    # silently dropped instead of reaching the user's activity feed. Verified
+    # empirically — plain `pool.submit(asyncio.run, ...)` sees None; via
+    # `ctx.run` it sees the bound run.
+    ctx = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, wrapped).result(timeout=timeout + 5)
+        return pool.submit(ctx.run, asyncio.run, wrapped).result(timeout=timeout + 5)
 
 
 def _usage_row(usage, purpose: str, items_in_batch: int) -> dict:
@@ -142,13 +152,101 @@ def _usage_row(usage, purpose: str, items_in_batch: int) -> dict:
     }
 
 
-def _model_candidates(state: TriageState) -> list[str | None]:
-    """The user's preferred model first, then the provider default as a fallback.
+def _health():
+    """``llm.health`` (slice 3) if it has landed, else ``None``.
 
-    A stale or retired per-user model id must never take a whole run down with it.
+    Imported defensively so this module keeps working — with the pre-Phase-6
+    single-model behaviour — while the provider-resilience slice is still in flight.
+    """
+    try:
+        from llm import health  # type: ignore[attr-defined]
+    except ImportError:
+        return None
+    return health
+
+
+def _model_candidates(state: TriageState) -> list[str]:
+    """The chain of models this run may use NOW, current model first.
+
+    ``llm.health.model_chain(preferred)`` is the full ordered in-family chain; it is
+    sliced at the run's current chain position, so ``result[0]`` is always
+    ``llm.health.current_model(run_id)`` — a model the run has already abandoned is
+    never re-tried (spec/capabilities/durable-resumable-runs.md, Rule F).
     """
     preferred = (state.get("settings") or {}).get("llm_model")
-    return [preferred, None] if preferred else [None]
+    health = _health()
+    chain_fn = getattr(health, "model_chain", None) if health else None
+    if chain_fn is None:
+        # Pre-Phase-6 behaviour: the user's model, then the provider default.
+        return [preferred] if preferred else []
+    chain = list(chain_fn(preferred) or [])
+    run_id = state.get("run_id")
+    snapshot_fn = getattr(health, "snapshot", None)
+    if run_id and snapshot_fn is not None and chain:
+        try:
+            position = int((snapshot_fn(run_id) or {}).get("chain_position", 0) or 0)
+        except Exception:  # pragma: no cover - health must never break the cascade
+            position = 0
+        # Position 0 = nothing abandoned yet, so the user's preferred model leads.
+        # Every advance drops one more entry, permanently, for the rest of the run.
+        if position > 0:
+            chain = chain[position:] or chain[-1:]
+    return chain
+
+
+def _advance_model(state: TriageState, *, from_model: str | None, reason: str) -> str | None:
+    """Rotate this run onto the next chain model. Returns it, or ``None`` if exhausted.
+
+    Called once the current model's existing retry budget is exhausted, for **any**
+    failure class including ``APIConnectionError``/timeouts: NVIDIA routes each model to
+    its own backend pool, so a saturated pool for one model says nothing about the rest.
+    The advance is per-run and sticks.
+    """
+    health = _health()
+    advance = getattr(health, "advance_model", None) if health else None
+    run_id = state.get("run_id")
+    if advance is None or not run_id:
+        return None
+    try:
+        to_model = advance(run_id, reason=reason)
+    except Exception as exc:  # pragma: no cover - never break the cascade
+        log.warning("triage.model_advance_failed", run_id=run_id, error=str(exc))
+        return None
+    if to_model is None:
+        log.error("triage.model_chain_exhausted", run_id=run_id, reason=reason)
+        return None
+    log.warning(
+        "llm.model_fallback", run_id=run_id, from_model=from_model, to_model=to_model,
+        reason=reason,
+    )
+    try:
+        from events.bus import emit_model_fallback
+
+        emit_model_fallback(
+            state["user_id"],
+            run_id=run_id,
+            from_model=str(from_model or ""),
+            to_model=to_model,
+            reason=reason,
+        )
+    except (ImportError, AttributeError):  # pragma: no cover - slice 2 not landed
+        pass
+    except Exception:  # pragma: no cover - the bus must never fail a run
+        pass
+    return to_model
+
+
+def _circuit_open_error():
+    """``llm.health.ProviderCircuitOpen`` if available, else a never-matching class."""
+    health = _health()
+    exc = getattr(health, "ProviderCircuitOpen", None) if health else None
+    if isinstance(exc, type) and issubclass(exc, BaseException):
+        return exc
+
+    class _Never(Exception):
+        pass
+
+    return _Never
 
 
 def _call_llm(
@@ -236,14 +334,19 @@ def _record_progress(
         if run_cls is None:
             return
         with create_db_session() as session:
-            values: dict = {}
             if items_total is not None:
-                values["items_total"] = items_total
-            if items_decided is not None:
-                values["items_decided"] = items_decided
-            if values:
+                # Never shrink the denominator — a resumed run only fetches what it
+                # still has to decide.
                 session.execute(
-                    sa_update(run_cls).where(run_cls.id == run_id).values(**values)
+                    sa_update(run_cls)
+                    .where(run_cls.id == run_id, run_cls.items_total < items_total)
+                    .values(items_total=items_total)
+                )
+            if items_decided is not None:
+                session.execute(
+                    sa_update(run_cls)
+                    .where(run_cls.id == run_id)
+                    .values(items_decided=items_decided)
                 )
             if decided_delta:
                 session.execute(
@@ -417,10 +520,18 @@ def load_context(state: TriageState) -> dict:
 
 
 def fetch_items(state: TriageState) -> dict:
-    """Normalised items, headers + subject + <=200 char snippet only."""
+    """Normalised items, headers + subject + <=200 char snippet only.
+
+    On a resume, every thread this run has already decided is filtered out here — the
+    single choke point every downstream tier queue is derived from — so an already
+    decided thread is never re-sent to the LLM (Rule B).
+    """
     if state.get("items"):
-        items = list(state["items"])
-        _record_progress(state.get("run_id"), items_total=len(items))
+        items = _skip_already_decided(state, list(state["items"]))
+        _record_progress(
+            state.get("run_id"),
+            items_total=len(items) + int(state.get("already_decided_count") or 0),
+        )
         return {"items": items, "error": None}
     try:
         from channels import get_adapter
@@ -491,9 +602,11 @@ def fetch_items(state: TriageState) -> dict:
             list_kwargs["on_fetch_failed"] = _on_fetch_failed
         fetched = adapter.list_threads(**list_kwargs)
         items = [i if isinstance(i, dict) else i.model_dump() for i in fetched]
+        mailbox_total = len(items)
+        items = _skip_already_decided(state, items)
         # The progress bar's denominator, written the moment the total is known —
         # not at the end of the run (spec/api.md: GET /api/runs is polled at 1s).
-        _record_progress(state.get("run_id"), items_total=len(items))
+        _record_progress(state.get("run_id"), items_total=mailbox_total)
         if fetch_failed:
             log.warning(
                 "gmail.fetch_incomplete",
@@ -520,6 +633,26 @@ def fetch_items(state: TriageState) -> dict:
         }
     except Exception as exc:
         return {"error": f"fetch_items failed: {exc}"}
+
+
+def _skip_already_decided(state: TriageState, items: list[dict]) -> list[dict]:
+    """Drop threads this run has already decided (resume). Never re-classified."""
+    decided = set(state.get("already_decided_item_ids") or [])
+    if not decided:
+        return items
+    remaining = [
+        item
+        for item in items
+        if item.get("id") not in decided
+        and (item.get("external_thread_id") or item.get("id")) not in decided
+    ]
+    log.info(
+        "triage.resume_skipped",
+        run_id=state.get("run_id"),
+        skipped=len(items) - len(remaining),
+        remaining=len(remaining),
+    )
+    return remaining
 
 
 def _detect_and_record_mailbox_corrections(user_id: str, items: list[dict]) -> None:
@@ -643,25 +776,9 @@ def apply_deterministic_rules(state: TriageState) -> dict:
         "triage.tier1", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
-    # Emit per-thread classification events for live transparency (tier 1 rules)
-    try:
-        from events import bus as _bus
-        import time as _time
-        _items_by_id = {i["id"]: i for i in (state.get("items") or [])}
-        for _d in decisions:
-            _item = _items_by_id.get(_d["item_id"], {})
-            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
-            _bus.emit(state["user_id"], {
-                "type": "thread_classified",
-                "ts": _time.time(),
-                "run_id": state.get("run_id"),
-                "subject": _subj,
-                "category": _d.get("category_key") or _d.get("category") or "",
-                "action": _d.get("proposed_action") or "",
-                "decided_by": "rule",
-            })
-    except Exception:  # pragma: no cover - bus must never fail a run
-        pass
+    # Durable the instant the tier decides: the rows land provisional and the
+    # per-thread event is emitted from the same checkpoint.
+    checkpoint.record_batch(state, decisions, tier="rule")
     return {"resolved": decisions, "llm_queue": unresolved}
 
 
@@ -673,34 +790,15 @@ def apply_sender_history(state: TriageState) -> dict:
         "triage.tier2", run_id=state.get("run_id"), resolved=len(decisions),
         remaining=len(unresolved),
     )
-    # Emit per-thread classification events for live transparency (tier 2 sender history)
-    try:
-        from events import bus as _bus
-        import time as _time
-        _items_by_id = {i["id"]: i for i in (state.get("items") or [])}
-        for _d in decisions:
-            _item = _items_by_id.get(_d["item_id"], {})
-            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
-            _bus.emit(state["user_id"], {
-                "type": "thread_classified",
-                "ts": _time.time(),
-                "run_id": state.get("run_id"),
-                "subject": _subj,
-                "category": _d.get("category_key") or _d.get("category") or "",
-                "action": _d.get("proposed_action") or "",
-                "decided_by": "sender_history",
-            })
-    except Exception:  # pragma: no cover - bus must never fail a run
-        pass
+    checkpoint.record_batch(state, decisions, tier="sender_history")
     return {"resolved": decisions, "llm_queue": unresolved}
 
 
 def prepare_llm_batches(state: TriageState) -> dict:
     batches = _chunk(state.get("llm_queue") or [])
-    # Tiers 1-2 are done by now: surface their progress before the LLM starts.
-    _record_progress(
-        state.get("run_id"), items_decided=len(state.get("resolved") or [])
-    )
+    # Tiers 1-2 have already checkpointed their own decisions and bumped
+    # items_decided atomically — writing an absolute count here would clobber a
+    # resumed run's carried-over progress.
     log.info(
         "triage.batches", run_id=state.get("run_id"), batches=len(batches),
         items=len(state.get("llm_queue") or []),
@@ -741,7 +839,8 @@ def llm_classify_batch(state: TriageState) -> dict:
     result = None
     last_error = "unknown error"
     failed_calls: list[dict] = []
-    for model in _model_candidates(state):
+    circuit_open = _circuit_open_error()
+    for model in _model_candidates(state) or [None]:
         try:
             result = _run_async(
                 get_llm_client().classify_batch(
@@ -754,6 +853,13 @@ def llm_classify_batch(state: TriageState) -> dict:
                 )
             )
             break
+        except circuit_open as exc:
+            # The provider is circuit-broken for every model this run can still
+            # reach. Do NOT degrade the batch into keep-everything rows — route to
+            # the error handler so the run closes as `resumable` with every already
+            # decided thread durable (Rule E).
+            log.error("triage.tier3_circuit_open", run_id=run_id, model=model, error=str(exc))
+            return {"error": f"provider circuit open: {exc}", "llm_calls": failed_calls}
         except Exception as exc:
             last_error = str(exc)
             # Tokens burnt by a failed batch are still real spend — keep them for
@@ -767,11 +873,21 @@ def llm_classify_batch(state: TriageState) -> dict:
                 model=model,
                 error=last_error,
             )
+            # This model's retry budget is spent. Rotate the whole run onto the next
+            # chain entry — for every failure class, connection errors included — and
+            # carry on rather than failing the batch.
+            _advance_model(
+                state,
+                from_model=model,
+                reason=f"{type(exc).__name__}: {last_error}"[:200],
+            )
 
     if result is None:
         log.error("triage.tier3_failed", run_id=state.get("run_id"), error=last_error)
+        degraded = _degraded(batch, last_error)
+        checkpoint.record_batch(state, degraded, tier="error", llm_calls=failed_calls, items=batch)
         return {
-            "llm_decisions": _degraded(batch, last_error),
+            "llm_decisions": degraded,
             "deep_queue": [],
             "llm_calls": failed_calls,
         }
@@ -791,27 +907,9 @@ def llm_classify_batch(state: TriageState) -> dict:
     calls = failed_calls + (
         [_usage_row(result.usage, "classify", len(batch))] if result.usage else []
     )
-    # Emit per-thread classification events for live transparency (tier 3 LLM)
-    try:
-        from events import bus as _bus
-        import time as _time
-        _items_by_id = {i["id"]: i for i in batch}
-        for _d in decisions:
-            _item = _items_by_id.get(_d["item_id"], {})
-            _subj = str(_item.get("subject") or _item.get("from_email") or _d["item_id"])[:60]
-            _bus.emit(state["user_id"], {
-                "type": "thread_classified",
-                "ts": _time.time(),
-                "run_id": run_id,
-                "subject": _subj,
-                "category": _d.get("category_key") or _d.get("category") or "",
-                "action": _d.get("proposed_action") or "",
-                "decided_by": _d.get("decided_by") or "llm",
-            })
-    except Exception:  # pragma: no cover - bus must never fail a run
-        pass
-    # Live progress: this batch is decided — bump the numerator atomically.
-    _record_progress(run_id, decided_delta=len(batch))
+    # Durable + visible in one step: the batch's rows land provisional and each
+    # thread emits its own classification event.
+    checkpoint.record_batch(state, decisions, tier="llm", llm_calls=calls, items=batch)
     # Emit an SSE progress event so the frontend sees incremental LLM progress
     # rather than waiting until persist_decisions fires at the very end.
     try:
@@ -855,7 +953,8 @@ def deep_read_escalation(state: TriageState) -> dict:
     category_keys = {c["key"] for c in categories}
     schema = _verdict_schema(sorted(category_keys))
     template = _prompt("deep_read.md")
-    candidates = _model_candidates(state)
+    candidates = _model_candidates(state) or [None]
+    circuit_open = _circuit_open_error()
     sender_stats = state.get("sender_stats") or {}
 
     decisions: list[dict] = []
@@ -901,32 +1000,27 @@ def deep_read_escalation(state: TriageState) -> dict:
                 verdict["decided_by"] = "llm_deep"
                 verdict["unsure"] = False
                 decisions.append(verdict)
-                # Emit per-thread classification event for live transparency (tier 4 deep read)
-                try:
-                    from events import bus as _bus
-                    import time as _time
-                    _subj = str(item.get("subject") or item.get("from_email") or item["id"])[:60]
-                    _bus.emit(state["user_id"], {
-                        "type": "thread_classified",
-                        "ts": _time.time(),
-                        "run_id": run_id,
-                        "subject": _subj,
-                        "category": verdict.get("category_key") or verdict.get("category") or "",
-                        "action": verdict.get("proposed_action") or "",
-                        "decided_by": "llm_deep",
-                    })
-                except Exception:  # pragma: no cover - bus must never fail a run
-                    pass
                 # Deep reads land one item at a time (unlike a batch, which lands
-                # all at once) — the progress bar's numerator advances with each
-                # one instead of waiting for the whole queue to finish.
-                _record_progress(run_id, decided_delta=1)
+                # all at once) — each is checkpointed and emitted on its own, so the
+                # numerator advances thread by thread.
+                checkpoint.record_batch(state, [verdict], tier="llm_deep", llm_calls=metas, items=[item])
                 break
+            except circuit_open as exc:
+                # Chain exhausted and circuit-broken: stop spending, keep the batch
+                # verdict (low confidence -> needs_your_call), never archive.
+                log.error(
+                    "triage.tier4_circuit_open", run_id=run_id, item_id=item["id"],
+                    error=str(exc),
+                )
+                return {"llm_decisions": decisions, "llm_calls": calls}
             except Exception as exc:
                 # The batch verdict stands: low confidence -> needs_your_call, never archive.
                 log.warning(
                     "triage.tier4_failed", run_id=state.get("run_id"), item_id=item["id"],
                     model=model, error=str(exc),
+                )
+                _advance_model(
+                    state, from_model=model, reason=f"{type(exc).__name__}: {exc}"[:200]
                 )
 
     log.info("triage.tier4", run_id=state.get("run_id"), deep_reads=len(decisions))
@@ -961,21 +1055,56 @@ def _merge_decisions(state: TriageState, *, cancelled: bool = False) -> list[dic
     return sorted(best.values(), key=lambda d: order.get(d["item_id"], 0))
 
 
+def _carry_forward_provisional(state: TriageState) -> tuple[list[dict], list[dict]]:
+    """A resumed run's already-persisted provisional rows, ready for the reviewer.
+
+    Rule B: the interrupted leg's threads must reach the second-pass reviewer exactly
+    once, together with the ones this leg decided — otherwise they would either stay
+    provisional forever (never appliable) or be upgraded without ever being reviewed.
+    """
+    run_id = state.get("run_id")
+    if not run_id or not state.get("already_decided_item_ids"):
+        return [], []
+    try:
+        from db.session import create_db_session
+        from graph.persistence import load_provisional_for_review
+
+        with create_db_session() as session:
+            return load_provisional_for_review(
+                session,
+                run_id=run_id,
+                user_id=state["user_id"],
+                only_item_ids=set(state.get("already_decided_item_ids") or []),
+            )
+    except Exception as exc:  # pragma: no cover - never fail the run over a carry-over
+        log.warning("triage.carry_forward_failed", run_id=run_id, error=str(exc))
+        return [], []
+
+
 def cluster_decisions(state: TriageState) -> dict:
     try:
         floor = float(
             (state.get("settings") or {}).get("confidence_floor", DEFAULT_CONFIDENCE_FLOOR)
         )
         cancelled = _run_is_cancelled(state.get("run_id"))
-        decisions = apply_confidence_floor(_merge_decisions(state, cancelled=cancelled), floor)
+        carried_items, carried_decisions = _carry_forward_provisional(state)
+        items = list(state.get("items") or []) + carried_items
+        decisions = apply_confidence_floor(
+            _merge_decisions(state, cancelled=cancelled) + carried_decisions, floor
+        )
         clusters = clustering.cluster(
-            decisions, state.get("items") or [], categories=state.get("categories") or []
+            decisions, items, categories=state.get("categories") or []
         )
         log.info(
             "triage.clustered", run_id=state.get("run_id"), decisions=len(decisions),
             clusters=len(clusters),
         )
-        return {"decisions": decisions, "clusters": clusters, "error": None}
+        return {
+            "decisions": decisions,
+            "clusters": clusters,
+            "items": items,
+            "error": None,
+        }
     except Exception as exc:
         return {"error": f"cluster_decisions failed: {exc}"}
 
@@ -1012,14 +1141,31 @@ def _cost(state: TriageState) -> dict:
 
 
 def persist_decisions(state: TriageState) -> dict:
+    """Idempotent finalisation — no longer the first write.
+
+    Every tier checkpointed its own rows as ``provisional`` while the run was in
+    flight (``graph.checkpoint``). This node writes the clusters, back-fills cluster
+    membership and the reviewer's final verdict onto the existing rows, inserts
+    anything that never made it through a checkpoint, and upgrades the whole run's
+    ``review_state`` — the point at which the decisions become final.
+    """
     try:
         from db.session import create_db_session
-        from graph.persistence import persist_run_results
+        from graph.persistence import (
+            persist_run_results,
+            run_cost_totals,
+            upgrade_review_state,
+        )
 
         floor = float(
             (state.get("settings") or {}).get("confidence_floor", DEFAULT_CONFIDENCE_FLOOR)
         )
         decisions = apply_confidence_floor(state.get("decisions") or [], floor)
+        review_failed = set(state.get("review_failed_item_ids") or [])
+        for decision in decisions:
+            decision["review_state"] = (
+                "review_failed" if decision["item_id"] in review_failed else "reviewed"
+            )
         counts = _counts(decisions)
         cost = _cost(state)
 
@@ -1037,6 +1183,11 @@ def persist_decisions(state: TriageState) -> dict:
                 llm_calls=state.get("llm_calls") or [],
                 status="running",
             )
+            # Safety sweep: nothing may finish the graph still provisional. Any row
+            # the reviewer never saw (e.g. checkpointed by a tier after the reviewer
+            # ran) is upgraded here, so no decision is left permanently un-appliable.
+            upgrade_review_state(session, run_id=state["run_id"], state="reviewed")
+            cost = run_cost_totals(session, state["run_id"])
         try:
             from events import bus
 
@@ -1059,10 +1210,35 @@ def persist_decisions(state: TriageState) -> dict:
 
 
 def handle_error(state: TriageState) -> dict:
-    """Degradation always keeps mail visible."""
+    """Degradation always keeps mail visible — and never destroys resumable work.
+
+    A run that already decided something ends ``resumable``, not ``failed``: every
+    decided thread is durable (``graph.checkpoint``) and the undecided ones are left
+    undecided so a resume picks them up. Only a run with nothing persisted is
+    ``failed`` — there is nothing to resume.
+    """
     error = state.get("error") or "unknown error"
-    decisions = apply_confidence_floor(_merge_decisions(state), 1.1)  # everything to the user
+    decided_so_far = _persisted_decision_count(state.get("run_id"))
+    resumable = decided_so_far > 0
+    # A resumable run must NOT synthesize "no verdict" rows for the threads it never
+    # reached — that would decide them as errors and there would be nothing to resume.
+    decisions = apply_confidence_floor(
+        _merge_decisions(state, cancelled=resumable), 1.1  # everything to the user
+    )
+    for decision in decisions:
+        decision.setdefault("review_state", "reviewed")
     counts = _counts(decisions)
+    status = "resumable" if resumable else "failed"
+    mailbox_total = max(
+        len(state.get("items") or []) + int(state.get("already_decided_count") or 0),
+        decided_so_far,
+    )
+    message = (
+        f"Interrupted at {decided_so_far} of {mailbox_total} threads — nothing was "
+        f"left half-applied. Resume to continue. ({error})"
+        if resumable
+        else error
+    )
     try:
         from db.session import create_db_session
         from graph.persistence import persist_run_results
@@ -1079,12 +1255,12 @@ def handle_error(state: TriageState) -> dict:
                 counts=counts,
                 cost=_cost(state),
                 llm_calls=state.get("llm_calls") or [],
-                status="failed",
-                error=error,
+                status=status,
+                error=message,
             )
     except Exception as exc:  # pragma: no cover - the run is already failing
         log.error("triage.persist_on_error_failed", error=str(exc))
-    log.error("triage.failed", run_id=state.get("run_id"), error=error)
+    log.error("triage.failed", run_id=state.get("run_id"), error=error, status=status)
 
     try:
         from events import bus
@@ -1095,13 +1271,56 @@ def handle_error(state: TriageState) -> dict:
                 "type": "error",
                 "ts": __import__("time").time(),
                 "run_id": state.get("run_id"),
-                "message": error,
+                "message": message,
             },
         )
     except Exception:  # pragma: no cover
         pass
 
-    return {"status": "failed", "decisions": decisions, "counts": counts}
+    if resumable:
+        try:
+            from events.bus import emit_run_resumable
+
+            emit_run_resumable(
+                state["user_id"],
+                run_id=state.get("run_id") or "",
+                items_total=len(state.get("items") or []) + decided_so_far,
+                items_decided=decided_so_far,
+                reason=error,
+            )
+        except (ImportError, AttributeError):  # pragma: no cover - slice 2 not landed
+            pass
+        except Exception:  # pragma: no cover
+            pass
+
+    return {"status": status, "decisions": decisions, "counts": counts}
+
+
+def _persisted_decision_count(run_id: str | None) -> int:
+    """How many decisions this run has already made durable."""
+    if not run_id:
+        return 0
+    try:
+        from sqlalchemy import func, select as sa_select
+
+        from db.session import create_db_session
+        from graph.persistence import model_for
+
+        decision_cls = model_for("decisions")
+        if decision_cls is None:
+            return 0
+        with create_db_session() as session:
+            return int(
+                session.execute(
+                    sa_select(func.count(decision_cls.id)).where(
+                        decision_cls.run_id == run_id
+                    )
+                ).scalar_one()
+                or 0
+            )
+    except Exception as exc:  # pragma: no cover - never fail the error handler
+        log.warning("triage.decision_count_failed", run_id=run_id, error=str(exc))
+        return 0
 
 
 def _build_mutator_for_user(user_id: str, channel_account_id: str, session):

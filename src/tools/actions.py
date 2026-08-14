@@ -54,6 +54,19 @@ class NotArchivableError(ActionsError):
     """
 
 
+class NotReviewedError(ActionsError):
+    """The decision has not passed the never-miss second-pass reviewer.
+
+    Decisions are persisted the instant a tier makes them (``review_state
+    ="provisional"``) so an interrupted run is resumable, but durability is not
+    finality: only a row the reviewer has upgraded to ``review_state="reviewed"``
+    may ever reach a Gmail mutation. Checked **independently of ``status``** — a
+    caller cannot force a provisional archive through by flipping ``status`` to
+    ``approved`` — and **not bypassable by ``force=True``**, which only ever
+    bypassed the keep-proposed guard.
+    """
+
+
 class Mutator(Protocol):
     def get_thread_labels(self, thread_id: str) -> list[str]: ...
     def archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict: ...
@@ -110,6 +123,14 @@ def apply_decision(
     ).scalar_one_or_none()
     if decision is None:
         raise ActionsError(f"decision {decision_id!r} not found")
+    # The never-miss finality gate, checked FIRST and before the mutator is ever
+    # touched: an un-reviewed archive is never mutable by any code path.
+    review_state = getattr(decision, "review_state", "reviewed")
+    if review_state != "reviewed":
+        raise NotReviewedError(
+            "this decision has not passed the never-miss reviewer and can never be "
+            f"applied (review_state={review_state!r})"
+        )
     if decision.status == "needs_your_call":
         raise NeedsYourCallError("a decision in needs_your_call can never be mutated")
     if decision.status != "approved":

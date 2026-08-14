@@ -188,7 +188,14 @@ class TestLlmBatchFailure:
         assert by_id["i2"]["proposed_action"] == "keep"
         assert out["llm_calls"][0]["tokens_in"] == 10
 
-    def test_a_stale_user_model_falls_back_to_the_provider_default(self, monkeypatch):
+    def test_a_stale_user_model_falls_back_to_the_next_chain_model(self, monkeypatch):
+        """Phase 6: the fallback is the in-family model chain, not "the default".
+
+        ``_model_candidates`` now returns ``llm.health.model_chain(preferred)`` sliced
+        at the run's current position, so a retired per-user model id is tried first
+        and the run rotates onto the next real model instead of falling back to
+        ``model=None``.
+        """
         from llm.providers.base import BatchClassification, LLMResult
 
         seen: list[str | None] = []
@@ -196,7 +203,7 @@ class TestLlmBatchFailure:
         class Flaky:
             async def classify_batch(self, items, *, model=None, **kwargs):
                 seen.append(model)
-                if model is not None:
+                if model == "retired/model-9":
                     raise RuntimeError("404 page not found: retired model id")
                 return BatchClassification(
                     results=[
@@ -209,9 +216,15 @@ class TestLlmBatchFailure:
                 )
 
         monkeypatch.setattr("llm.client.get_llm_client", lambda: Flaky())
+        # A model advance is per-run and sticks, so this run starts from chain
+        # position 0 exactly as graph.runner does on every start/resume.
+        from llm import health
+
+        health.reset("run-1")
         state = base_state(batch=[item()], settings={"llm_model": "retired/model-9"})
         out = nodes.llm_classify_batch(state)
-        assert seen == ["retired/model-9", None]
+        assert seen[0] == "retired/model-9"
+        assert len(seen) >= 2 and seen[1] != "retired/model-9"
         assert out["llm_decisions"][0]["decided_by"] == "llm"
 
     def test_empty_batch_is_a_no_op(self):

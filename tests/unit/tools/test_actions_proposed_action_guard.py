@@ -107,6 +107,9 @@ def seeded(_isolated_db):
                 decided_by="llm",
                 time_sensitive=False,
                 status="approved",
+                # Phase 6: only a reviewed decision is appliable at all — this fixture
+                # exercises the proposed_action/status guards, not the review gate.
+                review_state="reviewed",
             )
             session.add(decision)
             return decision.id

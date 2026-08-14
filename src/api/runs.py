@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -16,11 +16,22 @@ router = APIRouter()
 
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
+#: A run interrupted with work already persisted. Not terminal: it can be put back
+#: to ``running`` by POST /api/runs/{id}/resume without redoing a single thread.
+RESUMABLE_STATUS = "resumable"
+
+#: spec/api.md "Error codes" — 409, the run has no partial work to resume.
+NOT_RESUMABLE = "not_resumable"
+
 
 def run_payload(run) -> dict:
+    items_total = run.items_total or 0
+    items_decided = run.items_decided or 0
     return {
         "id": run.id,
         "status": run.status,
+        "resumable": run.status == RESUMABLE_STATUS,
+        "remaining": max(items_total - items_decided, 0),
         "dry_run": bool(run.dry_run),
         "items_total": run.items_total or 0,
         "items_decided": run.items_decided or 0,
@@ -56,9 +67,20 @@ def get_latest_run(
     is matched here rather than treated as a run id (Starlette matches routes
     in registration order, not by specificity).
     """
-    from api.triage import _latest_run_id
+    from db.models import TriageRun
 
-    run_id = _latest_run_id(session, user_id)
+    # ``resumable`` is included alongside completed/running: an interrupted run with
+    # persisted work is exactly what the dashboard must surface (the Resume banner,
+    # ui.md screen 13) — never a failed-run message.
+    run_id = session.execute(
+        select(TriageRun.id)
+        .where(
+            TriageRun.user_id == user_id,
+            TriageRun.status.in_(("completed", "running", RESUMABLE_STATUS)),
+        )
+        .order_by(TriageRun.started_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
     if run_id is None:
         return ok(None)
     return ok(run_payload(load_run(session, run_id, user_id)))
@@ -139,6 +161,79 @@ def get_run_summary(
         }
     )
 
+
+
+@router.post("/api/runs/{run_id}/resume")
+def resume_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Restart the SAME run row, skipping every thread that already has a decision.
+
+    No new run is created, so counts and cost stay on one row and spend is additive.
+    ``409 not_resumable`` when the run has no partial work to resume. Idempotent: a
+    run already back in ``running`` returns the same payload and no second background
+    task is started.
+    """
+    from sqlalchemy import update
+
+    from api.connections import _run_triage_task
+    from db.models import TriageRun
+
+    run = load_run(session, run_id, user_id)  # 404s if absent or another user's
+    payload = {
+        "run_id": run.id,
+        "items_total": run.items_total or 0,
+        "items_decided": run.items_decided or 0,
+        "remaining": max((run.items_total or 0) - (run.items_decided or 0), 0),
+    }
+    if run.status == "running":
+        return ok(payload)  # already resumed — never start a second worker
+    if run.status != RESUMABLE_STATUS:
+        raise api_error(
+            NOT_RESUMABLE,
+            f"this run has no partial work to resume (status={run.status!r})",
+            409,
+        )
+
+    # The resumable -> running transition is a single atomic conditional UPDATE,
+    # NOT the read-check-write above. Those checks are only for the error
+    # responses; they cannot decide who starts the worker.
+    #
+    # Read-check-then-commit leaves a TOCTOU window: two concurrent resumes (a
+    # double-click, or a client retry on a flaky connection) both read
+    # 'resumable', both write 'running', and both schedule a background task —
+    # two workers decide the same run at once, double-counting items_decided and
+    # cost. qa-auditor reproduced exactly that: 5 concurrent requests spawned 2
+    # workers, twice. Only the request whose UPDATE actually matches a row that
+    # is STILL 'resumable' wins; the database arbitrates, not the application.
+    won = session.execute(
+        update(TriageRun)
+        .where(
+            TriageRun.id == run_id,
+            TriageRun.user_id == user_id,
+            TriageRun.status == RESUMABLE_STATUS,
+        )
+        .values(status="running", finished_at=None, error_message=None)
+    ).rowcount
+    session.commit()
+
+    if not won:
+        # Another concurrent request flipped it first. Same payload, no second
+        # worker — identical to the already-running branch above.
+        return ok(payload)
+
+    background_tasks.add_task(
+        _run_triage_task,
+        run_id=run.id,
+        user_id=user_id,
+        channel_account_id=run.channel_account_id,
+        limit=max(run.items_total or 0, 10_000),
+        dry_run=bool(run.dry_run),
+    )
+    return ok(payload)
 
 
 @router.post("/api/runs/{run_id}/undo")

@@ -116,11 +116,18 @@ class TestLiveProgress:
         assert out["error"] is None
         assert run_row().items_total == 7
 
-    def test_prepare_llm_batches_surfaces_tier12_progress(self, run_row):
-        resolved = [{"item_id": f"i{n}", "decided_by": "rule"} for n in range(5)]
-        nodes.prepare_llm_batches(
-            _state(resolved=resolved, llm_queue=[_item(9)])
-        )
+    def test_prepare_llm_batches_never_clobbers_the_decided_count(self, run_row):
+        """Phase 6: tiers 1-2 checkpoint their own rows and bump the counter
+        atomically, so this node must not write an absolute count — doing so would
+        reset a resumed run's carried-over progress back to this leg's total."""
+        from db.models import TriageRun
+        from db.session import create_db_session
+
+        with create_db_session() as session:
+            session.get(TriageRun, "run-ctl").items_decided = 5
+
+        resolved = [{"item_id": f"i{n}", "decided_by": "rule"} for n in range(2)]
+        nodes.prepare_llm_batches(_state(resolved=resolved, llm_queue=[_item(9)]))
         assert run_row().items_decided == 5
 
     def test_each_classified_batch_increments_items_decided(self, run_row, monkeypatch):
@@ -517,11 +524,13 @@ class TestFailedBatchSpend:
         out = nodes.llm_classify_batch(_state(batch=[_item(1), _item(2)]))
 
         assert {d["decided_by"] for d in out["llm_decisions"]} == {"error"}
-        assert len(out["llm_calls"]) == 1
-        call = out["llm_calls"][0]
-        assert call["purpose"] == "classify_failed"
-        assert call["tokens_in"] == 444 and call["tokens_out"] == 333
-        assert call["items_in_batch"] == 2
+        # Phase 6: the batch is retried down the whole model chain before it
+        # degrades, so every model's burnt tokens are recorded — not just the first.
+        assert len(out["llm_calls"]) >= 1
+        for call in out["llm_calls"]:
+            assert call["purpose"] == "classify_failed"
+            assert call["tokens_in"] == 444 and call["tokens_out"] == 333
+            assert call["items_in_batch"] == 2
 
     def test_an_exception_without_usage_still_degrades_cleanly(
         self, _isolated_db, monkeypatch

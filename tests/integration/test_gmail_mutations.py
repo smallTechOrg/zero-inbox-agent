@@ -233,6 +233,9 @@ def action_pipeline_row(gmail_connection, gmail_service):
             reasoning="test",
             decided_by="rule",
             status="approved",
+            # Phase 6: only a reviewed decision is appliable at all; this test
+            # exercises the status guards, not the never-miss review gate.
+            review_state="reviewed",
         )
         session.add(decision)
         session.commit()
@@ -463,6 +466,9 @@ def test_apply_decision_refuses_a_needs_your_call_decision_without_touching_gmai
             reasoning="below floor",
             decided_by="llm",
             status="needs_your_call",
+            # Phase 6: only a reviewed decision is appliable at all; this test
+            # exercises the status guards, not the never-miss review gate.
+            review_state="reviewed",
         )
         session.add(decision)
         session.commit()
@@ -533,6 +539,9 @@ def test_apply_decision_refuses_a_rejected_decision(gmail_connection, gmail_serv
             reasoning="rejected by user",
             decided_by="llm",
             status="rejected",
+            # Phase 6: only a reviewed decision is appliable at all; this test
+            # exercises the status guards, not the never-miss review gate.
+            review_state="reviewed",
         )
         session.add(decision)
         session.commit()

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from api._common import (
     DRY_RUN_VIOLATION,
     NOT_FOUND,
+    NOT_REVIEWED,
     PROVIDER_ERROR,
     VALIDATION_ERROR,
     api_error,
@@ -31,7 +32,7 @@ from api._common import (
 from api.session import require_user_id
 from channels.base import ChannelError, DryRunViolation
 from db.session import get_session
-from tools.actions import ActionsError, NeedsYourCallError, NotApprovedError, apply_decision, undo_action
+from tools.actions import ActionsError, NeedsYourCallError, NotApprovedError, NotReviewedError, apply_decision, undo_action
 
 router = APIRouter()
 
@@ -139,6 +140,12 @@ def apply_actions_route(
         except NotApprovedError as exc:
             session.rollback()
             first_error = first_error or api_error(VALIDATION_ERROR, str(exc))
+        except NotReviewedError as exc:
+            # MUST precede the ActionsError catch-all: NotReviewedError subclasses
+            # it, so the generic handler would render this as 404 not_found — for a
+            # decision that plainly exists and is merely still provisional.
+            session.rollback()
+            first_error = first_error or api_error(NOT_REVIEWED, str(exc), 422)
         except ActionsError as exc:
             session.rollback()
             first_error = first_error or api_error(NOT_FOUND, str(exc), 404)

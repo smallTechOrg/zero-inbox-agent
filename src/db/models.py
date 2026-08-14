@@ -19,6 +19,7 @@ from sqlalchemy import (
     Boolean,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Text,
@@ -271,7 +272,10 @@ class Decision(Base):
     """The audit record: category + confidence + reasoning + which tier fired."""
 
     __tablename__ = "decisions"
-    __table_args__ = (UniqueConstraint("run_id", "item_id", name="uq_decision_run_item"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "item_id", name="uq_decision_run_item"),
+        Index("ix_decisions_run_review", "run_id", "review_state"),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
@@ -300,6 +304,13 @@ class Decision(Base):
     )
     time_sensitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="proposed", index=True)
+    #: The never-miss finality gate: provisional | reviewed | review_failed.
+    #: A row is durable the instant its tier decides it (``provisional``) and only
+    #: becomes appliable once the second-pass reviewer has upgraded it to
+    #: ``reviewed``. Orthogonal to ``status`` — see spec/data.md.
+    review_state: Mapped[str] = mapped_column(
+        Text, nullable=False, default="provisional", server_default="provisional"
+    )
     created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
     decided_at: Mapped[datetime | None] = _ts(nullable=True)
 

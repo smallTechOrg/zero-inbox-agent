@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from jsonschema import Draft202012Validator
 
 from config.settings import get_settings
+from llm.health import ProviderCircuitOpen
 from llm.providers.base import (
     BatchClassification,
     LLMError,
@@ -33,6 +34,9 @@ __all__ = [
     "LLMResult",
     "LLMError",
     "LLMSchemaError",
+    # Re-exported so call sites can catch it without importing llm.health directly.
+    # It is NOT an LLMError: it must never be swallowed by a retry/degrade path.
+    "ProviderCircuitOpen",
 ]
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)

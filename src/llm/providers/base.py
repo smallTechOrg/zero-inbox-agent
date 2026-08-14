@@ -70,11 +70,21 @@ class LLMError(RuntimeError):
     ``usage`` (when present) carries the token/cost accounting accumulated before
     the failure so the caller can persist it — tokens spent on a failed batch are
     still real spend and belong in the audit trail (spec/capabilities/decision-audit-trail.md).
+
+    ``model`` names the model id that failed, so the caller can decide to advance the
+    cross-model fallback chain (spec/capabilities/durable-resumable-runs.md rule F).
     """
 
-    def __init__(self, message: str = "", *, usage: "LLMResult | None" = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        usage: "LLMResult | None" = None,
+        model: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.model = model
 
 
 class LLMSchemaError(LLMError):

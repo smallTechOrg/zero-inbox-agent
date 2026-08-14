@@ -222,7 +222,11 @@ def second_pass_reviewer(state: TriageState) -> dict:
         flipped=flipped,
         failed_batches=len(failed_ids),
     )
-    return {"decisions": decisions, "llm_calls": calls}
+    return {
+        "decisions": decisions,
+        "llm_calls": calls,
+        "review_failed_item_ids": sorted(failed_ids),
+    }
 
 
 def apply_never_miss_floor(state: TriageState) -> dict:
@@ -251,4 +255,59 @@ def apply_never_miss_floor(state: TriageState) -> dict:
         floor=floor,
         needs_your_call=sum(1 for d in decisions if d.get("status") == "needs_your_call"),
     )
+    _upgrade_review_state(state, decisions)
     return {"decisions": decisions}
+
+
+def _upgrade_review_state(state: TriageState, decisions: list[dict]) -> None:
+    """Durable becomes final: provisional -> reviewed (or review_failed).
+
+    Runs at the end of the never-miss chain — the last point at which an ``archive``
+    can still be flipped back to ``keep``. Every thread whose verdict changed re-emits
+    ``thread_classified`` so the live feed shows provisional becoming final in place.
+    A failure here leaves the rows provisional, which is the safe direction: an
+    un-upgraded row can never be applied.
+    """
+    run_id = state.get("run_id")
+    if not run_id:
+        return
+    failed_ids = list(state.get("review_failed_item_ids") or [])
+    try:
+        from db.session import create_db_session
+        from graph.persistence import finalise_review
+
+        with create_db_session() as session:
+            outcome = finalise_review(
+                session,
+                run_id=run_id,
+                user_id=state["user_id"],
+                decisions=decisions,
+                review_failed_item_ids=failed_ids,
+            )
+    except Exception as exc:
+        log.warning("never_miss.review_state_upgrade_failed", run_id=run_id, error=str(exc))
+        return
+
+    log.info(
+        "never_miss.review_state",
+        run_id=run_id,
+        reviewed=outcome["reviewed"],
+        review_failed=outcome["review_failed"],
+        flipped=len(outcome["flipped"]),
+    )
+
+    from graph.checkpoint import emit_decisions
+
+    failed_set = set(failed_ids)
+    changed = set(outcome["flipped"]) | failed_set
+    for decision in decisions:
+        if decision["item_id"] not in changed:
+            continue
+        emit_decisions(
+            state,
+            [decision],
+            tier=decision.get("decided_by") or "reviewer",
+            review_state=(
+                "review_failed" if decision["item_id"] in failed_set else "reviewed"
+            ),
+        )

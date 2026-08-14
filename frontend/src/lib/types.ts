@@ -30,7 +30,14 @@ export type Me = {
 }
 
 /** src/domain/enums.py::RunStatus — there is no `queued` or `succeeded`. */
-export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | string
+export type RunStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  /** Phase 6 — interrupted with durable partial work; resumable in one click. */
+  | 'resumable'
+  | string
 
 export const RUN_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'] as const
 
@@ -225,11 +232,61 @@ export type SseEventType =
   | 'auto_apply_complete'
   | 'thread_classified'
   | 'thread_archived'
+  /** Phase 6 — the LLM provider is failing enough to stretch the run. */
+  | 'provider_degraded'
+  /** Phase 6 — the run stopped with durable partial work; it can be resumed. */
+  | 'run_resumable'
+  /** Phase 6 — a mid-run switch to the next model in the fallback chain. */
+  | 'model_fallback'
   | 'error'
   | 'heartbeat'
   /** Every backend log line, bridged from structlog — including Gmail 429
    * backoffs and LLM retries, which emit no hand-placed bus event. */
   | 'log'
+
+/** Phase 6 — spec/data.md decisions.review_state. */
+export type ReviewState = 'provisional' | 'reviewed' | 'review_failed' | string
+
+/** Payload of a `thread_classified` SSE event.
+ * Mirrors spec/capabilities/triage-transparency.md exactly. `subject` is capped
+ * at 60 chars and `reasoning` at 140 chars server-side; there is never a body. */
+export type ThreadClassifiedEvent = {
+  run_id: string
+  item_id: string
+  subject: string
+  from_email: string
+  category: string
+  action: string
+  decided_by: DecidedBy
+  confidence: number
+  /** Phase 6 — why the tier decided this way (first 140 chars). */
+  reasoning: string
+  /** Phase 6 — provisional until the never-miss reviewer has seen it. */
+  review_state: ReviewState
+}
+
+export type ProviderDegradedEvent = {
+  run_id: string
+  provider: string
+  model: string
+  calls: number
+  retries: number
+  consecutive_failures: number
+}
+
+export type RunResumableEvent = {
+  run_id: string
+  items_total: number
+  items_decided: number
+  reason: string
+}
+
+export type ModelFallbackEvent = {
+  run_id: string
+  from_model: string
+  to_model: string
+  reason: string
+}
 
 export type SseEvent = {
   id: string // client-side generated

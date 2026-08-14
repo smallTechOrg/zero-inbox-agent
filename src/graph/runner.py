@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -51,6 +52,70 @@ def _ensure_run(
         return row.id
 
 
+def _already_decided(run_id: str) -> dict:
+    """``{"ids": set[str], "count": int}`` for a (possibly resumed) run."""
+    try:
+        from sqlalchemy import func, select
+
+        from db.session import create_db_session
+        from graph.persistence import already_decided_item_ids
+
+        decision_cls = model_for("decisions")
+        with create_db_session() as session:
+            ids = already_decided_item_ids(session, run_id)
+            count = 0
+            if decision_cls is not None:
+                count = int(
+                    session.execute(
+                        select(func.count(decision_cls.id)).where(
+                            decision_cls.run_id == run_id
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+        if count:
+            log.info("triage.resuming", run_id=run_id, already_decided=count)
+        return {"ids": ids, "count": count}
+    except Exception as exc:  # pragma: no cover - a fresh run must never fail here
+        log.warning("triage.resume_load_failed", run_id=run_id, error=str(exc))
+        return {"ids": set(), "count": 0}
+
+
+def _reset_provider_health(run_id: str) -> None:
+    """Fresh circuit + chain position 0 on every start/resume (Rules E + F)."""
+    try:
+        from llm import health  # type: ignore[attr-defined]
+    except ImportError:  # pragma: no cover - slice 3 not landed yet
+        return
+    reset = getattr(health, "reset", None)
+    if reset is None:  # pragma: no cover
+        return
+    try:
+        reset(run_id)
+    except Exception as exc:  # pragma: no cover - never fail a run over telemetry
+        log.warning("triage.health_reset_failed", run_id=run_id, error=str(exc))
+
+
+@contextmanager
+def _bind_provider_health(run_id: str, user_id: str):
+    """`llm.health.bind_run(...)` if slice 3 is present, else a no-op.
+
+    Defensive so the runner keeps working if the provider-resilience module is
+    absent, matching `_reset_provider_health` above.
+    """
+    try:
+        from llm import health  # type: ignore[attr-defined]
+
+        binder = getattr(health, "bind_run", None)
+    except ImportError:  # pragma: no cover - slice 3 not landed
+        binder = None
+    if binder is None:  # pragma: no cover
+        yield
+        return
+    with binder(run_id, user_id):
+        yield
+
+
 def execute_triage(
     *,
     user_id: str,
@@ -88,6 +153,12 @@ def execute_triage(
         user_id=user_id, run_id=resolved_run_id
     )
 
+    # Resume: everything this run already decided is loaded up-front and seeded into
+    # state, so fetch_items can drop those threads from every downstream queue. A
+    # fresh run simply finds nothing (spec/capabilities/durable-resumable-runs.md B).
+    already_decided = _already_decided(resolved_run_id)
+    _reset_provider_health(resolved_run_id)
+
     initial: TriageState = {
         "run_id": resolved_run_id,
         "user_id": user_id,
@@ -101,16 +172,27 @@ def execute_triage(
         "llm_decisions": [],
         "deep_queue": [],
         "llm_calls": [],
+        "already_decided_item_ids": sorted(already_decided["ids"]),
+        "already_decided_count": already_decided["count"],
+        "review_failed_item_ids": [],
     }
     if items is not None:
         initial["items"] = items
 
     started = time.time()
     try:
-        final = triage_graph.invoke(
-            initial,
-            config={"max_concurrency": MAX_CONCURRENCY, "recursion_limit": 100},
-        )
+        # Bind the run to llm.health for the WHOLE invocation, so every provider
+        # counter, circuit-breaker decision, model rotation and degraded warning
+        # is attributed to this run and this user — and therefore reaches the
+        # user's activity feed instead of being dropped as unattributed. Without
+        # this the binding was dead code: defined, exported, never called.
+        # (Graph nodes hop to a worker thread for their async LLM calls;
+        # `_run_async` copies the context across so this binding survives.)
+        with _bind_provider_health(resolved_run_id, user_id):
+            final = triage_graph.invoke(
+                initial,
+                config={"max_concurrency": MAX_CONCURRENCY, "recursion_limit": 100},
+            )
     except Exception as exc:
         log.error("triage.crashed", run_id=resolved_run_id, error=str(exc))
         from db.session import create_db_session
