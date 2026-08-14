@@ -14,6 +14,25 @@ from sqlalchemy.orm import Session
 
 from tools.rules import DEFAULT_TAXONOMY
 
+#: Phase 7 per-category autonomy bars (spec/capabilities/drive-to-inbox-zero.md § B).
+#: Every other category is seeded NULL and inherits the global
+#: ``user_settings.auto_act_threshold`` (0.80), which is what keeps the global
+#: slider load-bearing.
+#:
+#: - ``outreach`` is the one archive-by-default category where a false archive
+#:   costs a real opportunity (a genuine intro reads like recruiter spam), so it
+#:   sits one measured confidence band above the global bar.
+#: - ``receipts`` is ``default_action = archive`` (Phase 7 — keeping it meant a
+#:   permanent ~715-thread inbox floor, so "inbox zero" could never be true), and
+#:   its bar is therefore **live**, not inert. Financial records earn the same
+#:   one-band margin as outreach: a wrongly-archived invoice is far more costly
+#:   than a wrongly-kept one, and the never-miss layer still holds anything
+#:   ``time_sensitive`` regardless of this bar.
+SEEDED_AUTO_ACT_THRESHOLDS: dict[str, float] = {
+    "outreach": 0.85,
+    "receipts": 0.85,
+}
+
 
 def ensure_default_taxonomy(session: Session, user_id: str) -> int:
     """Insert any missing default categories for ``user_id``. Returns rows created.
@@ -42,6 +61,7 @@ def ensure_default_taxonomy(session: Session, user_id: str) -> int:
                 description=spec["description"],
                 channel_label_name=f"ZeroInbox/{spec['name']}",
                 default_action=spec["default_action"],
+                auto_act_threshold=SEEDED_AUTO_ACT_THRESHOLDS.get(spec["key"]),
                 is_default=True,
                 sort_order=order,
             )

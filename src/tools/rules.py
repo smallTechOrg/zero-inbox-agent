@@ -40,7 +40,15 @@ DEFAULT_TAXONOMY: list[dict] = [
         "name": "Receipts",
         "description": "Purchase receipts, invoices, order confirmations, shipping updates, "
         "subscription billing and payment statements.",
-        "default_action": "keep",
+        # Phase 7: flipped from "keep" to "archive". Receipts are archival
+        # records, not work — you search for an invoice, you do not action it
+        # from the inbox — and keeping them put a ~715-thread floor under the
+        # inbox, so the product could not reach its own definition of zero.
+        # Nothing is lost: labelled ZeroInbox/Receipts, searchable, one-click
+        # undoable, never trashed. A genuinely time-sensitive receipt is still
+        # flagged time_sensitive and held by the never-miss layer, which is why
+        # the flip is safe. See spec/capabilities/drive-to-inbox-zero.md § B.
+        "default_action": "archive",
     },
     {
         "key": "outreach",

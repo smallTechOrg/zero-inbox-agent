@@ -83,7 +83,13 @@ class UserSettings(Base):
     user_id: Mapped[str] = mapped_column(
         Text, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
-    auto_act_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.95)
+    #: Phase 7: the **global** confidence bar at or above which the agent acts on
+    #: its own — finally read by a real code path (``graph.autonomy``). The
+    #: default dropped from 0.95 to 0.80 because 0.95 sits above the model's
+    #: entire measured output range (~0.94 ceiling); see spec/data.md.
+    auto_act_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.80, server_default="0.8"
+    )
     confidence_floor: Mapped[float] = mapped_column(Float, nullable=False, default=0.75)
     dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     llm_model: Mapped[str] = mapped_column(Text, nullable=False, default="nvidia/nemotron-3-nano-30b-a3b")
@@ -195,6 +201,10 @@ class Category(Base):
     channel_label_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
     channel_label_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     default_action: Mapped[str] = mapped_column(Text, nullable=False, default="keep")
+    #: Phase 7: per-category autonomy bar. NULL inherits
+    #: ``user_settings.auto_act_threshold``, which is what keeps the global
+    #: slider load-bearing. Inert while ``default_action = keep``.
+    auto_act_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
@@ -275,6 +285,7 @@ class Decision(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "item_id", name="uq_decision_run_item"),
         Index("ix_decisions_run_review", "run_id", "review_state"),
+        Index("ix_decisions_run_autonomy", "run_id", "autonomy_state"),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
@@ -311,6 +322,13 @@ class Decision(Base):
     review_state: Mapped[str] = mapped_column(
         Text, nullable=False, default="provisional", server_default="provisional"
     )
+    #: Phase 7: the **autonomy** lifecycle — why this thread is or is not leaving
+    #: the inbox. One of graph.autonomy.AUTONOMY_STATES. Orthogonal to both
+    #: ``status`` and ``review_state``. NULL only on rows written before Phase 7,
+    #: reported by the remainder ledger as ``unclassified`` — never backfilled,
+    #: because inventing a state for a decision made under a policy that did not
+    #: exist would fabricate history.
+    autonomy_state: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
     decided_at: Mapped[datetime | None] = _ts(nullable=True)
 

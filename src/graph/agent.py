@@ -8,6 +8,12 @@ no reducer, so each node's return value is the authoritative snapshot for the
 rest of the run — and run after ``cluster_decisions`` (which already merges
 tiers 1-4 into that key) and before ``persist_decisions``, which re-applies the
 floor once more as a final, idempotent safety net.
+
+Phase 7 inserts the two autonomy nodes from ``graph.nodes_autonomy`` *inside* that
+guarded chain: ``align_to_category_default`` immediately before the reviewer (so
+every category-driven archive is audited by the full never-miss cascade) and
+``mark_autonomy_state`` immediately after the floor (so nothing is stamped
+``auto_act`` before every verdict is final). See spec/agent.md § Edges.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from graph import edges, nodes, nodes_review
+from graph import edges, nodes, nodes_autonomy, nodes_review
 from graph.state import TriageState
 
 MAX_CONCURRENCY = 4
@@ -30,8 +36,10 @@ _NODES = (
     "llm_classify_batch",
     "deep_read_escalation",
     "cluster_decisions",
+    "align_to_category_default",
     "second_pass_reviewer",
     "apply_never_miss_floor",
+    "mark_autonomy_state",
     "persist_decisions",
     "handle_error",
     "finalize",
@@ -40,6 +48,9 @@ _NODES = (
 _REVIEW_NODES = {
     "second_pass_reviewer": nodes_review.second_pass_reviewer,
     "apply_never_miss_floor": nodes_review.apply_never_miss_floor,
+    # Phase 7 (spec/agent.md): the autonomy pair brackets the never-miss chain.
+    "align_to_category_default": nodes_autonomy.align_to_category_default,
+    "mark_autonomy_state": nodes_autonomy.mark_autonomy_state,
 }
 
 
@@ -89,6 +100,14 @@ def build_triage_graph():
     g.add_edge("deep_read_escalation", "cluster_decisions")
     g.add_conditional_edges(
         "cluster_decisions",
+        edges.guard("align_to_category_default"),
+        {
+            "align_to_category_default": "align_to_category_default",
+            "handle_error": "handle_error",
+        },
+    )
+    g.add_conditional_edges(
+        "align_to_category_default",
         edges.guard("second_pass_reviewer"),
         {"second_pass_reviewer": "second_pass_reviewer", "handle_error": "handle_error"},
     )
@@ -99,6 +118,11 @@ def build_triage_graph():
     )
     g.add_conditional_edges(
         "apply_never_miss_floor",
+        edges.guard("mark_autonomy_state"),
+        {"mark_autonomy_state": "mark_autonomy_state", "handle_error": "handle_error"},
+    )
+    g.add_conditional_edges(
+        "mark_autonomy_state",
         edges.guard("persist_decisions"),
         {"persist_decisions": "persist_decisions", "handle_error": "handle_error"},
     )

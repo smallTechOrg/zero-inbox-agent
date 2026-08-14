@@ -155,7 +155,10 @@ def test_user_settings_defaults_match_spec(session):
     user = _make_user(session, "defaults@example.com")
     session.commit()
     settings = session.get(UserSettings, user.id)
-    assert settings.auto_act_threshold == pytest.approx(0.95)
+    # Phase 7: 0.95 -> 0.80. The old default sat above the model's entire
+    # measured output range (~0.94 ceiling), so it was a bar nothing could clear.
+    # See spec/data.md § user_settings.
+    assert settings.auto_act_threshold == pytest.approx(0.80)
     assert settings.confidence_floor == pytest.approx(0.75)
     assert settings.dry_run is True
     assert settings.llm_model == "nvidia/nemotron-3-nano-30b-a3b"

@@ -17,8 +17,10 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api._common import UNAUTHENTICATED, api_error, iso, ok
+from api._common import UNAUTHENTICATED, VALIDATION_ERROR, api_error, iso, ok
 from db.session import get_session
+from graph.autonomy import DEFAULT_AUTO_ACT_THRESHOLD, MODEL_CEILING_WARNING_THRESHOLD
+from tools.never_miss import DEFAULT_CONFIDENCE_FLOOR
 
 COOKIE_NAME = "zi_session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
@@ -137,11 +139,16 @@ def me(
 
 
 def _settings_payload(row) -> dict:
-    """Settings are returned with Phase-1 defaults when the row does not exist yet."""
+    """Settings are returned with the shipped defaults when the row does not exist yet.
+
+    ``auto_act_threshold`` defaults to ``DEFAULT_AUTO_ACT_THRESHOLD`` (0.80, Phase 7)
+    rather than the old 0.95: 0.95 sits above the model's entire measured output
+    range, so it is a bar the agent can never clear. See spec/data.md.
+    """
     if row is None:
         return {
-            "auto_act_threshold": 0.95,
-            "confidence_floor": 0.75,
+            "auto_act_threshold": DEFAULT_AUTO_ACT_THRESHOLD,
+            "confidence_floor": DEFAULT_CONFIDENCE_FLOOR,
             "dry_run": True,
             "llm_model": "",
             "digest_hour_local": 8,
@@ -155,6 +162,19 @@ def _settings_payload(row) -> dict:
         "digest_hour_local": row.digest_hour_local,
         "timezone": row.timezone,
     }
+
+
+def _validate_threshold(field: str, value) -> float:
+    """Rule A5: ``0 < threshold <= 1``. Rejected with ``validation_error``."""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise api_error(VALIDATION_ERROR, f"{field} must be a number between 0 and 1") from exc
+    if not (0 < threshold <= 1):
+        raise api_error(
+            VALIDATION_ERROR, f"{field} must be greater than 0 and at most 1"
+        )
+    return threshold
 
 
 @router.patch("/api/settings")
@@ -180,12 +200,26 @@ def update_settings(
     }
     updates = {k: v for k, v in body.items() if k in allowed_fields}
 
+    # Phase 7 Rule A5. Both bars are validated the same way; the autonomy bar is
+    # additionally warned about above the measured model ceiling.
+    warning: str | None = None
+    for field in ("auto_act_threshold", "confidence_floor"):
+        if field in updates:
+            updates[field] = _validate_threshold(field, updates[field])
+    if updates.get("auto_act_threshold", 0) > MODEL_CEILING_WARNING_THRESHOLD:
+        # Accepted, not rejected — it is the user's inbox. But the measured model
+        # ceiling is ~0.94, so a bar above 0.90 means the agent acts on almost
+        # nothing, and the UI must say so rather than shipping a silent no-op.
+        warning = "above_model_ceiling"
+
     row = session.get(UserSettings, user_id)
     if row is None:
         row = UserSettings(
             user_id=user_id,
-            auto_act_threshold=updates.get("auto_act_threshold", 0.95),
-            confidence_floor=updates.get("confidence_floor", 0.75),
+            auto_act_threshold=updates.get(
+                "auto_act_threshold", DEFAULT_AUTO_ACT_THRESHOLD
+            ),
+            confidence_floor=updates.get("confidence_floor", DEFAULT_CONFIDENCE_FLOOR),
             dry_run=updates.get("dry_run", True),
             llm_model=updates.get("llm_model", ""),
             digest_hour_local=updates.get("digest_hour_local", 8),
@@ -199,4 +233,7 @@ def update_settings(
     session.commit()
     session.refresh(row)
 
-    return ok(_settings_payload(row))
+    payload = _settings_payload(row)
+    if warning:
+        payload["warning"] = warning
+    return ok(payload)

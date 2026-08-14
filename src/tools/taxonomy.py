@@ -28,6 +28,16 @@ from tools.rules import DEFAULT_TAXONOMY, VALID_ACTIONS
 URGENT_KEY = "urgent"
 
 
+class _Unset:
+    """Sentinel: "this field was not supplied" — distinct from an explicit None."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
 class TaxonomyError(ValueError):
     """A taxonomy business-rule violation (e.g. Urgent set to archive)."""
 
@@ -81,6 +91,22 @@ def _validate_action(key: str, default_action: str) -> None:
         raise TaxonomyError("The Urgent category can never carry default_action=archive")
 
 
+def validate_auto_act_threshold(value: float | None) -> float | None:
+    """Phase 7 Rule A5: ``0 < auto_act_threshold <= 1``. ``None`` = inherit global.
+
+    Returns the normalised float so callers can assign the result directly.
+    """
+    if value is None:
+        return None
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TaxonomyError("auto_act_threshold must be a number between 0 and 1") from exc
+    if not (0 < threshold <= 1):
+        raise TaxonomyError("auto_act_threshold must be greater than 0 and at most 1")
+    return threshold
+
+
 def create_category(
     session: Session,
     user_id: str,
@@ -90,6 +116,7 @@ def create_category(
     description: str = "",
     default_action: str = "keep",
     sort_order: int = 0,
+    auto_act_threshold: float | None = None,
 ) -> object:
     Category = _models().Category
 
@@ -98,6 +125,7 @@ def create_category(
     if not name or not name.strip():
         raise TaxonomyError("name is required")
     _validate_action(key, default_action)
+    auto_act_threshold = validate_auto_act_threshold(auto_act_threshold)
 
     existing = session.execute(
         select(Category).where(Category.user_id == user_id, Category.key == key)
@@ -112,6 +140,7 @@ def create_category(
         description=description,
         channel_label_name=label_name_for(name),
         default_action=default_action,
+        auto_act_threshold=auto_act_threshold,
         is_default=False,
         sort_order=sort_order,
     )
@@ -129,6 +158,7 @@ def update_category(
     description: str | None = None,
     default_action: str | None = None,
     sort_order: int | None = None,
+    auto_act_threshold: float | None | object = UNSET,
 ) -> object:
     Category = _models().Category
     category = session.get(Category, category_id)
@@ -137,6 +167,10 @@ def update_category(
 
     next_action = default_action if default_action is not None else category.default_action
     _validate_action(category.key, next_action)
+    if auto_act_threshold is not UNSET:
+        # ``None`` here is meaningful — it clears the override so the category
+        # inherits the global bar again — hence the UNSET sentinel.
+        category.auto_act_threshold = validate_auto_act_threshold(auto_act_threshold)
 
     if name is not None and name.strip():
         category.name = name
@@ -198,6 +232,8 @@ __all__ = [
     "TaxonomyError",
     "LabelClient",
     "URGENT_KEY",
+    "UNSET",
+    "validate_auto_act_threshold",
     "ensure_default_taxonomy",
     "list_categories",
     "create_category",

@@ -20,7 +20,13 @@ from api._common import VALIDATION_ERROR, api_error, not_found, ok
 from api.session import require_user_id
 from db.session import get_session
 from tools.rules import VALID_ACTIONS
-from tools.taxonomy import TaxonomyError, create_category, sync_labels, update_category
+from tools.taxonomy import (
+    UNSET,
+    TaxonomyError,
+    create_category,
+    sync_labels,
+    update_category,
+)
 
 router = APIRouter()
 
@@ -31,6 +37,9 @@ class CategoryCreate(BaseModel):
     description: str = ""
     default_action: str = "keep"
     sort_order: int = 0
+    #: Phase 7: per-category autonomy bar. Omit (or null) to inherit the global
+    #: ``user_settings.auto_act_threshold``.
+    auto_act_threshold: float | None = None
 
 
 class CategoryUpdate(BaseModel):
@@ -38,6 +47,9 @@ class CategoryUpdate(BaseModel):
     description: str | None = None
     default_action: str | None = None
     sort_order: int | None = None
+    #: Phase 7. Absent = unchanged; explicit ``null`` = clear the override and
+    #: inherit the global bar again. Hence ``model_fields_set`` below.
+    auto_act_threshold: float | None = None
 
 
 def _category_payload(category) -> dict:
@@ -49,6 +61,7 @@ def _category_payload(category) -> dict:
         "channel_label_name": category.channel_label_name,
         "channel_label_id": category.channel_label_id,
         "default_action": category.default_action,
+        "auto_act_threshold": category.auto_act_threshold,
         "is_default": bool(category.is_default),
         "sort_order": category.sort_order,
     }
@@ -71,6 +84,7 @@ def create_category_route(
             description=body.description,
             default_action=body.default_action,
             sort_order=body.sort_order,
+            auto_act_threshold=body.auto_act_threshold,
         )
     except TaxonomyError as exc:
         raise api_error(VALIDATION_ERROR, str(exc)) from exc
@@ -95,6 +109,11 @@ def update_category_route(
             description=body.description,
             default_action=body.default_action,
             sort_order=body.sort_order,
+            auto_act_threshold=(
+                body.auto_act_threshold
+                if "auto_act_threshold" in body.model_fields_set
+                else UNSET
+            ),
         )
     except LookupError as exc:
         raise not_found("Category") from exc
