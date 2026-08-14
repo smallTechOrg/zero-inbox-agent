@@ -530,8 +530,31 @@ def insert_provisional_decisions(
             continue
         stale = existing.get(db_item_id)
         if stale is not None:
-            # Rule F2 — only an unresolved `error` row may be overwritten in place.
-            if getattr(stale, "decided_by", None) != "error":
+            # Rule F2 — an UNRESOLVED row may be overwritten in place. Two kinds
+            # qualify, and both must, or the tail never converges:
+            #
+            #   decided_by == "error"          the tier could not decide it
+            #   review_state == "review_failed" the reviewer could not audit it
+            #
+            # `review_failed` was originally excluded, which made it a permanent,
+            # self-renewing leak rather than a one-off discard: F1 re-queues the
+            # row so it costs a real LLM call on EVERY resume forever; this
+            # branch refused the write so it stayed `review_failed`; and
+            # `load_provisional_for_review` selects only `provisional`, so the
+            # reviewer could never clear it either. The row stayed permanently
+            # un-appliable — counted in `distance_to_zero` for good, pinning
+            # `apply_ok` false on every future run so the red "Retry archiving"
+            # bar could never clear. That is the opposite of "the remainder
+            # holds only what needs a human": it held work the agent had
+            # declined to finish, and billed for it repeatedly.
+            #
+            # Landing state is right: the overwrite resets `review_state` to
+            # `provisional` below, so the fresh verdict re-enters the never-miss
+            # gate exactly like any other decision. Nothing skips review.
+            if (
+                getattr(stale, "decided_by", None) != "error"
+                and getattr(stale, "review_state", None) != "review_failed"
+            ):
                 continue
             _assign(
                 stale,

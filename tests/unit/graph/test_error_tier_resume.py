@@ -305,7 +305,27 @@ def test_f1_and_f2_together_converge_the_tail(seeded):
         rows = session.query(Decision).filter(Decision.run_id == RUN_ID).all()
         assert len(rows) == 3  # no duplicates
         assert not [r for r in rows if r.decided_by == "error"]
-        # The review_failed row is deliberately NOT overwritten — only an `error`
-        # row may be. It stays un-appliable until the reviewer sees it again.
+        # BOTH unresolved kinds converge. `review_failed` used to be excluded
+        # here, which made it a permanent self-renewing leak rather than a
+        # one-off discard: F1 re-queued the row (costing a real LLM call every
+        # resume, forever), F2 refused the write so it stayed `review_failed`,
+        # and `load_provisional_for_review` selects only `provisional` so the
+        # reviewer could never clear it. The row stayed un-appliable for good —
+        # counted in `distance_to_zero` permanently, pinning `apply_ok` false on
+        # every future run so the red "Retry archiving" bar could never clear.
         by_item = {r.item_id: r for r in rows}
-        assert by_item["item2"].review_state == "review_failed"
+        assert by_item["item2"].review_state == "provisional", (
+            "a review_failed row must be overwritten by its fresh verdict and "
+            "returned to provisional, or the tail never converges"
+        )
+        assert by_item["item2"].reasoning == "resume verdict"
+        # Landing state matters: provisional means it re-enters the never-miss
+        # gate like any other decision. Nothing skips review.
+        assert by_item["item2"].status == "proposed"
+
+        # And nothing is left unresolved at all — the whole point of the tail.
+        unresolved = [
+            r for r in rows
+            if r.decided_by == "error" or r.review_state == "review_failed"
+        ]
+        assert unresolved == []
