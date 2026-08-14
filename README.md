@@ -107,8 +107,16 @@ uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_
 ```bash
 uv run alembic upgrade head          # create / migrate the SQLite database
 cd frontend && pnpm build && cd ..   # static export into frontend/out
-uv run python -m src                 # FastAPI + the static frontend on port 8001
+./scripts/run-server.sh              # supervised: FastAPI + static frontend on port 8001
 ```
+
+**Use `./scripts/run-server.sh`, not a bare `uv run python -m src`.** The wrapper restarts
+the server if it ever dies, logging every restart with a timestamp. That matters because the
+API reconciles orphaned `running` triage runs on boot — supervised, that repair happens
+automatically instead of waiting for someone to notice a dead process. A bare
+`uv run python -m src` still works for a one-off foreground run, and it now enables
+`faulthandler`, so a native crash dumps every thread's stack instead of ending the log
+mid-line.
 
 Open **<http://localhost:8001/app/>** — note the port, the `/app/`, and the **trailing slash**.
 
@@ -181,7 +189,7 @@ integration or E2E level.
 uv run alembic upgrade head && uv run alembic current
 uv run pytest tests/unit tests/integration -q
 cd frontend && pnpm install && pnpm build && cd ..
-uv run python -m src &            # serves http://localhost:8001
+./scripts/run-server.sh &         # supervised; serves http://localhost:8001
 npx playwright test tests/e2e/ --reporter=line
 ```
 

@@ -129,7 +129,15 @@ def create_app() -> FastAPI:
             structlog.contextvars.clear_contextvars()
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
+        """Liveness. Deliberately ``async`` and DB-free.
+
+        A sync `def` endpoint runs in Starlette's shared 40-token anyio
+        threadpool. During a long triage run the 1s-poll endpoints can drain
+        every token, and a sync /health would then hang too — making a busy
+        server indistinguishable from a dead one. Liveness must never depend on
+        that pool.
+        """
         return ok({"status": "ok", "version": VERSION})
 
     from api import actions, categories, connections, digest, events, memory, runs, session, triage

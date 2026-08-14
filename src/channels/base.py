@@ -112,6 +112,7 @@ class ChannelAdapter(ABC):
         query: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
         after: datetime | None = None,
+        on_fetch_failed: Callable[[list[str]], None] | None = None,
     ) -> list[ChannelItem]:
         """Most recent inbox threads, newest first, headers/snippet only.
 
@@ -122,6 +123,11 @@ class ChannelAdapter(ABC):
         ``after`` (optional) stops the scan once a thread's own internal date
         reaches that cutoff — an incremental "what's new since my last run"
         fetch, cheaper than re-listing and re-classifying the whole inbox.
+
+        ``on_fetch_failed`` (optional) is called with the external ids of threads
+        that could not be fetched. Those threads are absent from the result, so
+        an implementation that drops them silently would make a partial run look
+        complete — implementations must report, never swallow.
         """
 
     @abstractmethod

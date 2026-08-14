@@ -8,6 +8,7 @@ scope, not deferred.
 
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,6 +33,10 @@ from channels.gmail.normalize import WANTED_HEADERS, Redactor, normalize_thread
 
 MAX_ATTEMPTS = 3
 GMAIL_PAGE_SIZE = 100
+#: Socket timeout (seconds) for every worker's own httplib2 connection.
+GMAIL_HTTP_TIMEOUT = 60
+#: Concurrent per-thread metadata fetches. Each worker owns its own TLS socket.
+GMAIL_MAX_WORKERS = 10
 DRY_RUN_MESSAGE = (
     "Phase 1 is dry-run: the Gmail adapter performs no mutations. "
     "Real mutations ship in Phase 2 behind explicit approval + undo."
@@ -39,26 +44,64 @@ DRY_RUN_MESSAGE = (
 
 
 class GmailAdapter(ChannelAdapter):
-    """Wraps a built googleapiclient Gmail service for one user's mailbox."""
+    """Wraps a built googleapiclient Gmail service for one user's mailbox.
+
+    **Thread safety.** A googleapiclient service owns exactly one ``httplib2.Http``,
+    and httplib2 caches one ``HTTPSConnection`` per host — its own docstring says
+    it is "not thread-safe, requires external synchronization". Sharing one service
+    across a ``ThreadPoolExecutor`` therefore interleaves several workers'
+    ``putrequest``/``getresponse`` calls on a single TLS socket; one worker's read
+    timeout closes the socket underneath the others, producing a burst of read
+    timeouts, an OpenSSL ``RECORD_LAYER_FAILURE`` and finally a native abort with no
+    Python traceback.
+
+    So every pooled worker gets its **own** service, built by ``service_factory``
+    and cached in a :class:`threading.local`. ``service_factory`` also mints fresh
+    credentials per thread, so concurrent access-token refreshes cannot race on one
+    shared ``Credentials`` object either.
+    """
 
     channel = "gmail"
 
+    # Class-level defaults so a partially-constructed adapter (tests build one
+    # with ``object.__new__`` to inject a fake transport) still has a coherent,
+    # single-service, serial configuration.
+    _service_factory: Callable[[], object] | None = None
+    _max_workers: int = GMAIL_MAX_WORKERS
+    # Safe despite being a mutable class-level default: `list_threads` REBINDS
+    # `self.last_fetch_failed_ids = []` (instance attribute) before anything
+    # extends it, so this shared list is only ever read, never mutated. Keep
+    # that rebind if you touch list_threads.
+    last_fetch_failed_ids: list[str] = []
+
     def __init__(
         self,
-        service,
+        service=None,
         *,
         user_id: str,
         account_email: str = "",
         redactor: Redactor | None = None,
         backoff_seconds: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
+        service_factory: Callable[[], object] | None = None,
+        max_workers: int = GMAIL_MAX_WORKERS,
     ) -> None:
-        self._service = service
+        if service is None and service_factory is None:
+            raise ChannelError("GmailAdapter requires a service or a service_factory")
+        self._service_factory = service_factory
+        # The serial (non-pooled) service. Built once; only ever touched by the
+        # calling thread.
+        self._service = service if service is not None else service_factory()  # type: ignore[misc]
+        self._local = threading.local()
+        self._max_workers = max_workers
         self.user_id = user_id
         self._account_email = account_email
         self._redactor = redactor
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep
+        #: External thread ids that could not be fetched on the last
+        #: :meth:`list_threads` call, even after a retry on a fresh connection.
+        self.last_fetch_failed_ids: list[str] = []
 
     # --- factory ------------------------------------------------------
     @classmethod
@@ -66,14 +109,29 @@ class GmailAdapter(ChannelAdapter):
         cls, refresh_token: str, *, user_id: str, account_email: str = "", **kwargs
     ) -> "GmailAdapter":
         """Build an adapter from a decrypted refresh token (auto-refreshes access)."""
-        from googleapiclient.discovery import build
-
-        from channels.gmail.oauth import credentials_from_refresh_token, google_oauth_config
+        from channels.gmail.oauth import google_oauth_config
 
         config = google_oauth_config()
-        credentials = credentials_from_refresh_token(config, refresh_token)
-        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
-        return cls(service, user_id=user_id, account_email=account_email, **kwargs)
+        factory = _service_factory_for_refresh_token(config, refresh_token)
+        return cls(
+            None,
+            service_factory=factory,
+            user_id=user_id,
+            account_email=account_email,
+            **kwargs,
+        )
+
+    # --- per-thread transport ----------------------------------------
+    def _worker_service(self, *, fresh: bool = False):
+        """The calling thread's own Gmail service (never shared across threads)."""
+        if self._service_factory is None:
+            # Injected service (tests / callers that supply their own). Serial use
+            # only — there is nothing to build a second connection from.
+            return self._service
+        existing = getattr(self._local, "service", None)
+        if fresh or existing is None:
+            self._local.service = self._service_factory()
+        return self._local.service
 
     # --- transport ----------------------------------------------------
     def _execute(self, request):
@@ -113,18 +171,48 @@ class GmailAdapter(ChannelAdapter):
         return "insufficientPermissions" in str(exc) or "ACCESS_TOKEN" in str(exc)
 
     # --- helpers ------------------------------------------------------
+    def _thread_meta_request(self, service, thread_id: str):
+        return service.users().threads().get(
+            userId="me", id=thread_id, format="metadata",
+            metadataHeaders=WANTED_HEADERS,
+        )
+
+    def _fetch_once(self, service, thread_id: str) -> dict:
+        """One metadata fetch on the given service. An empty body is a failure.
+
+        Gmail never legitimately answers ``threads().get`` with an empty body, so
+        treating it as success would drop the thread from the run without ever
+        counting it as failed.
+        """
+        raw = self._execute(self._thread_meta_request(service, thread_id))
+        if not raw:
+            raise ChannelError(f"Gmail returned an empty body for thread {thread_id}")
+        return raw
+
+    def _fetch_thread_meta_checked(self, thread_id: str) -> tuple[dict | None, str | None]:
+        """Fetch one thread's metadata on this thread's own connection.
+
+        Returns ``(raw, error)``. A first failure is retried **once on a brand new
+        connection** — a dropped/poisoned socket is the common transient here and a
+        fresh `Http` recovers it. Only an unrecoverable failure returns an error,
+        and the caller must surface it: silently dropping threads makes a partial
+        run look complete.
+        """
+        try:
+            return self._fetch_once(self._worker_service(), thread_id), None
+        except Exception as first:
+            log.warning(
+                "gmail.thread_fetch_retry", thread_id=thread_id, error=str(first)
+            )
+        try:
+            return self._fetch_once(self._worker_service(fresh=True), thread_id), None
+        except Exception as exc:
+            log.warning("gmail.thread_fetch_failed", thread_id=thread_id, error=str(exc))
+            return None, str(exc)
+
     def _fetch_thread_meta(self, thread_id: str) -> dict | None:
         """Fetch a single thread's metadata — safe to call from a thread pool."""
-        try:
-            return self._execute(
-                self._service.users().threads().get(
-                    userId="me", id=thread_id, format="metadata",
-                    metadataHeaders=WANTED_HEADERS,
-                )
-            )
-        except Exception as e:
-            log.warning("gmail.thread_fetch_failed", thread_id=thread_id, error=str(e))
-            return None
+        return self._fetch_thread_meta_checked(thread_id)[0]
 
     # --- read ---------------------------------------------------------
     def account_email(self) -> str:
@@ -141,6 +229,7 @@ class GmailAdapter(ChannelAdapter):
         cancel_check: Callable[[], bool] | None = None,
         after: datetime | None = None,
         on_page: Callable[[int, int], None] | None = None,
+        on_fetch_failed: Callable[[list[str]], None] | None = None,
     ) -> list[ChannelItem]:
         """Most recent inbox threads, newest first.
 
@@ -156,11 +245,18 @@ class GmailAdapter(ChannelAdapter):
         ``on_page`` (optional) is called with ``(page_num, fetched_so_far)``
         after each page's metadata is fully fetched and normalised — useful for
         emitting SSE progress events during long inbox scans.
+
+        ``on_fetch_failed`` (optional) is called with the list of external thread
+        ids that could not be fetched on a page even after a retry on a fresh
+        connection. Those threads are missing from the result, so the caller must
+        report them rather than present an under-counted run as complete. The same
+        ids accumulate on :attr:`last_fetch_failed_ids`.
         """
         if limit < 0:
             raise ChannelError("limit must be >= 0")
 
         redactor = self._redactor
+        self.last_fetch_failed_ids = []
         items: list[ChannelItem] = []
         page_token: str | None = None
         page_num = 0
@@ -189,16 +285,27 @@ class GmailAdapter(ChannelAdapter):
                 break
             log.info("gmail.fetch_page", page=page_num, fetched_so_far=len(items), page_size=len(batch))
 
-            # Parallelise the per-thread metadata requests (up to 10 at once).
+            # Parallelise the per-thread metadata requests. Each pool worker
+            # builds and reuses its OWN Gmail service (see `_worker_service`) —
+            # they must never share one httplib2 connection.
             page_items: list[ChannelItem] = []
-            with ThreadPoolExecutor(max_workers=10) as pool:
+            page_failed: list[str] = []
+            # An adapter built with an injected `service` (no factory) has exactly
+            # ONE service and `_worker_service` hands that same object to every
+            # worker — which is precisely the shared-httplib2 crash this class
+            # was rewritten to eliminate. Such an adapter must run serially, or
+            # it is the original bug again with a new caller.
+            workers = self._max_workers if self._service_factory is not None else 1
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(self._fetch_thread_meta, entry["id"]): entry["id"]
+                    pool.submit(self._fetch_thread_meta_checked, entry["id"]): entry["id"]
                     for entry in batch if entry.get("id")
                 }
                 for future in as_completed(futures):
-                    raw = future.result()
+                    raw, error = future.result()
                     if raw is None:
+                        if error is not None:
+                            page_failed.append(futures[future])
                         continue
                     try:
                         item = normalize_thread(raw, redactor=redactor)
@@ -206,6 +313,20 @@ class GmailAdapter(ChannelAdapter):
                         continue
                     if item is not None:
                         page_items.append(item)
+
+            if page_failed:
+                self.last_fetch_failed_ids.extend(page_failed)
+                log.warning(
+                    "gmail.page_fetch_incomplete",
+                    page=page_num,
+                    failed=len(page_failed),
+                    page_size=len(batch),
+                )
+                if on_fetch_failed is not None:
+                    try:
+                        on_fetch_failed(list(page_failed))
+                    except Exception:  # pragma: no cover - reporting never fails a fetch
+                        pass
 
             # Apply the after-cutoff filter: if any thread is older than the
             # watermark the scan is done (Gmail returns newest-first; once we
@@ -308,6 +429,30 @@ class GmailAdapter(ChannelAdapter):
 
     def create_draft(self, external_thread_id: str, body: str) -> dict:
         raise DryRunViolation(DRY_RUN_MESSAGE)
+
+
+def _service_factory_for_refresh_token(config, refresh_token: str) -> Callable[[], object]:
+    """A zero-arg builder of a *completely independent* Gmail service.
+
+    Independent means: its own ``httplib2.Http`` (hence its own TLS socket) **and**
+    its own ``Credentials`` object, so neither the connection nor the access-token
+    refresh is shared with any other thread.
+    """
+
+    def _build():
+        import google_auth_httplib2
+        import httplib2
+        from googleapiclient.discovery import build
+
+        from channels.gmail.oauth import credentials_from_refresh_token
+
+        credentials = credentials_from_refresh_token(config, refresh_token)
+        authed_http = google_auth_httplib2.AuthorizedHttp(
+            credentials, http=httplib2.Http(timeout=GMAIL_HTTP_TIMEOUT)
+        )
+        return build("gmail", "v1", http=authed_http, cache_discovery=False)
+
+    return _build
 
 
 def _accumulate_recipients(message: dict, signals: dict[str, SenderSignal]) -> None:

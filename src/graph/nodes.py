@@ -255,6 +255,35 @@ def _record_progress(
         log.warning("triage.progress_write_failed", run_id=run_id, error=str(exc))
 
 
+def _record_fetch_failures(run_id: str | None, *, fetched: int, failed: int) -> None:
+    """Record an incomplete fetch on the run row so a partial run is never shown as whole.
+
+    "Fetched 2,847 of 2,900 — 53 threads could not be read" is honest; silently
+    triaging 2,847 and calling it the whole inbox is not.
+    """
+    if not run_id or failed <= 0:
+        return
+    try:
+        from sqlalchemy import update as sa_update
+
+        from db.session import create_db_session
+        from graph.persistence import model_for
+
+        run_cls = model_for("triage_runs")
+        if run_cls is None:
+            return
+        message = (
+            f"Fetched {fetched} of {fetched + failed} threads — {failed} could not be "
+            f"read from Gmail and were not triaged. Re-run to pick them up."
+        )
+        with create_db_session() as session:
+            session.execute(
+                sa_update(run_cls).where(run_cls.id == run_id).values(error_message=message)
+            )
+    except Exception as exc:  # pragma: no cover - reporting must never fail a run
+        log.warning("triage.fetch_failure_write_failed", run_id=run_id, error=str(exc))
+
+
 _FENCE_RE = re.compile(r"```(?:json)?", re.IGNORECASE)
 
 
@@ -427,18 +456,52 @@ def fetch_items(state: TriageState) -> dict:
             except Exception:  # pragma: no cover - bus must never fail a run
                 pass
 
-        items = [
-            i if isinstance(i, dict) else i.model_dump()
-            for i in adapter.list_threads(
-                limit=state.get("limit", 200),
-                cancel_check=(lambda: _run_is_cancelled(run_id)) if run_id else None,
-                after=after_dt,
-                on_page=_on_fetch_page,
-            )
-        ]
+        # Threads Gmail refused to hand over even after a retry on a fresh
+        # connection. They are missing from `items`, so items_total would
+        # silently under-count the mailbox — the user must be told instead.
+        fetch_failed: list[str] = []
+
+        def _on_fetch_failed(failed_ids: list[str]) -> None:
+            fetch_failed.extend(failed_ids)
+            try:
+                from events import bus as _bus
+                _bus.emit(user_id, {
+                    "type": "fetch_failed",
+                    "run_id": run_id,
+                    "failed_in_page": len(failed_ids),
+                    "failed_total": len(fetch_failed),
+                })
+            except Exception:  # pragma: no cover - bus must never fail a run
+                pass
+
+        list_kwargs = dict(
+            limit=state.get("limit", 200),
+            cancel_check=(lambda: _run_is_cancelled(run_id)) if run_id else None,
+            after=after_dt,
+            on_page=_on_fetch_page,
+        )
+        # Decide support by INSPECTING the signature, never by catching TypeError
+        # around the call. A TypeError raised anywhere inside a 2,900-thread
+        # fetch (a bad cancel_check, a normalize bug) would otherwise be
+        # swallowed and silently trigger a COMPLETE second full-inbox re-fetch —
+        # double the Gmail quota and runtime, with the failure callback lost.
+        import inspect
+
+        if "on_fetch_failed" in inspect.signature(adapter.list_threads).parameters:
+            list_kwargs["on_fetch_failed"] = _on_fetch_failed
+        fetched = adapter.list_threads(**list_kwargs)
+        items = [i if isinstance(i, dict) else i.model_dump() for i in fetched]
         # The progress bar's denominator, written the moment the total is known —
         # not at the end of the run (spec/api.md: GET /api/runs is polled at 1s).
         _record_progress(state.get("run_id"), items_total=len(items))
+        if fetch_failed:
+            log.warning(
+                "gmail.fetch_incomplete",
+                run_id=run_id,
+                fetched=len(items),
+                failed=len(fetch_failed),
+            )
+            _record_fetch_failures(run_id, fetched=len(items), failed=len(fetch_failed))
         # Harvest + persist per-sender evidence so the never-miss reply-history
         # signal (sender_profiles.ever_replied) and the learned bulk-archive
         # heuristic feed tier 2 of the cascade. Best-effort: a channel read
