@@ -19,7 +19,10 @@ router = APIRouter()
 SAMPLE_SUBJECT_COUNT = 3
 
 
-_DEFAULT_VIEW_STATUSES = ("completed", "running")
+#: ``applying`` is included deliberately: the run is decided and its clusters
+#: exist, the apply pass is just still writing to Gmail. Omitting it made the
+#: dashboard lose the current run for the whole apply window.
+_DEFAULT_VIEW_STATUSES = ("completed", "running", "applying")
 
 
 def _latest_run_id(session: Session, user_id: str) -> str | None:

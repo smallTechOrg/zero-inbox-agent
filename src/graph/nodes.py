@@ -1839,10 +1839,20 @@ def finalize(state: TriageState) -> dict:
         from graph.persistence import update_run
 
         with create_db_session() as session:
+            # NOT `completed` yet — the apply pass below has not run. Marking the
+            # run complete here made every client polling `GET /api/runs/{id}`
+            # see a finished run whose decisions were still unapplied, i.e.
+            # `apply_ok: false` + `distance_to_zero > 0`, which renders the red
+            # "could not archive" bar. On a 40-thread run that flashed for
+            # seconds; on a 2,000-thread inbox the apply pass takes minutes, so
+            # every SUCCESSFUL run would show a sustained false failure right
+            # when the user is watching for the result. `applying` is
+            # non-terminal, so `isRunActive` keeps the progress UI up and the
+            # card holds its verdict until there is one.
             update_run(
                 session,
                 run_id=state["run_id"],
-                status="completed",
+                status="applying",
                 items_decided=counts.get("total", 0),
                 counts=counts,
                 cost=cost,
@@ -1929,6 +1939,19 @@ def finalize(state: TriageState) -> dict:
 
     # Persist the remainder ledger onto the run row (apply was persisted above).
     _persist_counts(run_id, counts)
+
+    # NOW the run is genuinely finished: decisions made, applied, ledger written.
+    # Flipping to `completed` only here means a client never sees a terminal run
+    # whose apply outcome is still in flight — `apply_ok` and `distance_to_zero`
+    # are settled the first moment the status says they can be trusted.
+    try:
+        from db.session import create_db_session
+        from graph.persistence import update_run
+
+        with create_db_session() as session:
+            update_run(session, run_id=run_id, status="completed")
+    except Exception as exc:  # pragma: no cover
+        log.error("triage.finalize_complete_failed", run_id=run_id, error=str(exc))
 
     log.info(
         "triage.completed",

@@ -25,6 +25,12 @@ TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 #: to ``running`` by POST /api/runs/{id}/resume without redoing a single thread.
 RESUMABLE_STATUS = "resumable"
 
+#: Decisions are made and persisted; the Gmail apply pass is still running.
+#: Non-terminal on purpose — a client must never see a terminal run whose
+#: apply outcome is still in flight, because `apply_ok`/`distance_to_zero`
+#: are not yet settled and the UI would render a false failure.
+APPLYING_STATUS = "applying"
+
 #: spec/api.md "Error codes" — 409, the run has no partial work to resume.
 NOT_RESUMABLE = "not_resumable"
 
@@ -98,7 +104,7 @@ def get_latest_run(
         select(TriageRun.id)
         .where(
             TriageRun.user_id == user_id,
-            TriageRun.status.in_(("completed", "running", RESUMABLE_STATUS)),
+            TriageRun.status.in_(("completed", "running", APPLYING_STATUS, RESUMABLE_STATUS)),
         )
         .order_by(TriageRun.started_at.desc())
         .limit(1)

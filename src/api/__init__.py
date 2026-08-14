@@ -44,7 +44,9 @@ def _reconcile_orphaned_runs() -> int:
     try:
         with create_db_session() as session:
             orphans = (
-                session.query(TriageRun).filter(TriageRun.status == "running").all()
+                session.query(TriageRun)
+                .filter(TriageRun.status.in_(("running", "applying")))
+                .all()
             )
             for run in orphans:
                 decided = int(
