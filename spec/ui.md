@@ -141,6 +141,61 @@ Layout — a flat list of category rows. Each row:
 
 Loading: skeleton rows. Error: toast with message. No page refresh required for any action.
 
+## Phase 6 screens
+
+### 13. Resume banner *(Phase 6 — top of the primary screen)*
+
+`frontend/src/components/ResumeBanner.tsx`, mounted in `page.tsx` above the progress bar. Rendered
+whenever `GET /api/runs/latest` returns `status === "resumable"`.
+
+- Full-width amber bar: **"Run interrupted — 2,003 of 2,176 threads already triaged."**
+- Primary button: **"Resume run — 2,003 of 2,176 already done"** → `POST /api/runs/{run_id}/resume`.
+  Disabled with a spinner while the request is in flight; on success the banner is replaced by the
+  live progress bar starting at 2,003, not 0.
+- Secondary text link: "Start a fresh run instead" → the normal `POST .../triage`, with a confirm
+  dialog naming the consequence: *"This re-classifies all 2,176 threads and costs more."*
+- On `409 not_resumable` the banner clears and shows the standard envelope error with Retry.
+- Never shown for `running`, `completed`, `cancelled` or `failed` runs.
+
+### 14. Live classification feed *(Phase 6 — inside the Activity drawer)*
+
+The drawer becomes the live classification surface, not just a progress counter.
+
+- One row per decided thread, keyed by `item_id`, newest first, arriving as the run proceeds:
+  **tier badge** (`RULE` / `SENDER HISTORY` / `LLM` / `DEEP READ` / `REVIEWER` / `ERROR`) ·
+  subject · `→` category · action · confidence % · reasoning (truncated, expandable).
+- **Provisional labelling:** a row whose `review_state` is `provisional` carries an amber
+  `NOT YET REVIEWED` chip and muted text. `review_failed` carries a red `REVIEW FAILED — kept` chip.
+  Only `reviewed` rows render at full contrast with no chip. A later event for the same `item_id`
+  (a reviewer flip) **replaces** the earlier row in place, so the user watches provisional become
+  final. A provisional row must never read as a final decision.
+- **Degraded-provider banner:** a `provider_degraded` event pins a red banner to the **top** of the
+  drawer (above the feed, not scrolling with it) and auto-opens the drawer:
+  **"NVIDIA is failing — 2,774 retries. This run is degraded and may take much longer than usual."**
+  It clears on `run_completed` or `run_resumable`.
+- **Model-fallback row:** a `model_fallback` event renders a distinct amber system row (not a thread
+  row, never keyed by `item_id`) — *"Switched model: `nvidia/nemotron-3-nano-30b-a3b` →
+  `nvidia/nemotron-3-super-120b-a12b` — model unavailable: 404"* — showing `from_model`, `to_model`
+  and the reason verbatim. A mid-run model change is a backend action the user must be able to see;
+  it is never silent. Subsequent thread rows continue below it, so the boundary is visually obvious.
+  Model ids render as text, never as an icon or colour alone. The reason is shown as given, including
+  transport reasons such as *"APIConnectionError after 3 retries"* — a connection failure **does**
+  rotate the model, because NVIDIA serves each model from its own backend pool. Because the switch is
+  per-run and sticks, at most one row per chain step appears — repeated identical switch rows would
+  indicate a bug.
+- A `run_resumable` event renders a row *"Run interrupted at N of M — resumable"* followed by the
+  event's `reason` verbatim (e.g. *"All 3 models failed (last: APIConnectionError)"* or
+  *"Run exceeded its 60-minute ceiling"*), with a **Resume** button that performs the same call as the
+  Resume banner. A run that stops must always say **why**, in plain words — it never just stalls.
+- Tier badges and review chips carry text, never colour alone.
+
+### 15. Review state in the history view *(Phase 6)*
+
+The Triage History thread rows render `review_state` alongside the existing tier badge. A
+`provisional` or `review_failed` thread shows the same chip as the drawer and its per-decision Undo /
+apply affordances are **disabled** with the tooltip *"Not yet reviewed — the never-miss reviewer has
+not seen this decision, so it was never applied."*
+
 ## States (required for every list surface)
 
 | State | Treatment |
@@ -149,6 +204,7 @@ Loading: skeleton rows. Error: toast with message. No page refresh required for 
 | Empty | explanatory copy + the next action ("Connect Gmail" / "Run triage") |
 | Error | the error code and message from the envelope, plus a Retry button; `reauth_required` renders a "Reconnect Gmail" button |
 | Partial/failed run | the banner "This run failed partway — undecided threads were kept in your inbox and counted as auto-kept (low confidence)" |
+| Resumable run | the Resume banner (screen 13) — never the failed-run banner |
 
 ## Accessibility & build constraints
 

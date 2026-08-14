@@ -115,8 +115,31 @@ required. The run applies automatically on completion; the user sees the result 
 | `GET` | `/api/proactive` | `{possible_missed_important: [...], unsubscribe_candidates: [...], stale_awaiting_reply: [...]}` |
 | `POST` | `/api/drafts` | `{decision_id}` → creates a Gmail draft reply (never sends) |
 
+## Phase 6 — Durable, Resumable, Transparent Runs
+
+| Method | Path | Body / Query | Returns |
+|--------|------|--------------|---------|
+| `POST` | `/api/runs/{run_id}/resume` | — | `{run_id, items_total, items_decided, remaining}` — restarts the **same** run row in the background, skipping every thread that already has a decision. `409 not_resumable` if the run's status is not `resumable`. Idempotent: calling it on a run already back in `running` returns the same payload without starting a second background task. |
+| `GET` | `/api/provider-health` | — | `{provider, model, model_chain: string[], chain_position: int, chain_exhausted: bool, circuit_open, calls, retries, consecutive_failures, degraded: bool, run_id, throttle: {max_rpm: int, available: number, waiting: int}}` — the current run's LLM health counters. `model` is the run's **current** model (`llm.health.current_model(run_id)`), which after a fallback is not the configured default; `chain_position` is its index in `model_chain` (the ordered chain from `llm.health.model_chain(preferred)`), so the user sees where the run is and where it would go next; `chain_exhausted` is true once `advance_model` has returned `None`. `degraded` is true when `retries/max(calls,1) >= 1.0` or `retries >= 50`. `throttle` reports the **process-wide** rate limiter (`max_rpm` from `AGENT_LLM_MAX_RPM`, default 350 under the account's 490 req/min ceiling; `waiting` = calls currently blocked on the bucket). |
+
+Changes to existing routes:
+
+- `GET /api/runs/{run_id}` and `GET /api/runs/latest` gain `resumable` as a possible `status`, plus
+  `remaining` (`items_total - items_decided`) and `resumable: bool`. `error_message` for a resumable
+  run reads *"Interrupted at N of M threads — nothing was left half-applied. Resume to continue."*
+- `GET /api/triage/items` returns `review_state` on every row. `GET /api/triage/clusters` returns
+  `provisional_count` per cluster.
+- `POST /api/actions/{action_log_id}/undo` and every apply/approve path reject a decision whose
+  `review_state != "reviewed"` with `422 not_reviewed`.
+- `GET /api/events` gains the event types `provider_degraded`, `run_resumable` and `model_fallback`
+  (`{run_id, from_model, to_model, reason}`), and
+  `thread_classified` gains the `reasoning` and `review_state` fields
+  (shapes in [triage-transparency](capabilities/triage-transparency.md)).
+
 ## Error codes
 
 `unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `already_undone` (409) ·
 `reauth_required` (409, the Gmail refresh token is invalid) · `rate_limited` (429) ·
-`provider_error` (502) · `validation_error` (422).
+`provider_error` (502) · `validation_error` (422) · `not_resumable` (409, the run has no partial work
+to resume) · `not_reviewed` (422, the decision has not passed the never-miss reviewer and can never be
+applied).

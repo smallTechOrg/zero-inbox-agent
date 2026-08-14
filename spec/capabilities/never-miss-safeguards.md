@@ -48,6 +48,13 @@ ever replied to.
   staying in the inbox.
 - The order is fixed: reviewer → floor → reply-history/VIP/time-sensitive overrides. Later stages can
   only make an outcome *more* conservative.
+- **Durability never implies finality.** Decisions are persisted incrementally as
+  `review_state="provisional"` (see [durable-resumable-runs](durable-resumable-runs.md)); the reviewer
+  pass is what upgrades them to `review_state="reviewed"`. A batch the reviewer could not process
+  becomes `review_state="review_failed"`. **Only `reviewed` decisions are eligible for apply/approve** —
+  `apply_decision()` raises `NotReviewedError` for anything else, before the mutator is called, and
+  `force=True` does not bypass it. Incremental persistence therefore cannot let an un-reviewed archive
+  become visible-as-final or actionable.
 
 ## Success Criteria
 - [ ] Over the 220-thread fixture, zero threads from `ever_replied` senders are proposed for archive.
@@ -58,3 +65,6 @@ ever replied to.
 - [ ] A VIP-listed domain is never archived even when the classifier assigns 0.99 confidence to archive.
 - [ ] A forced reviewer failure leaves 100% of archive proposals in `needs_your_call` — none applied.
 - [ ] Setting the confidence floor to 0 is rejected with a validation error.
+- [ ] A run whose reviewer pass is forced to fail applies **zero** Gmail mutations: every decision row
+      is `review_state="review_failed"` and `apply_decision()` refuses each one with
+      `NotReviewedError` without calling the mutator — including when called with `force=True`.

@@ -48,6 +48,10 @@ visible.
   in `ActionLog.undo_token`. Any run or individual action can be reversed from the dashboard.
 - **Dry-run mode (debug).** When `settings.dry_run=true` the agent classifies but performs no Gmail
   mutations. Off by default in production; only used for development and testing.
+- **Durable ≠ final.** Decisions are persisted the moment they are made, but a decision is only
+  *final* — visible-as-final and eligible for apply/approve — once the never-miss reviewer has
+  upgraded it (`decisions.review_state = "reviewed"`). See
+  [durable-resumable-runs](capabilities/durable-resumable-runs.md).
 - **Complete audit trail** — every decision (reasoning + confidence + which rule fired), every mailbox
   mutation (parameters + undo token), and every user correction (as a training signal).
 - **Privacy** — by default only headers, subject and a redacted ~200-character snippet leave the
@@ -115,7 +119,7 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 
 ## Phases of Development
 
-Five phases: one first-win phase and four requirements phases.
+Six phases: one first-win phase and five requirements phases.
 
 ---
 
@@ -425,3 +429,315 @@ Both commands must exit 0. `tests/unit/graph/test_triage_transparency.py` assert
 4. Watch per-thread events arrive in real time: each classified thread shows `"[tier] subject → category (action, confidence%)"`.
 5. After the run, scroll the drawer: every thread that was archived shows `"Archived: subject → label_name"`.
 6. Open browser DevTools → Network → EventSource: confirm there is **exactly one** SSE connection (no duplicate), confirming the `SseContext` consolidation.
+
+---
+
+### Phase 6 — Durable, Resumable, Transparent Runs
+
+**Goal.** A triage run over a real 2,000+ thread mailbox is never lost. Decisions land in the database
+as they are made (in an explicit `provisional`, not-yet-reviewed state), an interrupted run is
+resumed in one click without re-classifying a single already-decided thread, the user watches threads
+classified one by one with tier and reason while the run proceeds, and a degraded LLM provider is
+surfaced and circuit-broken instead of silently stretching a run to 20+ minutes.
+
+**Motivating defect.** Run `fbeed060` decided 2,003 of 2,176 threads in ~23 minutes with 2,774
+`llm.retry` events and left **0 rows in `decisions`** — all work lived in LangGraph in-memory state.
+Root cause: `persist_decisions` writes items, clusters, decisions and `llm_calls` atomically **once at
+the very end of the graph**.
+
+**CRITICAL CONSTRAINT — the never-miss guarantee does not regress.** End-of-graph persistence was
+deliberate: nothing is shown as final or actioned before the second-pass reviewer can flip a
+false-negative `archive` back to `keep`. Incremental persistence separates **durability** from
+**finality** via `decisions.review_state`: rows land `provisional`, the reviewer upgrades them to
+`reviewed`, and **only `reviewed` rows are eligible for apply/approve** — enforced in
+`apply_decision()` before the mutator is called, not bypassable by `force=True`. See
+[never-miss-safeguards](capabilities/never-miss-safeguards.md).
+
+Capabilities: [durable-resumable-runs](capabilities/durable-resumable-runs.md) (new),
+[never-miss-safeguards](capabilities/never-miss-safeguards.md) (extended: `review_state` gate),
+[triage-transparency](capabilities/triage-transparency.md) (extended: coverage + provisional
+labelling + degraded banner), [decision-audit-trail](capabilities/decision-audit-trail.md)
+(extended: audit survives interruption).
+
+No new provider, no new keys, **no change to the default/primary model**. The existing 120 s LLM
+timeout and the `finish_reason == "length"` re-issue behaviour are unchanged. Slice 3 additionally
+adds (a) a **cross-model fallback chain within the Nemotron family** that rotates on persistent
+failure of **any** kind including `APIConnectionError`/timeouts — NVIDIA routes per model to separate
+backend pools, so one saturated pool does not mean the endpoint is down
+([Rule F](capabilities/durable-resumable-runs.md#f-cross-model-fallback-rotate-on-persistent-failure-of-any-kind)),
+(b) **process-wide client-side rate limiting** at 350 req/min under the account's 490 req/min ceiling
+([Rule G](capabilities/durable-resumable-runs.md#g-global-rate-limiting-process-wide)), and (c) an
+**overall never-stuck bound** ([Rule H](capabilities/durable-resumable-runs.md#h-never-get-stuck-hard-requirement)).
+
+#### Slices
+
+Three slices, **fully disjoint file ownership** — all three generate concurrently. Where one slice
+calls a function another slice writes, it is a **spec-contract dependency only** (the signature is
+pinned below); no slice waits on another's output, and both land in the same gate.
+
+| # | Slice | Owns (disjoint paths) | Depends on |
+|---|-------|----------------------|-----------|
+| 1 | `durable-resume` | `src/graph/checkpoint.py` (new), `src/graph/nodes.py`, `src/graph/nodes_review.py`, `src/graph/persistence.py`, `src/graph/runner.py`, `src/graph/state.py`, `src/graph/agent.py`, `src/db/models.py`, `alembic/versions/0005_decision_review_state.py`, `src/api/runs.py`, `src/api/__init__.py`, `src/tools/actions.py`, `frontend/src/components/ResumeBanner.tsx`, `frontend/src/app/page.tsx`, `tests/unit/graph/test_checkpoint.py`, `tests/unit/tools/test_review_state_guard.py`, `tests/integration/test_resume.py` | none (spec-contract: calls `events.bus.emit_thread_classified()` from slice 2 and `llm.health.circuit_open()` / `ProviderCircuitOpen` from slice 3; registers slice 3's `provider_health.router`) |
+| 2 | `live-transparency` | `src/events/bus.py`, `src/events/__init__.py`, `frontend/src/lib/SseContext.tsx`, `frontend/src/lib/types.ts`, `frontend/src/components/ActivityDrawer.tsx`, `frontend/src/components/ThreadFeedRow.tsx` (new), `tests/unit/events/test_thread_classified.py` | none (spec-contract: emits the payloads slice 1 supplies) |
+| 3 | `provider-resilience` | `src/llm/health.py` (new), `src/llm/throttle.py` (new), `src/llm/client.py`, `src/llm/providers/nvidia.py`, `src/llm/providers/base.py`, `src/api/provider_health.py` (new), `tests/unit/llm/test_circuit_breaker.py`, `tests/unit/llm/test_model_fallback.py` (new), `tests/unit/llm/test_throttle.py` (new), `tests/unit/llm/test_never_stuck.py` (new), `tests/unit/api/test_provider_health.py` | none (spec-contract: exposes `llm.health.model_chain()` / `current_model()` / `advance_model()`, which slice 1's `_model_candidates` consumes; emits via slice 2's `emit_model_fallback`) |
+
+**Pinned cross-slice contracts** (each slice codes against these, not against another slice's files):
+
+```python
+# slice 2 writes, slice 1 calls — one event per decided thread
+events.bus.emit_thread_classified(
+    user_id: str, *, run_id: str, item_id: str, subject: str, from_email: str,
+    category: str, action: str, decided_by: str, confidence: float,
+    reasoning: str, review_state: str,
+) -> None                      # never raises; wrapped in try/except internally
+
+events.bus.emit_provider_degraded(user_id, *, run_id, provider, model,
+                                  calls, retries, consecutive_failures) -> None
+events.bus.emit_run_resumable(user_id, *, run_id, items_total, items_decided, reason) -> None
+events.bus.emit_model_fallback(user_id, *, run_id, from_model: str, to_model: str,
+                               reason: str) -> None   # mid-run model switch, rendered in the drawer
+
+# slice 3 writes, slice 1 calls
+llm.health.snapshot(run_id: str | None) -> dict   # {provider, model, model_chain, chain_position,
+                                                  #  calls, retries, consecutive_failures,
+                                                  #  circuit_open, degraded, throttle}
+llm.health.reset(run_id: str) -> None             # called by runner on start/resume; also resets the
+                                                  # run to chain position 0
+llm.health.model_chain(preferred: str | None) -> list[str]
+    # the full ordered chain (preferred first if set, de-duplicated)
+llm.health.current_model(run_id: str) -> str
+    # the model this run must use NOW (chain[chain_position]) — the advance is PER-RUN and STICKS
+llm.health.advance_model(run_id: str, *, reason: str) -> str | None
+    # move to the next chain entry, return it; None == chain exhausted. Lock-guarded and idempotent:
+    # two concurrent batches failing on the same model advance the run ONE step and emit ONE event.
+    # slice 1's `src/graph/nodes.py::_model_candidates` returns the chain sliced from the run's
+    # current position (first element == current_model(run_id)).
+class llm.health.ProviderCircuitOpen(RuntimeError): ...   # raised by the client, NOT retried
+api.provider_health.router                        # FastAPI APIRouter, mounted by slice 1
+```
+
+##### Slice 1 — `durable-resume`
+
+- New `src/graph/checkpoint.py`: `record_batch(state, decisions, *, tier) -> None` — in its own short
+  transaction, upserts the batch's items, inserts the decisions with `review_state="provisional"`
+  (skipping any `(run_id, item_id)` that already exists), appends the batch's `llm_calls` rows, bumps
+  `items_decided` atomically, and calls `emit_thread_classified` per decision. Wrapped so a checkpoint
+  failure logs at WARNING and never kills the run.
+- `nodes.py`: tiers 1–4 (`apply_deterministic_rules`, `apply_sender_history`, `llm_classify_batch`,
+  `deep_read_escalation`) call `record_batch` instead of the current inline `bus.emit` blocks;
+  `persist_decisions` becomes idempotent finalisation (clusters + `review_state` upgrade + counts),
+  no longer the first write. `llm_classify_batch` lets `ProviderCircuitOpen` propagate as
+  `state["error"]` rather than degrading the batch.
+- `nodes.py::_model_candidates(state)` (slice 1 owns the function; slice 3 owns the chain) becomes a
+  one-liner returning `llm.health.model_chain((state.get("settings") or {}).get("llm_model"))`
+  **sliced from the run's current chain position**, typed `list[str]`, so its first element is
+  `llm.health.current_model(run_id)`. The existing candidate loops at the `llm_classify_batch` and
+  `deep_read_escalation` call sites **are** the fallback mechanism — no parallel mechanism. They
+  advance on **any** persistent failure (including `APIConnectionError` / `APITimeoutError`) once the
+  current model's existing retry budget is exhausted, by calling
+  `llm.health.advance_model(run_id, reason=...)` and `emit_model_fallback(...)`, then continuing the
+  run on the returned model. `advance_model` returning `None` (chain exhausted) is what feeds the
+  never-stuck bound ([Rule H](capabilities/durable-resumable-runs.md#h-never-get-stuck-hard-requirement)).
+- `nodes_review.py`: after the reviewer + never-miss floor, upgrade rows to `review_state="reviewed"`
+  (or `review_failed`) and re-emit `thread_classified` for every flipped thread.
+- `runner.py`: `execute_triage` loads `already_decided_item_ids(run_id)` and seeds it into state;
+  `fetch_items` filters them out of every downstream queue. `llm.health.reset(run_id)` on start.
+- `persistence.py`: `already_decided_item_ids()`, `insert_provisional_decisions()`,
+  `upgrade_review_state()`; `update_run` treats `resumable` like `running` (non-terminal, but never
+  overwrites `cancelled`).
+- `api/__init__.py`: `_reconcile_orphaned_runs()` marks an orphan `resumable` when it has ≥ 1 persisted
+  decision, `failed` otherwise; mounts `provider_health.router`.
+- `api/runs.py`: `POST /api/runs/{run_id}/resume`; `resumable` + `remaining` on the run payloads.
+- `tools/actions.py`: new `NotReviewedError`; `apply_decision()` raises it for
+  `review_state != "reviewed"` **before** touching the mutator, independent of `status`, not bypassed
+  by `force=True`.
+- Frontend: `ResumeBanner.tsx` + mounting it in `page.tsx` (screen 13 in [ui.md](ui.md)).
+- **Tests:** `test_checkpoint.py` (rows exist mid-run; a raising checkpoint does not fail the run);
+  `test_review_state_guard.py` (`NotReviewedError` for `provisional` and `review_failed`, with
+  `status="approved"` and with `force=True`; mutator never called);
+  `test_resume.py` (integration, below).
+
+##### Slice 2 — `live-transparency`
+
+- `events/bus.py`: the four typed emit helpers above (incl. `emit_model_fallback`), each internally `try/except Exception` +
+  WARNING log, subject truncated to 60 chars and reasoning to 140 chars **inside the helper** so no
+  caller can leak more. Ring buffer unchanged.
+- `SseContext.tsx` / `types.ts`: extend `SseEventType` with `provider_degraded`, `run_resumable` and
+  `model_fallback` (`{run_id, from_model, to_model, reason}`);
+  add `reasoning` + `review_state` to `ThreadClassifiedEvent`.
+- `ActivityDrawer.tsx` + `ThreadFeedRow.tsx`: per-thread feed keyed by `item_id` (later event for the
+  same id **replaces** the earlier row), tier badge, reasoning, `NOT YET REVIEWED` / `REVIEW FAILED`
+  chips, pinned degraded-provider banner that auto-opens the drawer, `run_resumable` row with a
+  Resume button, and a `model_fallback` row *"Switched model: A → B (reason)"* (screen 14 in
+  [ui.md](ui.md)) so a mid-run model switch is never an invisible backend action.
+- **Tests:** `test_thread_classified.py` asserts each helper's emitted dict matches the documented
+  JSON schema exactly (field names + types), that subject/reasoning are truncated, that **no body or
+  unredacted content field is present**, and that a raising subscriber does not propagate.
+
+##### Slice 3 — `provider-resilience`
+
+- `src/llm/health.py`: per-run counters (`calls`, `retries`, `consecutive_failures`), thread-safe;
+  `degraded` when `retries/max(calls,1) >= 1.0` or `retries >= 50`; circuit opens after **5
+  consecutive** fully-failed calls and then raises `ProviderCircuitOpen` immediately instead of
+  attempting the call; `reset(run_id)` clears it.
+- `providers/nvidia.py`: increments the counters at the existing `llm.retry` site and on
+  success/terminal failure; emits `provider_degraded` once per 50 further retries. **The 120 s timeout
+  and the `finish_reason == "length"` handling are not touched. The model and provider are not
+  changed.**
+- `src/llm/health.py` also owns the **cross-model fallback chain and failure classification**
+  ([Rule F](capabilities/durable-resumable-runs.md#f-cross-model-fallback-rotate-on-persistent-failure-of-any-kind)):
+  - `MODEL_CHAIN = ["nvidia/nemotron-3-nano-30b-a3b", "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/nvidia-nemotron-nano-9b-v2"]` — measured live against the real endpoint at 0.56 s / 0.65 s /
+    2.03 s. `meta/llama-3.3-70b-instruct` and `openai/gpt-oss-120b` are **excluded**: both timed out at
+    45 s, i.e. worse than the primary. The default model does not change.
+  - `model_chain(preferred) -> list[str]` — `preferred` first if set, then the chain, de-duplicated.
+  - `current_model(run_id) -> str` / `advance_model(run_id, *, reason) -> str | None` — a **per-run**
+    chain position that **sticks** for the rest of the run (not per batch, not per tier). Lock-guarded
+    and idempotent under concurrency: two batches failing on the same model advance one step and emit
+    one `model_fallback`. `None` = chain exhausted.
+  - **Rotate on persistent failure of ANY kind.** There is **no** `is_model_specific()` predicate —
+    that contract is deleted. `APIConnectionError`, `APITimeoutError`, DNS/TLS/connect failures, and
+    every `APIStatusError` status all advance the chain once the current model's existing retry budget
+    is exhausted. Requires an inline comment recording *why*: NVIDIA routes per model to separate
+    backend pools, so one model's pool can be saturated (connection errors, timeouts) while the others
+    answer in under 2 s on the same key and host — measured live during run `fbeed060`.
+  - **No mid-run re-probing** of an abandoned model. `reset(run_id)` (start/resume only) returns the
+    run to position 0.
+- `src/llm/throttle.py` (new): a **process-wide** token/leaky bucket gating every outbound LLM request
+  — first attempts, **retries**, and every tier — before it is issued. Per-batch limiting cannot work
+  because the graph's `MAX_CONCURRENCY` runs batches in parallel. Account ceiling is **490 req/min**;
+  default target **350 req/min** for headroom, configurable via `AGENT_LLM_MAX_RPM`
+  (`.env.example` + [architecture.md](architecture.md)). Continuous refill (never a fixed window);
+  waiting callers block, and a wait is never counted as a failure or a retry. `snapshot()` exposes
+  `{max_rpm, available, waiting}`.
+- **Never-stuck bound** ([Rule H](capabilities/durable-resumable-runs.md#h-never-get-stuck-hard-requirement)):
+  a per-run wall-clock ceiling `AGENT_RUN_MAX_SECONDS` (default `3600`) **and** a bound of **3**
+  consecutive fully-failed batches after `advance_model` has returned `None`. Either bound ends the
+  run `resumable` with a human-readable `error_message` and all partial decisions intact.
+- `providers/nvidia.py`: `LLMResult.model` must be the model that **actually served** the call
+  (`response.model`, falling back to the requested id only when absent) so `llm_calls.model` — and
+  therefore cost attribution — names the real model, not the requested one. Attach the failing model
+  id to raised `LLMError`s so the caller can classify. `_RETRY_STATUS`, the 120 s timeout and the
+  `finish_reason == "length"` handling are untouched.
+- `api/provider_health.py`: `GET /api/provider-health`, reporting the **current model**, the ordered
+  `model_chain` + `chain_position`, and the `throttle` state alongside the health counters.
+- **Tests:** `test_model_fallback.py` (new) — `model_chain` ordering/de-dup and the absence of any
+  out-of-family model; a stub failing model 1 with a 404 and succeeding on model 2 yields exactly one
+  `model_fallback` emit and an `llm_calls` row whose `model` is model 2; **a stub raising
+  `APIConnectionError` on every model-1 call and succeeding on model 2 also rotates** — the run
+  completes on model 2, one `model_fallback` naming `APIConnectionError` is emitted, and model 1 is
+  never requested again for the rest of the run (the advance sticks per-run); two concurrent failing
+  batches advance exactly one position and emit exactly one event.
+  `test_throttle.py` (new) — with `AGENT_LLM_MAX_RPM=60` and 200 calls issued from concurrent tasks
+  (retries counted), no 60 s window ever exceeds 60 outbound requests, every call eventually
+  completes, and no call is dropped or turned into a failure; the bucket is shared process-wide
+  (two independent run ids share one budget).
+  `test_never_stuck.py` (new) — with **all three** models stubbed to fail every call the run
+  terminates as `resumable` well inside a test timeout (never hangs), `error_message` names the
+  exhausted chain and the last failure, and the partial decisions are intact; separately, the
+  wall-clock ceiling alone ends a run that would otherwise grind.
+  `test_circuit_breaker.py` — a stub provider failing every call opens the circuit after
+  exactly 5 consecutive failures and the 6th call raises `ProviderCircuitOpen` **without an HTTP
+  attempt**; a success resets `consecutive_failures`; `degraded` flips at the documented thresholds;
+  the 120 s timeout constant is asserted unchanged. `test_provider_health.py` — endpoint envelope +
+  auth scoping.
+
+#### Gate (exact commands, run from the repo root, real APIs via `.env`, production DB driver)
+
+```bash
+uv run alembic upgrade head && uv run alembic current
+uv run pytest tests/unit tests/integration -q
+cd frontend && pnpm install && pnpm build && cd ..
+uv run python -m src &
+npx playwright test tests/e2e/ --reporter=line
+```
+
+All must exit 0; `alembic current` must print a revision hash including
+`0005_decision_review_state`.
+
+`tests/integration/test_resume.py` is the load-bearing gate. It runs the **220-thread fixture against
+the real NVIDIA NIM endpoint** using the key from `.env` — large enough that a partial result and a
+full result are observably different — and asserts:
+
+1. **Durability:** while the run is in flight, `count(decisions where run_id=:id)` is > 0 and strictly
+   increasing before `finalize` runs.
+2. **Interrupt:** the run is killed after ~40 % of threads are decided; the persisted count matches
+   `triage_runs.items_decided` and is strictly between 0 and 220.
+3. **Reconcile:** `_reconcile_orphaned_runs()` marks that run `resumable`, not `failed`.
+4. **Resume:** `POST /api/runs/{run_id}/resume` finishes the run with **exactly 220** decision rows,
+   **zero** duplicate `(run_id, item_id)` pairs, and **strictly fewer `llm_calls` rows added during
+   the resume than a from-zero run makes** — proving already-decided threads were skipped, not
+   re-classified. `cost_usd` is additive, never reset.
+5. **Never-miss not regressed:** every row ends `review_state="reviewed"`; a variant of the run with
+   the reviewer forced to fail leaves every row `review_failed` and applies **zero** Gmail mutations,
+   with `apply_decision()` raising `NotReviewedError` (also with `force=True`).
+6. **Coverage:** the number of distinct `item_id`s in emitted `thread_classified` events equals 220.
+7. **Circuit breaker:** with the provider stubbed to fail every call **for every model in the chain**,
+   the run ends `resumable` within seconds rather than after exhausting all batches, a
+   `provider_degraded` event was emitted, and every thread decided before the failure is still in
+   `decisions`. (With only the current model failing, the circuit opens for that model and the run
+   advances instead of stopping — assertion 9.)
+8. **Model fallback:** with the primary model stubbed to raise `APIStatusError(status_code=404)` and
+   model 2 healthy, the 220-thread run completes, exactly one `model_fallback` event per switch is
+   emitted naming `from_model`/`to_model`/`reason`, and
+   `SELECT DISTINCT model FROM llm_calls WHERE run_id=:id` contains
+   `nvidia/nemotron-3-super-120b-a12b` — the model that actually served, never only the requested
+   primary.
+9. **Rotation ON connection failure (this is the corrected assertion):** with the primary stubbed to
+   raise `APIConnectionError` on **every** call and model 2 healthy, the run **rotates and
+   completes** — ≥ 1 `model_fallback` event is emitted whose `reason` names `APIConnectionError`,
+   model 2 serves the remaining batches, and after the first advance the primary is **never requested
+   again for the rest of the run** (asserted on the recorded request log: the advance is per-run and
+   sticks, not re-tried per batch). The run does **not** end `resumable`.
+10. **Never stuck:** with **all three** chain models stubbed to fail every call, the run terminates as
+    `resumable` inside a test timeout strictly below `AGENT_RUN_MAX_SECONDS` (asserted with
+    `pytest.mark.timeout`), `triage_runs.error_message` is a human-readable string naming the
+    exhausted chain and the last failure, and every thread decided before the failure is still in
+    `decisions`. It never hangs and never grinds indefinitely.
+11. **Global throttle:** with `AGENT_LLM_MAX_RPM=60`, the 220-thread run's outbound LLM request
+    timestamps (first attempts **and** retries, all tiers) never exceed 60 in any rolling 60 s
+    window, and the run still completes — the throttle delays, never drops.
+12. **Default unchanged:** the run's first request uses `AGENT_NVIDIA_DEFAULT_MODEL`
+    (`nvidia/nemotron-3-nano-30b-a3b`), and `llm.health.model_chain(None)[0]` equals it.
+
+`tests/integration/test_no_body_persisted.py` must still pass unchanged — it pins that no body text
+reaches the database, and the new event payloads are additionally asserted body-free in
+`tests/unit/events/test_thread_classified.py`.
+
+#### How the user tests it
+
+1. `uv run alembic upgrade head`, then `cd frontend && pnpm build && cd .. && uv run python -m src`.
+2. Open **http://localhost:8001/app/** and click **Run triage**.
+3. Open the **Activity drawer** (bell icon). Within seconds threads scroll past **one at a time** —
+   each showing its tier badge (`RULE` / `SENDER HISTORY` / `LLM` / `DEEP READ`), subject, category,
+   action, confidence and the reason. Every one carries an amber **NOT YET REVIEWED** chip.
+4. While it is running, kill the server (`Ctrl-C`) after a minute or two.
+5. Restart it (`uv run python -m src`) and reload the dashboard. The top of the page shows the amber
+   **"Resume run — N of M already done"** banner, with N matching how far it had got — *not* a
+   "run failed" message.
+6. Click **Resume run**. The progress bar starts at N, not 0, and the drawer resumes streaming — the
+   already-done threads are never re-classified (watch the run finish far faster and far cheaper than
+   the first attempt; the Cost panel total goes up, never back to zero).
+7. When the reviewer pass runs at the end, watch the drawer rows lose their **NOT YET REVIEWED** chip;
+   any thread the reviewer flipped re-appears with a `REVIEWER` badge and `keep`.
+8. Check Gmail: only reviewed decisions were applied. Nothing archived while it was provisional.
+9. To see degraded-provider handling, temporarily point `AGENT_NVIDIA_BASE_URL` in `.env` at an
+   unreachable host and start a run. Because **every** model is then unreachable, the drawer shows
+   the chain being walked — *"Switched model: … → … (APIConnectionError after 3 retries)"* twice —
+   pins the red **"NVIDIA is failing — N retries"** banner, and then the run stops as **resumable**
+   within seconds with a message naming the exhausted chain and every already-decided thread
+   preserved. It must **never** grind for 20 minutes. Restore `.env` and click **Resume run**.
+10. To see **cross-model fallback**, set `AGENT_NVIDIA_DEFAULT_MODEL` in `.env` to a bogus id such as
+    `nvidia/does-not-exist` and start a run. The drawer shows a
+    *"Switched model: nvidia/does-not-exist → nvidia/nemotron-3-super-120b-a12b (model unavailable:
+    404)"* row within seconds and **the run completes normally** on the fallback model. Crucially you
+    should see that switch **once** — not once per batch — because the run sticks to the new model.
+    Open the Cost panel / `GET /api/provider-health`: `model` is the fallback, `chain_position` is 1,
+    and the spend is attributed to the model that actually served it. Restore `.env` afterwards.
+11. To see the **global rate limit**, hit `GET /api/provider-health` mid-run: `throttle.max_rpm` is
+    350 (or whatever `AGENT_LLM_MAX_RPM` is set to) and `throttle.waiting` is > 0 while batches are
+    queued. Set `AGENT_LLM_MAX_RPM=30` and restart: the same run visibly takes longer but still
+    completes — no errors, no dropped threads.
+12. **Real in Phase 6:** incremental persistence, resume banner + resume, per-thread live feed with
+    tier and reason, provisional labelling, review-state apply guard, degraded banner, circuit
+    breaker. **Labelled stubs remaining:** unchanged from Phase 4 — none.

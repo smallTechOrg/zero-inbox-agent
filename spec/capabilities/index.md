@@ -46,3 +46,12 @@ for the phase plan and slices.
 | Capability | What it does |
 |------------|--------------|
 | [triage-transparency](triage-transparency.md) | Per-thread SSE events (`thread_classified`, `thread_archived`) surfaced in the Activity drawer; shared `SseContext` eliminates duplicate EventSource |
+
+## Phase 6 — Durable, Resumable, Transparent Runs
+
+| Capability | What it does |
+|------------|--------------|
+| [durable-resumable-runs](durable-resumable-runs.md) | Incremental per-batch persistence in a `provisional` review state; one-click resume of an interrupted run without re-classifying; live per-thread feed with tier + reason + not-yet-reviewed labelling; provider-degraded banner and a circuit breaker that aborts fast with partial work preserved |
+| [never-miss-safeguards](never-miss-safeguards.md) | Extended: `review_state` gate — only `reviewed` decisions are appliable, enforced in `apply_decision()` |
+| [triage-transparency](triage-transparency.md) | Extended: per-thread coverage guarantee, `reasoning` + `review_state` on every event, provisional labelling, degraded-provider banner |
+| [decision-audit-trail](decision-audit-trail.md) | Extended: decisions and `llm_calls` survive an interrupted run |

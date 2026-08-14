@@ -63,7 +63,11 @@ class TriageState(TypedDict, total=False):
 
     # control
     error: str | None
-    status: str                     # running | completed | failed | cancelled
+    status: str                     # running | completed | failed | cancelled | resumable
+
+    # Phase 6 — durable, resumable runs
+    already_decided: set[str]       # item_ids with a decision row for this run_id; excluded
+                                    # from every tier queue so a resume re-classifies nothing
 ```
 
 `llm_decisions` and `resolved` use `operator.add` reducers so parallel `Send` branches merge without
@@ -86,8 +90,8 @@ clobbering each other. Everything else is last-write-wins (written by exactly on
 | `second_pass_reviewer` | **2** | Reflection. Takes every decision proposing archive and asks a reviewer prompt (`prompts/reviewer.md`) one question only: *is this a false negative — something the user would be upset to miss?* Any flip becomes `keep` with `decided_by="reviewer"` and the reviewer's reasoning appended. Batched 20–50 |
 | `apply_never_miss_floor` | **2** | Enforces: (a) confidence < `confidence_floor` → `needs_your_call`; (b) sender in VIP or `ever_replied` and no explicit override → force `keep`; (c) `time_sensitive` true → force `keep` unless a user-promoted rule explicitly says otherwise |
 | `cluster_decisions` | 1 | `tools.clustering.cluster()` groups decisions by mailing-list id → sender → domain → category, emitting `Cluster` rows with counts, a suggested bulk action and the minimum confidence in the cluster |
-| `persist_decisions` | 1 | Writes `Decision`, `Cluster`, `LlmCall` rows; updates `TriageRun` counts/cost. Idempotent on `(run_id, item_id)` so a resumed run never double-decides |
-| `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible |
+| `persist_decisions` | 1 | Writes `Decision`, `Cluster`, `LlmCall` rows; updates `TriageRun` counts/cost. Idempotent on `(run_id, item_id)` so a resumed run never double-decides. **Phase 6:** no longer the first write — it finalises clusters, upgrades `review_state`, and reconciles counts over rows already checkpointed |
+| `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible. **Phase 6:** closes the run `resumable` instead of `failed` when ≥ 1 decision is already persisted, or when the cause is `ProviderCircuitOpen` |
 | `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event |
 
 `second_pass_reviewer` and `apply_never_miss_floor` are wired in Phase 2. Phase 1 applied a simple
@@ -137,15 +141,29 @@ Routing functions (`src/graph/edges.py`):
 - Batch size 20–50 items, chosen by an estimated-token budget of ~12k input tokens per call.
 - `deep_read_escalation` is capped at **25 items per run**; overflow goes straight to
   `needs_your_call` rather than blowing the budget or silently archiving.
-- Only `persist_decisions` writes to the DB, in one transaction per run — no write contention between
-  parallel branches.
+- **Phase 6 revises the write model.** Every tier node now calls
+  `graph.checkpoint.record_batch(state, decisions, tier=…)` as its batch lands: a **short, independent
+  transaction per batch** writing decisions as `review_state="provisional"`, appending that batch's
+  `llm_calls`, bumping `items_decided` atomically, and emitting one `thread_classified` event per
+  decision. Parallel batch branches do not contend — each owns a disjoint set of `(run_id, item_id)`
+  keys and the unique constraint makes a collision a skip, not an error. A checkpoint failure is
+  logged at WARNING and never fails the run; the un-checkpointed threads are simply re-decided on
+  resume. See [capabilities/durable-resumable-runs.md](capabilities/durable-resumable-runs.md).
+- **Resume:** `runner.execute_triage` loads `already_decided_item_ids(run_id)` into state and
+  `fetch_items` removes them from every tier queue, so a resumed run re-classifies nothing.
+- **Circuit breaker:** `llm_classify_batch` and `deep_read_escalation` let `llm.health.ProviderCircuitOpen`
+  propagate into `state["error"]` (they do **not** swallow it into a degraded batch), which routes to
+  `handle_error` and closes the run `resumable` with all provisional work preserved.
 
 ## Error Handler
 
 `handle_error` never fails the user's mail. It: records `TriageRun.status="failed"` and the error
 message, marks every item without a decision as `needs_your_call`, emits a structlog `error` event
-with `run_id`, and ends. A partial run is always resumable — `persist_decisions` is idempotent on
-`(run_id, item_id)`.
+with `run_id`, and ends. A partial run is always resumable — every write is idempotent on
+`(run_id, item_id)`. **Phase 6:** when the run already has ≥ 1 persisted decision (or the error is
+`ProviderCircuitOpen`), the run is closed `resumable` rather than `failed`, and a `run_resumable`
+event is emitted so the dashboard offers a one-click resume. `cancelled` remains terminal and is
+never converted.
 
 ## Finalize
 

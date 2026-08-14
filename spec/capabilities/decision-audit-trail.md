@@ -29,7 +29,13 @@ None directly — this capability observes the others.
 
 ## Business Rules
 - Every decision persists: category, proposed action, confidence, full reasoning, `decided_by` tier,
-  `rule_id` when a rule fired, and `time_sensitive`.
+  `rule_id` when a rule fired, `time_sensitive`, and `review_state`.
+- Decisions are persisted **incrementally, as each tier decides them** (see
+  [durable-resumable-runs](durable-resumable-runs.md)), not in one end-of-run write. The audit trail
+  therefore survives an interrupted run. `review_state` records whether the never-miss reviewer had
+  seen the row (`provisional` → `reviewed` / `review_failed`); it is upgraded in place, never deleted.
+- `llm_calls` rows are likewise appended per checkpoint, so a killed run's real token spend is never
+  lost and a resumed run's cost is additive, never reset.
 - Every mutation persists: operation, exact request parameters, provider response, and an **undo
   token** sufficient to fully reverse it. A mutation without an undo token is a defect.
 - `action_logs.operation` has no delete/trash value — destructive operations are not representable.
@@ -49,3 +55,5 @@ None directly — this capability observes the others.
 - [ ] A Phase 1 end-to-end run emits a structlog summary event containing `run_id`, per-tier counts and
       cost, visible on stdout.
 - [ ] A log scan of a full run finds no token, secret or body text.
+- [ ] A run killed mid-flight still has one `decisions` row per already-decided thread and one
+      `llm_calls` row per LLM call already made — nothing is lost with the process.

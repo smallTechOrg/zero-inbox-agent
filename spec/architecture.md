@@ -150,6 +150,8 @@ removed — NVIDIA NIM is the only provider in v1.
 | `nvidia_api_key` | `AGENT_NVIDIA_API_KEY` | required |
 | `nvidia_base_url` | `AGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` |
 | `nvidia_default_model` | `AGENT_NVIDIA_DEFAULT_MODEL` | `nvidia/nemotron-3-nano-30b-a3b` |
+| `llm_max_rpm` | `AGENT_LLM_MAX_RPM` | `350` — **process-wide** client-side ceiling on outbound LLM requests per minute, counting first attempts, retries and every tier. The NVIDIA account limit is **490 req/min**; 350 leaves real headroom. Enforced by a shared token bucket in `src/llm/throttle.py` (Phase 6). Must be documented in `.env.example`. |
+| `run_max_seconds` | `AGENT_RUN_MAX_SECONDS` | `3600` — per-run wall-clock ceiling; on exceeding it the run ends `resumable` with its partial decisions intact (never-stuck bound, Phase 6). Must be documented in `.env.example`. |
 | `google_client_id` | `AGENT_GOOGLE_CLIENT_ID` | required |
 | `google_client_secret` | `AGENT_GOOGLE_CLIENT_SECRET` | required |
 | `google_redirect_uri` | `AGENT_GOOGLE_REDIRECT_URI` | `http://localhost:8001/auth/google/callback` |

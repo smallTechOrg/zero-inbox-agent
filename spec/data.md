@@ -118,7 +118,7 @@ Unique on `(user_id, key)`.
 |-------|------|-------|
 | `id` PK, `user_id` FK, `channel_account_id` FK | | |
 | `kind` | str | `incremental` \| `backlog` |
-| `status` | str | `running` \| `completed` \| `failed` \| `cancelled` |
+| `status` | str | `running` \| `completed` \| `failed` \| `cancelled` \| `resumable` |
 | `dry_run` | bool | Phase 1: always true |
 | `range_start`, `range_end` | ts \| null | backlog chunk bounds |
 | `cursor` | str \| null | resume point |
@@ -142,9 +142,17 @@ Unique on `(user_id, key)`.
 | `rule_id` | str FK \| null | set when `decided_by="rule"` |
 | `time_sensitive` | bool | forces toward keep |
 | `status` | str | `proposed` \| `approved` \| `rejected` \| `applied` \| `undone` \| `needs_your_call` |
+| `review_state` | str NOT NULL, default `provisional` | `provisional` \| `reviewed` \| `review_failed` — **the never-miss finality gate** |
 | `created_at`, `decided_at` | ts | |
 
 Unique on `(run_id, item_id)` — makes resume idempotent.
+Index on `(run_id, review_state)` — the resume query and the apply-eligibility query both use it.
+
+`review_state` is orthogonal to `status`. `status` is the *user/action* lifecycle; `review_state` is
+the *never-miss* lifecycle. A row is written `provisional` the instant its tier decides it and is
+upgraded to `reviewed` by the second-pass reviewer + never-miss floor
+(see [durable-resumable-runs](capabilities/durable-resumable-runs.md)). **Only `reviewed` rows are
+eligible for apply/approve**, checked independently of `status` and not bypassable by `force=True`.
 
 ### `clusters`
 | Field | Type | Notes |
@@ -230,10 +238,31 @@ at runtime, so per-user edits never affect other users.
 
 ---
 
+## Phase 6 migration
+
+Alembic revision `0005_decision_review_state` (single migration, required):
+
+1. `ALTER TABLE decisions ADD COLUMN review_state VARCHAR NOT NULL DEFAULT 'provisional'`.
+2. **Backfill:** every pre-existing row belongs to a run that already completed its reviewer pass, so
+   set `review_state = 'reviewed'` for all existing rows — otherwise historical decisions would
+   become un-appliable and un-undoable. New rows default to `provisional`.
+3. `CREATE INDEX ix_decisions_run_review ON decisions (run_id, review_state)`.
+4. No change is needed for `triage_runs.status` (a free-text/enum-by-convention column); the new
+   `resumable` value is additive.
+
+Downgrade drops the index and the column.
+
+---
+
 ## Lifecycle
 
 ```
-Item ingested ──▶ Decision(proposed | needs_your_call)
+Item ingested ──▶ Decision(review_state=provisional, proposed | needs_your_call)   ← durable immediately
+                      │
+    second-pass reviewer + never-miss floor ──▶ Decision(review_state=reviewed)     ← now final
+                      │  (reviewer unavailable ──▶ review_state=review_failed, never applied)
+                      ▼
+                  Decision(proposed | needs_your_call)
                       │
       user approves ──┼──▶ Decision(approved) ──▶ [dry_run off] ActionLog(+undo_token) ──▶ Decision(applied)
       user rejects  ──┘                                    │                                        │
