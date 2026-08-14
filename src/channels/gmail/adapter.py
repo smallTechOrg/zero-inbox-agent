@@ -90,7 +90,18 @@ class GmailAdapter(ChannelAdapter):
                     ) from exc
                 if status in (429, 500, 502, 503, 504):
                     last = exc
-                    self._sleep(self._backoff_seconds * (2**attempt))
+                    delay = self._backoff_seconds * (2**attempt)
+                    # Retries used to be entirely silent: Gmail could rate-limit
+                    # us repeatedly and the UI showed nothing at all. Every
+                    # backoff is now an event the user can see.
+                    log.warning(
+                        "gmail.retry",
+                        status=status,
+                        attempt=attempt + 1,
+                        max_attempts=MAX_ATTEMPTS,
+                        backoff_seconds=round(delay, 2),
+                    )
+                    self._sleep(delay)
                     continue
                 raise ChannelError(f"Gmail request failed with HTTP {status}") from exc
         raise RateLimited("Gmail is rate limiting; retries exhausted") from last

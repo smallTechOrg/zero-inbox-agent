@@ -39,15 +39,20 @@ def test_emit_adds_to_ring_buffer():
     assert buf[0] == event
 
 
-def test_ring_buffer_caps_at_50_drops_oldest():
+def test_ring_buffer_caps_at_ring_size_dropping_oldest():
+    """Asserted against _RING_SIZE, not a hardcoded number: the ring is what a
+    browser replays on connect, and it was resized once the activity feed
+    started carrying every backend log line (a big run emits hundreds)."""
     bus = _fresh_bus()
-    for i in range(55):
+    cap = bus._RING_SIZE
+    overflow = 5
+    for i in range(cap + overflow):
         bus.emit("user-cap", {"type": "e", "i": i})
     buf = bus.replay_buffer("user-cap")
-    assert len(buf) == 50
-    # The first 5 events (i=0..4) should have been dropped
-    assert buf[0]["i"] == 5
-    assert buf[-1]["i"] == 54
+    assert len(buf) == cap
+    # The oldest `overflow` events are the ones dropped.
+    assert buf[0]["i"] == overflow
+    assert buf[-1]["i"] == cap + overflow - 1
 
 
 def test_subscriber_receives_emitted_event():

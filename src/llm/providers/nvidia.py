@@ -34,6 +34,9 @@ from openai import (
 )
 
 from llm.providers.base import LLMError, LLMResult, estimate_cost_usd
+from observability.logging import get_logger
+
+_log = get_logger("llm.nvidia")
 
 DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_MAX_RETRIES = 3
@@ -167,7 +170,19 @@ class NvidiaProvider:
                     ) from exc
                 last_exc = exc
             if attempt < self._max_retries:
-                await asyncio.sleep(min(2**attempt, 8) * (0.5 + random.random() / 2))
+                delay = min(2**attempt, 8) * (0.5 + random.random() / 2)
+                # Previously silent: a model could time out and be retried
+                # several times with nothing whatsoever surfacing to the user,
+                # who just saw a stalled progress bar.
+                _log.warning(
+                    "llm.retry",
+                    model=kwargs.get("model"),
+                    attempt=attempt,
+                    max_attempts=self._max_retries,
+                    backoff_seconds=round(delay, 2),
+                    cause=type(last_exc).__name__,
+                )
+                await asyncio.sleep(delay)
         raise LLMError(
             f"NVIDIA NIM call failed after {self._max_retries} attempts for model "
             f"{kwargs['model']!r}: {last_exc}"

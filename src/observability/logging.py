@@ -107,6 +107,60 @@ def redact_processor(
     return {key: _scrub_pair(key, value) for key, value in event_dict.items()}
 
 
+def activity_bus_processor(
+    _logger: Any, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Forward every log event to the per-user SSE bus, so the UI shows all of it.
+
+    Deliberately placed AFTER :func:`redact_processor` in the chain — the bus
+    only ever receives already-scrubbed events, never a raw secret or body.
+
+    This exists because hand-placed ``bus.emit()`` calls permanently drift out
+    of date: Gmail 429 backoffs and LLM retries were entirely invisible in the
+    UI despite the backend retrying repeatedly. Bridging the logging pipeline
+    itself means anything anyone logs, now or later, shows up without needing
+    a matching emit call.
+
+    ``user_id`` comes from structlog contextvars (bound per request and per
+    triage run) or from the event's own fields. Events with no resolvable user
+    are dropped rather than broadcast — never leak one tenant's activity to
+    another.
+    """
+    user_id = event_dict.get("user_id")
+    if user_id:
+        try:
+            from events import bus
+
+            bus.emit(
+                str(user_id),
+                {
+                    "type": "log",
+                    "event": event_dict.get("event"),
+                    "level": event_dict.get("level"),
+                    "logger": event_dict.get("logger"),
+                    "timestamp": event_dict.get("timestamp"),
+                    "run_id": event_dict.get("run_id"),
+                    # Everything else the call site logged, minus the keys above.
+                    "fields": {
+                        k: v
+                        for k, v in event_dict.items()
+                        if k
+                        not in (
+                            "event",
+                            "level",
+                            "logger",
+                            "timestamp",
+                            "run_id",
+                            "user_id",
+                        )
+                    },
+                },
+            )
+        except Exception:  # pragma: no cover — telemetry must never break logging
+            pass
+    return event_dict
+
+
 _configured = False
 
 
@@ -127,6 +181,9 @@ def configure_logging(log_level: str | None = None, *, force: bool = False) -> N
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             redact_processor,
+            # Must stay immediately after redact_processor: the bus (and so the
+            # browser) only ever sees scrubbed events.
+            activity_bus_processor,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(sort_keys=True),

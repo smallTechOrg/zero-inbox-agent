@@ -26,6 +26,7 @@ const EVENT_ICON: Record<SseEventType | string, string> = {
   thread_archived: '✓',
   error: '!',
   heartbeat: '♡',
+  log: '·',
 }
 
 function eventLabel(ev: SseEvent): string | null {
@@ -56,6 +57,19 @@ function eventLabel(ev: SseEvent): string | null {
       return `Archived: ${String(p.subject ?? '').slice(0, 50) || '(no subject)'} → ${p.label_name ?? ''}`
     case 'heartbeat':
       return null
+    case 'log': {
+      // Every backend log line, bridged from structlog. Render the event name
+      // plus whatever fields the call site logged, so a Gmail 429 backoff or an
+      // LLM retry reads as "gmail.retry status=429 attempt=1 backoff_seconds=2"
+      // rather than an opaque JSON blob.
+      const name = String(p.event ?? 'log')
+      const fields = (p.fields ?? {}) as Record<string, unknown>
+      const detail = Object.entries(fields)
+        .filter(([, v]) => v !== null && v !== undefined && v !== '')
+        .map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+        .join(' ')
+      return detail ? `${name} · ${detail}` : name
+    }
     default:
       return JSON.stringify(ev.payload)
   }

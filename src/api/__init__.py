@@ -18,11 +18,52 @@ from api._common import VALIDATION_ERROR, ok
 VERSION = "0.1.0"
 
 
+def _reconcile_orphaned_runs() -> int:
+    """Close out runs left ``running`` by a process that no longer exists.
+
+    Triage runs execute as in-process background tasks, so a server restart (or
+    a crash) kills them silently while their row still says ``running``. The UI
+    polls that row and renders a live progress bar for work that stopped long
+    ago — showing activity that isn't happening, which is worse than showing
+    nothing. Any run still marked ``running`` at startup is by definition
+    orphaned: this process has just booted and owns no background work yet.
+    """
+    from datetime import datetime, timezone
+
+    from db.models import TriageRun
+    from db.session import create_db_session
+
+    closed = 0
+    try:
+        with create_db_session() as session:
+            orphans = (
+                session.query(TriageRun).filter(TriageRun.status == "running").all()
+            )
+            for run in orphans:
+                run.status = "failed"
+                run.error_message = (
+                    "Interrupted — the server restarted while this run was in "
+                    "flight, so it stopped. Nothing was left half-applied: only "
+                    "approved decisions ever mutate Gmail. Start a new run."
+                )
+                run.finished_at = datetime.now(timezone.utc)
+                closed += 1
+    except Exception:  # noqa: BLE001 — never block startup on reconciliation
+        return 0
+    return closed
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     from db.session import init_db
 
     init_db()
+
+    closed = _reconcile_orphaned_runs()
+    if closed:
+        from observability.events import get_logger
+
+        get_logger("startup").warning("runs.orphaned_closed", count=closed)
 
     try:
         from scheduler import start_scheduler, stop_scheduler
@@ -60,6 +101,32 @@ def _install_handlers(app: FastAPI) -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="Zero Inbox Agent", version=VERSION, lifespan=_lifespan)
     _install_handlers(app)
+
+    @app.middleware("http")
+    async def _bind_user_to_logs(request, call_next):
+        """Bind the signed-in user to structlog contextvars for the request.
+
+        Without this only triage runs carried a user_id, so everything that
+        happens inside an ordinary API call — the whole archive/apply path, the
+        Gmail mutations, their retries — logged with no user attached and was
+        therefore dropped by activity_bus_processor instead of reaching the
+        activity feed. That is precisely the work that had no UI visibility.
+        """
+        import structlog
+
+        from api.session import optional_user_id
+
+        structlog.contextvars.clear_contextvars()
+        try:
+            user_id = optional_user_id(request)
+        except Exception:  # noqa: BLE001 — never fail a request over telemetry
+            user_id = None
+        if user_id:
+            structlog.contextvars.bind_contextvars(user_id=user_id)
+        try:
+            return await call_next(request)
+        finally:
+            structlog.contextvars.clear_contextvars()
 
     @app.get("/health")
     def health() -> dict:

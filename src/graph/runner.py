@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import structlog
+
 from graph.agent import MAX_CONCURRENCY, triage_graph
 from graph.persistence import model_for, update_run
 from graph.state import TriageState
@@ -74,6 +76,16 @@ def execute_triage(
         channel_account_id=channel_account_id,
         dry_run=dry_run,
         kind=kind,
+    )
+
+    # Bind once here so EVERY log line emitted anywhere under this run — graph
+    # nodes, the Gmail adapter, LLM retries, third-party code using structlog —
+    # carries user_id/run_id and is therefore routed to that user's activity
+    # stream by activity_bus_processor. Without this the UI only sees the
+    # hand-placed bus.emit() calls, which is how Gmail 429 backoffs and LLM
+    # retries stayed invisible.
+    structlog.contextvars.bind_contextvars(
+        user_id=user_id, run_id=resolved_run_id
     )
 
     initial: TriageState = {

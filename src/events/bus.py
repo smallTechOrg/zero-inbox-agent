@@ -16,7 +16,11 @@ import time
 from collections import deque
 from typing import Any
 
-_RING_SIZE = 50
+# Sized for "show me every micro action": a large triage run emits hundreds of
+# log lines (per-batch tier decisions, per-page fetches, retries), and the ring
+# is what a browser replays on connect/reconnect. At 50 a user reconnecting
+# mid-run saw only the last few seconds of a multi-minute run.
+_RING_SIZE = 1000
 _HEARTBEAT_EVENT = {"type": "heartbeat"}
 
 # ── module-level singleton state ──────────────────────────────────────────────

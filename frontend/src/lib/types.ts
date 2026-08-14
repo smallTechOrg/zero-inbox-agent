@@ -227,6 +227,9 @@ export type SseEventType =
   | 'thread_archived'
   | 'error'
   | 'heartbeat'
+  /** Every backend log line, bridged from structlog — including Gmail 429
+   * backoffs and LLM retries, which emit no hand-placed bus event. */
+  | 'log'
 
 export type SseEvent = {
   id: string // client-side generated
