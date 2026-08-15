@@ -15,7 +15,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+
+from tools.correspondents import is_no_reply
 
 SNIPPET_MAX_CHARS = 200
 
@@ -87,6 +89,17 @@ class SenderSignal(BaseModel):
     replied_count: int = 0
     ever_replied: bool = False
     last_replied_at: datetime | None = None
+    #: True when the address is an unattended machine mailbox (``no-reply@``).
+    #: Carried on the signal so the taxonomy census and the never-miss guards
+    #: read the flag instead of re-parsing the address at every consumer.
+    #: Defaults from ``sender_email`` — an adapter cannot forget to set it.
+    is_no_reply: bool = False
+
+    @model_validator(mode="after")
+    def _derive_is_no_reply(self) -> "SenderSignal":
+        if not self.is_no_reply and is_no_reply(self.sender_email):
+            object.__setattr__(self, "is_no_reply", True)
+        return self
 
 
 class ChannelAdapter(ABC):

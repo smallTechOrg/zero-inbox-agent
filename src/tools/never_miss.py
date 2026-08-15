@@ -9,7 +9,29 @@ re-open something an earlier stage already forced to ``keep``.
 
 from __future__ import annotations
 
+from tools.correspondents import is_no_reply, is_self_address
+
 DEFAULT_CONFIDENCE_FLOOR = 0.75
+
+
+def is_genuine_correspondent(
+    email: str, *, account_email: str = "", aliases: list[str] | None = None
+) -> bool:
+    """False for the two addresses a reply-history signal can never be about.
+
+    A ``no-reply@`` mailbox does not read replies, and the user is not his own
+    correspondent. Either one produces an ``ever_replied`` claim that is an
+    artefact of how the evidence was harvested, not evidence of a relationship.
+    """
+    if not email:
+        return False
+    if is_no_reply(email):
+        return False
+    if account_email and is_self_address(
+        email, account_email=account_email, aliases=aliases or []
+    ):
+        return False
+    return True
 
 
 def apply_confidence_floor(decisions: list[dict], floor: float) -> list[dict]:
@@ -97,6 +119,8 @@ def apply_reply_history_guard(
     items: list[dict],
     *,
     overrides: set[str] | None = None,
+    account_email: str = "",
+    aliases: list[str] | None = None,
 ) -> list[dict]:
     """Mechanism C. A sender the user has ever replied to is important.
 
@@ -105,6 +129,13 @@ def apply_reply_history_guard(
     forced to ``keep`` — unless the user has created an explicit override
     naming that sender. Checked last, so it cannot be argued away by the
     model or slip past a false-negative the reviewer missed.
+
+    **Defence in depth (Phase 9).** An ``ever_replied`` claim is *ignored* when
+    the sender cannot be a genuine correspondent — the user's own address, or a
+    ``no-reply@`` machine mailbox. The adapter no longer records such claims
+    (:func:`channels.gmail.adapter._accumulate_recipients`), but a
+    ``sender_profiles`` row harvested before that fix still asserts one, and a
+    stale row must not hold a thread in the inbox forever.
     """
     override_set = {e.lower() for e in (overrides or set())}
     items_by_id = {item["id"]: item for item in items}
@@ -114,6 +145,10 @@ def apply_reply_history_guard(
         item = items_by_id.get(decision.get("item_id"), {})
         sender = (item.get("from_email") or "").lower()
         stats = (sender_stats or {}).get(sender) or {}
+        if sender and not is_genuine_correspondent(
+            sender, account_email=account_email, aliases=aliases
+        ):
+            stats = {}
         if (
             stats.get("ever_replied")
             and sender

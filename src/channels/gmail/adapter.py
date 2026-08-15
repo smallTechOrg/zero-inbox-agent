@@ -369,9 +369,44 @@ class GmailAdapter(ChannelAdapter):
         )
         return _extract_text(thread)
 
+    def send_as_aliases(self) -> list[str]:
+        """Every address this mailbox can send as. Best-effort, never fatal.
+
+        Used only to recognise the user's own address in his own ``SENT`` mail.
+        On any failure we fall back to the account address alone and log at
+        WARNING — an alias lookup must never take a triage run down.
+        """
+        cached = getattr(self, "_send_as_cache", None)
+        if cached is not None:
+            return cached
+        aliases: list[str] = []
+        try:
+            listing = self._execute(
+                self._service.users().settings().sendAs().list(userId="me")
+            )
+            aliases = [
+                (entry.get("sendAsEmail") or "").lower()
+                for entry in ((listing or {}).get("sendAs") or [])
+                if entry.get("sendAsEmail")
+            ]
+        except Exception as exc:  # noqa: BLE001 — best-effort by contract
+            log.warning("gmail.send_as_failed", error=str(exc))
+            aliases = []
+        self._send_as_cache = aliases
+        return aliases
+
     def sender_history(self, *, limit: int = 500) -> dict[str, SenderSignal]:
         if limit < 0:
             raise ChannelError("limit must be >= 0")
+        # Who "me" is, so the user is never harvested as his own correspondent.
+        account = self._account_email
+        if not account:
+            try:
+                account = self.account_email()
+            except Exception as exc:  # noqa: BLE001 — best-effort by contract
+                log.warning("gmail.account_email_failed", error=str(exc))
+                account = ""
+        aliases = self.send_as_aliases()
         listing = self._execute(
             self._service.users()
             .messages()
@@ -392,7 +427,9 @@ class GmailAdapter(ChannelAdapter):
                 )
             except ChannelError:
                 continue
-            _accumulate_recipients(message, signals)
+            _accumulate_recipients(
+                message, signals, account_email=account, aliases=aliases
+            )
         return signals
 
     def list_labels(self) -> list[dict]:
@@ -455,13 +492,29 @@ def _service_factory_for_refresh_token(config, refresh_token: str) -> Callable[[
     return _build
 
 
-def _accumulate_recipients(message: dict, signals: dict[str, SenderSignal]) -> None:
+def _accumulate_recipients(
+    message: dict,
+    signals: dict[str, SenderSignal],
+    *,
+    account_email: str = "",
+    aliases: list[str] | None = None,
+) -> None:
+    """Harvest reply evidence from one ``SENT`` message.
+
+    The user's own addresses are skipped **entirely** — no ``SenderSignal``, no
+    ``replied_count``, no ``ever_replied``. Mailing yourself, or being on the
+    Cc of your own thread, is not a correspondence.
+    """
     from channels.gmail.normalize import addresses_of, headers_of, internal_date_of
+
+    from tools.correspondents import is_self_address
 
     headers = headers_of(message)
     sent_at: datetime = internal_date_of(message)
     recipients = addresses_of(headers.get("to", "")) + addresses_of(headers.get("cc", ""))
     for email in dict.fromkeys(recipients):
+        if is_self_address(email, account_email=account_email, aliases=aliases or []):
+            continue
         signal = signals.get(email)
         if signal is None:
             signal = SenderSignal(
