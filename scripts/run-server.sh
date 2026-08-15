@@ -54,6 +54,13 @@ while true; do
   if [[ "$stopping" -eq 1 ]]; then
     exit 0
   fi
+  # 78 = os.EX_CONFIG, raised by src/__main__.py for an unrecoverable configuration
+  # error (e.g. a missing AGENT_SECRET_KEY). Restarting cannot fix it, and a
+  # readable banner repeated 100 times is still an unreadable crash loop.
+  if [[ "$status" -eq 78 ]]; then
+    echo "$LOG_PREFIX $(date -u +%FT%TZ) fatal configuration error (78) — not restarting" >&2
+    exit 78
+  fi
   if [[ "$status" -eq 0 ]]; then
     echo "$LOG_PREFIX $(date -u +%FT%TZ) exited cleanly (0) — not restarting"
     exit 0

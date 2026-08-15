@@ -32,5 +32,23 @@ def _port() -> int:
     return int(os.environ.get("PORT", "8001"))
 
 
+def _check_fatal_config() -> None:
+    """Fail fast, readably, and *unrepeatably* on an unrecoverable config error.
+
+    Without this the missing-key error surfaced as a bare traceback with status 1,
+    which `scripts/run-server.sh` reads as an ordinary crash — so a one-line config
+    mistake became a 100-restart loop. Exiting with `FatalConfigError.exit_code`
+    (78 = os.EX_CONFIG) is the signal the supervisor uses to stop instead.
+    """
+    from config.settings import FatalConfigError, fatal_config_banner, require_secret_key
+
+    try:
+        require_secret_key()
+    except FatalConfigError as exc:
+        print(fatal_config_banner(str(exc)), file=sys.stderr, flush=True)
+        sys.exit(exc.exit_code)
+
+
 if __name__ == "__main__":
+    _check_fatal_config()
     uvicorn.run("api:app", host="0.0.0.0", port=_port(), reload=False)
