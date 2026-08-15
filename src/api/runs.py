@@ -38,12 +38,49 @@ NOT_RESUMABLE = "not_resumable"
 #: cannot be applied.
 NOT_APPLIABLE = "not_appliable"
 
+#: spec/api.md Phase 8 — 409, the run cannot be re-reviewed: it is not ``completed``,
+#: or every decision has already passed the never-miss reviewer.
+NOT_RETRYABLE = "not_retryable"
+
+#: The review states that mean "never got past the reviewer". Both are refused by
+#: ``tools.actions.apply_decision`` forever; only the reviewer can clear them.
+PENDING_REVIEW_STATES = ("provisional", "review_failed")
+
 #: Run ids whose retry-apply pass is currently in flight in this process. A second
 #: POST while the first is still working is a no-op rather than a second worker
 #: racing the same rows (the pass is idempotent per decision, but two passes would
 #: still double the Gmail calls).
 _apply_in_flight: set[str] = set()
 _apply_lock = threading.Lock()
+
+#: Run ids whose retry-review pass is in flight in this process. A second POST is a
+#: no-op rather than a second reviewer pass over the same rows — two passes would
+#: double the LLM spend and race each other's writes.
+_review_in_flight: set[str] = set()
+_review_lock = threading.Lock()
+
+
+def not_reviewed_count(session: Session, *, run_id: str, user_id: str) -> int:
+    """How many of this run's decisions never got past the never-miss reviewer.
+
+    Surfaced on ``GET /api/runs/{run_id}/remainder`` (ui.md screen 24): it is the
+    number behind the amber "Retry review" bar. Computed live from ``decisions``
+    with ORM column expressions — never from a cached count, for the same reason
+    the rest of the ledger is (a cached count is how run ``fbeed060`` reported
+    itself clean while 615 archives sat unapplied).
+    """
+    from db.models import Decision
+
+    return int(
+        session.execute(
+            select(func.count(Decision.id)).where(
+                Decision.run_id == run_id,
+                Decision.user_id == user_id,
+                Decision.review_state.in_(PENDING_REVIEW_STATES),
+            )
+        ).scalar_one()
+        or 0
+    )
 
 
 def run_payload(run, session: Session) -> dict:
@@ -210,7 +247,12 @@ def get_run_remainder(
     exist **or belongs to another user** — a run id is not a capability.
     """
     load_run(session, run_id, user_id)  # 404s if absent or another user's
-    return ok(remainder_ledger(session, run_id=run_id, user_id=user_id))
+    ledger = remainder_ledger(session, run_id=run_id, user_id=user_id)
+    # Phase 8: the unreviewed remainder is part of the honest answer. Without it
+    # the card cannot tell "we decided to keep these" from "we never got to look
+    # at these", and the second one is recoverable (screen 24).
+    ledger["not_reviewed"] = not_reviewed_count(session, run_id=run_id, user_id=user_id)
+    return ok(ledger)
 
 
 def _retry_apply_task(*, run_id: str, user_id: str, channel_account_id: str, dry_run: bool) -> None:
@@ -282,6 +324,82 @@ def apply_run(
     payload = remainder_ledger(session, run_id=run_id, user_id=user_id)
     payload["queued"] = queued
     return ok(payload)
+
+
+def _retry_review_task(*, run_id: str, user_id: str) -> None:
+    """Re-run the never-miss reviewer for one completed run. Never raises."""
+    try:
+        from graph.review_retry import retry_review
+
+        counts = retry_review(run_id=run_id, user_id=user_id)
+        _log.info(
+            "runs.retry_review_complete run_id=%s retried=%s reviewed=%s still_failed=%s applied=%s",
+            run_id,
+            counts.get("retried"),
+            counts.get("reviewed"),
+            counts.get("still_failed"),
+            counts.get("applied"),
+        )
+    except Exception:
+        _log.warning("runs.retry_review_failed run_id=%s", run_id, exc_info=True)
+    finally:
+        with _review_lock:
+            _review_in_flight.discard(run_id)
+
+
+@router.post("/api/runs/{run_id}/retry-review")
+def retry_review_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(require_user_id),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Re-enter the never-miss gate for a completed run's unreviewed decisions.
+
+    The recovery path for a reviewer outage (spec/capabilities/review-recovery.md).
+    It re-runs the **real** reviewer over the run's ``provisional`` /
+    ``review_failed`` rows and then the ordinary apply pass over whatever the
+    reviewer upgraded. It never writes ``review_state = "reviewed"`` and never
+    applies with ``force=True`` — a thread the reviewer flips to keep stays kept,
+    and if the reviewer fails again the rows stay blocked.
+
+    ``409 not_retryable`` unless the run is ``completed`` and at least one
+    non-``reviewed`` decision exists. Idempotent: a second call while one is in
+    flight is a no-op. ``404`` for another user's run.
+    """
+    run = load_run(session, run_id, user_id)  # 404s if absent or another user's
+    if run.status != "completed":
+        raise api_error(
+            NOT_RETRYABLE,
+            f"only a completed run can be re-reviewed (status={run.status!r})",
+            409,
+        )
+    pending = not_reviewed_count(session, run_id=run_id, user_id=user_id)
+    if pending == 0:
+        raise api_error(
+            NOT_RETRYABLE,
+            "every decision in this run has already passed the never-miss reviewer",
+            409,
+        )
+
+    with _review_lock:
+        queued = run_id not in _review_in_flight
+        if queued:
+            _review_in_flight.add(run_id)
+
+    if queued:
+        background_tasks.add_task(_retry_review_task, run_id=run.id, user_id=user_id)
+
+    # Returns immediately; the counts land on GET /api/runs/{run_id}/remainder and
+    # the reviewer's rows stream to the live feed as it works.
+    return ok(
+        {
+            "run_id": run.id,
+            "status": "retrying_review",
+            "not_reviewed": pending,
+            "queued": queued,
+        }
+    )
 
 
 @router.post("/api/runs/{run_id}/resume")

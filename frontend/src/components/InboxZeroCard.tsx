@@ -27,6 +27,37 @@ import { ErrorState, SkeletonRows } from '@/components/States'
 /** The events that make the ledger stale. Refetch, never poll. */
 const REFETCH_ON = ['apply_progress', 'inbox_zero_report', 'run_apply_failed']
 
+/**
+ * `POST /api/runs/{id}/retry-review` — ui.md screen 24, api.md § Phase 8.
+ *
+ * Declared locally on purpose: `lib/api.ts` belongs to another slice this phase,
+ * and the path is a spec contract, not a shared file. Same-origin (the static
+ * export is served by the same FastAPI process), same envelope as `lib/api.ts`.
+ */
+async function postRetryReview(runId: string): Promise<void> {
+  let res: Response
+  try {
+    res = await fetch(`/api/runs/${runId}/retry-review`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+    })
+  } catch {
+    throw new Error('Could not reach the server — is it running on http://localhost:8001 ?')
+  }
+  let body: { error?: { code?: string; message?: string } } | null = null
+  try {
+    body = (await res.json()) as { error?: { code?: string; message?: string } }
+  } catch {
+    body = null
+  }
+  if (!res.ok || body?.error) {
+    throw new Error(
+      body?.error?.message ?? `Retry review failed (${res.status}).`,
+    )
+  }
+}
+
 const BUCKET_LABEL: Record<keyof RemainderBuckets, string> = {
   needs_your_call: 'need your call',
   category_keep: 'kept by category',
@@ -69,6 +100,8 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
   const [error, setError] = useState<unknown>(null)
   const [retrying, setRetrying] = useState(false)
   const [retryError, setRetryError] = useState<string | null>(null)
+  const [retryingReview, setRetryingReview] = useState(false)
+  const [retryReviewError, setRetryReviewError] = useState<string | null>(null)
   const [categories, setCategories] = useState<Category[] | null>(null)
 
   const load = useCallback(async () => {
@@ -128,6 +161,26 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
     }
   }, [runId, load])
 
+  // Screen 24. The reviewer is allowed to fail, and when it does those threads
+  // are left in the inbox rather than archived unseen — the honest outcome, but
+  // one the user could not previously recover from without a whole new run.
+  const retryReview = useCallback(async () => {
+    if (!runId) return
+    setRetryingReview(true)
+    setRetryReviewError(null)
+    try {
+      await postRetryReview(runId)
+      // The pass runs in the background; the reviewer's rows stream to the live
+      // feed and the ledger refetches on its events. This first refetch is the
+      // immediate acknowledgement.
+      await load()
+    } catch (e) {
+      setRetryReviewError(e instanceof Error ? e.message : 'Retry review failed.')
+    } finally {
+      setRetryingReview(false)
+    }
+  }, [runId, load])
+
   // Both lists in the definition text are read from the LIVE taxonomy, never
   // hardcoded (ui.md #16). Hardcoding is how the card came to claim "Receipts
   // always stay" for a whole phase after Receipts became an archive category.
@@ -162,6 +215,10 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
   // backend follows api.md literally (`apply_ok=false` when distance > 0, with
   // no dry-run exemption); the dry-run chip is the honest presentation of that,
   // and the red "could not archive" bar beside it would be a lie.
+  // `not_reviewed` is served by GET /api/runs/{id}/remainder (api.md § Phase 8).
+  // Read defensively so an older backend renders the card without the bar rather
+  // than crashing — `lib/types.ts` belongs to another slice this phase.
+  const notReviewed = Number((ledger as { not_reviewed?: number }).not_reviewed ?? 0)
   const isDryRun = ledger.dry_run === true
   const applyFailed = !isDryRun && ledger.apply_ok === false
   const reason =
@@ -204,6 +261,50 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
           </button>
           {retryError ? (
             <p className="mt-1 text-xs font-medium text-rose-900">{retryError}</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Screen 24 — the unreviewed remainder. Rendered BELOW the red apply
+          failure bar and never instead of it: both can be true at once. */}
+      {notReviewed > 0 ? (
+        <div
+          role="status"
+          data-testid="not-reviewed-bar"
+          data-state="warn"
+          data-not-reviewed={String(notReviewed)}
+          className="rounded-lg border border-amber-300 bg-amber-50 p-3"
+        >
+          <p className="text-sm font-bold text-amber-900">
+            {notReviewed.toLocaleString()} thread{notReviewed === 1 ? '' : 's'} never got past the
+            reviewer
+          </p>
+          <p className="mt-1 text-xs text-amber-900">
+            They were left in your inbox rather than archived unseen. The reviewer failed or was
+            unavailable during this run.
+          </p>
+          <button
+            type="button"
+            data-testid="retry-review"
+            onClick={() => void retryReview()}
+            disabled={retryingReview}
+            className="mt-2 rounded-lg border border-amber-500 bg-white px-3 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100 focus:ring-2 focus:ring-amber-500 focus:outline-none disabled:opacity-50"
+          >
+            {retryingReview ? 'Retrying review…' : 'Retry review'}
+          </button>
+          {retryingReview ? (
+            <p className="mt-1 text-xs text-amber-800" data-testid="retry-review-progress">
+              The reviewer is looking at them now — watch the live feed. Nothing is archived until
+              it passes a thread.
+            </p>
+          ) : null}
+          {retryReviewError ? (
+            <p
+              className="mt-1 text-xs font-medium text-amber-900"
+              data-testid="retry-review-error"
+            >
+              {retryReviewError}
+            </p>
           ) : null}
         </div>
       ) : null}
