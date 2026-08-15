@@ -218,5 +218,31 @@ export const api = {
   },
 }
 
+/**
+ * Phase 8 — signing in and connecting a mailbox are two different consents.
+ *
+ * `intent=signin` asks Google for `openid email profile` only; it creates the
+ * account and the session and touches no mail. `intent=connect` is the existing
+ * Gmail scope set. The backend reads `intent` from the signed `zi_oauth_state`
+ * cookie, never from the callback query string (spec/api.md § Phase 8).
+ */
+export const SIGNIN_URL = '/auth/google/start?intent=signin'
+export const CONNECT_URL = '/auth/google/start?intent=connect'
+
+/** Kept for pre-Phase-8 callers: a bare start is `connect`, byte for byte. */
 export const AUTH_START_URL = '/auth/google/start'
+
+export const LOGOUT_URL = '/auth/logout'
+
+/** True when the backend says this session is gone — the signal to return the
+ *  user to the homepage with "You were signed out.", never a wall of failed
+ *  panels (spec/ui.md § States). */
+export function isUnauthenticated(e: unknown): boolean {
+  return e instanceof ApiError && (e.code === 'unauthenticated' || e.status === 401)
+}
+
+export async function logout(): Promise<void> {
+  await request<{ logged_out: boolean }>(LOGOUT_URL, { method: 'POST' })
+}
+
 export { ApiError }
