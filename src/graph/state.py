@@ -4,6 +4,28 @@ import operator
 from typing import Annotated, TypedDict
 
 
+def keep_first_error(current: str | None, incoming: str | None) -> str | None:
+    """Reducer for the ``error`` channel. Keeps the FIRST real error.
+
+    ``error`` is a hard gate: any truthy value routes the graph to
+    ``handle_error`` and ends the run. Without a reducer it is a LastValue
+    channel, so when several tier-3 batches fan out via ``Send`` and finish in
+    the SAME superstep — each returning ``{"error": ...}``, success or failure —
+    LangGraph raises ``InvalidUpdateError: At key 'error': Can receive only one
+    value per step`` and the whole run dies. That is what broke the 220-thread
+    full-resume path while fixture-scale runs (one batch, one write per step)
+    passed: the bug only appears once there are enough threads to produce
+    concurrent batches.
+
+    ``current or incoming`` is deliberate in both directions:
+      * a concurrent SUCCESS (``None``) must never erase a sibling's real error,
+        or a fatal batch would be silently swallowed and the run would carry on;
+      * the first error wins over later ones, so the reported cause is the one
+        that actually stopped things rather than whichever landed last.
+    """
+    return current or incoming
+
+
 class TriageState(TypedDict, total=False):
     """State of one cost-tiered triage run. See spec/agent.md."""
 
@@ -49,5 +71,5 @@ class TriageState(TypedDict, total=False):
     review_failed_item_ids: list[str]
 
     # control
-    error: str | None
+    error: Annotated[str | None, keep_first_error]
     status: str
