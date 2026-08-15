@@ -398,6 +398,7 @@ class ActionLog(Base):
     """
 
     __tablename__ = "action_logs"
+    __table_args__ = (Index("ix_action_logs_reorg_job", "reorg_job_id"),)
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
@@ -411,6 +412,14 @@ class ActionLog(Base):
     response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     undo_token: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     undone_at: Mapped[datetime | None] = _ts(nullable=True)
+    #: Phase 9: the re-organisation this mutation belonged to, or NULL for an
+    #: ordinary triage apply. Indexed so bulk undo of a whole re-organisation is
+    #: ONE query over ONE index rather than a join through ``decisions`` — the
+    #: difference between an undo button that works over 10,000 threads and one
+    #: that times out. See spec/data.md § Phase 9 entities.
+    reorg_job_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("reorg_jobs.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
 
 
@@ -418,6 +427,70 @@ ALLOWED_ACTION_OPERATIONS: frozenset[str] = frozenset(
     {"archive", "add_label", "remove_label", "create_filter", "create_draft"}
 )
 """Whitelist of mailbox mutations. Nothing destructive is representable."""
+
+
+# --- Phase 9: re-organisation ---------------------------------------------------------
+
+
+#: The closed set of reasons a decision was NOT re-organised. Every row the job
+#: did not mutate is counted under exactly one of these, and
+#: ``done + sum(skipped.values()) == total`` is an invariant asserted in tests.
+#: A reason outside this set means the job dropped a thread silently, which is
+#: the one thing "re-organise everything" may never do.
+REORG_SKIP_REASONS: tuple[str, ...] = (
+    "not_reviewed",
+    "no_category_fit",
+    "gmail_error",
+    "already_correct",
+    "dry_run",
+    "cancelled",
+)
+
+#: ``partial`` is used whenever ANYTHING was skipped — ``completed`` never hides
+#: a skip (spec/api.md § Phase 9).
+REORG_STATUSES: tuple[str, ...] = (
+    "running",
+    "completed",
+    "partial",
+    "cancelled",
+    "failed",
+)
+
+
+class ReorgJob(Base):
+    """One re-organisation of the whole mailbox under a changed taxonomy.
+
+    Scope is **every decision row for the user** — ~10,336 on the live account,
+    including threads that are already archived, which are relabelled in place
+    and never returned to the inbox. Never capped, never sampled: ``total`` is
+    the true count and every row lands in ``done`` or in exactly one ``skipped``
+    bucket.
+    """
+
+    __tablename__ = "reorg_jobs"
+    __table_args__ = (Index("ix_reorg_jobs_user_status", "user_id", "status"),)
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="running", index=True)
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: ``{reason: count}`` over REORG_SKIP_REASONS. Reasons with a zero count are
+    #: omitted rather than rendered as noise.
+    skipped: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: Resume point — the id of the last decision this job finished with. A killed
+    #: job restarts strictly after it and re-does nothing.
+    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: The triage run the re-classification pass writes into, so re-classification
+    #: is resumable by the existing Phase 6 machinery rather than a private cursor.
+    run_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    finished_at: Mapped[datetime | None] = _ts(nullable=True)
+    #: Non-null whenever status is ``partial`` or ``failed``, in human-readable words.
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Correction(Base):
@@ -492,6 +565,9 @@ __all__ = [
     "Decision",
     "LLMCall",
     "ActionLog",
+    "ReorgJob",
+    "REORG_SKIP_REASONS",
+    "REORG_STATUSES",
     "Correction",
     "VipEntry",
     "PriorityProfile",
