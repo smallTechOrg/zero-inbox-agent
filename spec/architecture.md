@@ -2,172 +2,101 @@
 
 ## System Overview
 
-A **channel-agnostic triage core** with **Gmail as the first adapter**. The triage brain, rules,
-categories, clusters, memory and audit log operate exclusively on a generic `Item` shape. Gmail sits
-behind a `ChannelAdapter` interface and is the only implementation shipped in v1.
-
 ```
-Browser (Next.js static export, served at :8001/app/)
-        │  JSON over /api/*   +  OAuth redirect via /auth/google/*
-        ▼
-FastAPI (:8001)  ── session cookie (signed, AGENT_SECRET_KEY)
-        │
-        ├── api/auth.py ........... Google OAuth web flow, refresh-token storage
-        ├── api/connections.py .... launch a triage run for a mailbox
-        ├── api/triage.py ......... clusters, threads, decisions, approve/reject
-        ├── api/runs.py ........... run progress (polled)
-        │
-        ▼
-LangGraph triage graph  (src/graph/)  ── see spec/agent.md
-        │
-        ├── ChannelAdapter (src/channels/base.py)
-        │        └── GmailAdapter (src/channels/gmail/)  ← only impl in v1
-        ├── Tools (src/tools/): redact, rules, clustering, never_miss, memory,
-        │                        taxonomy, actions, rule_mining, cost, digest
-        └── LLMClient (src/llm/) → NVIDIA NIM, OpenAI-compatible HTTP
-        │
-        ▼
-SQLite via SQLAlchemy 2.0 + Alembic  (headers, IDs, decisions, reasoning — never bodies)
+Browser (Next.js dashboard, :3000)
+   │  REST + SSE (proxied /api → :8001)
+   ▼
+FastAPI backend (:8001)
+   ├─ Auth: Google OAuth (signed session cookie; encrypted refresh tokens)
+   ├─ Gmail client: read INBOX threads, add/remove labels (reversible ops only)
+   ├─ Triage runner: LangGraph graph (spec/agent.md), one run at a time per user
+   ├─ Event bus: per-run SSE stream (feed + progress + cost ticker)
+   └─ SQLite (./data/agent.db) — all state, keyed by user_id
+LLM: NVIDIA NIM (primary) → Gemini (automatic fallback), hard timeouts
+Observability: LangSmith tracing + structured JSON logs (stdout)
 ```
 
 ## Components
 
-| Component | Path | Responsibility |
-|-----------|------|----------------|
-| API surface | `src/api/` | HTTP routes, session cookie, response envelope `ok()` / `api_error()` |
-| Channel interface | `src/channels/base.py` | Abstract `ChannelAdapter`: `list_threads`, `get_thread`, `archive_and_label(thread_id, add_label_ids, remove_inbox=True)`, `undo_archive_and_label(thread_id, ...)`, `create_label`, `create_filter`, `create_draft` — **no `trash`, `delete`, or `report_spam` method exists on this interface**, so no implementation, including `GmailAdapter`, can expose one |
-| Gmail adapter | `src/channels/gmail/` | OAuth client, thread listing, header/snippet extraction, the single atomic `modify()` call behind `archive_and_label`, filter creation, draft creation |
-| Triage graph | `src/graph/` | LangGraph state machine — the cost-tiered cascade; see [`agent.md`](agent.md) |
-| Tools | `src/tools/` | Pure functions: `(inputs) → domain model`. No side effects except the explicitly-named action tools |
-| LLM layer | `src/llm/` | `LLMClient` wrapper + swappable OpenAI-compatible provider |
-| Persistence | `src/db/` | SQLAlchemy 2.0 declarative models + session factory; schema in [`data.md`](data.md) |
-| Domain models | `src/domain/` | Pydantic models — `Item`, `Decision`, `Cluster`, `Rule`, `TriageOutcome` |
-| Security | `src/security/crypto.py` | Fernet encryption of OAuth refresh tokens at rest, keyed from `AGENT_SECRET_KEY` |
-| Observability | `src/observability/` | structlog JSON logging + LangSmith tracing + per-call cost accounting |
-| Identity & account | `src/api/session.py`, `src/api/auth.py`, `src/api/account.py` (Phase 8) | Signed session cookie carrying `{uid, sid}`; revocable `user_sessions` rows; the two OAuth intents (`signin` = `openid email profile`, `connect` = Gmail scopes); account/connection/session/delete routes. **Every `/api/*` route depends on `require_user_id`, which is the single user-scope chokepoint — Phase 8 adds revocation to it and adds no second auth path.** |
-| Review recovery | `src/graph/review_retry.py` (Phase 8) | Re-runs the existing reviewer node over a completed run's non-`reviewed` decisions and then the ordinary apply pass. Calls the same reviewer and the same `apply_decision()` as a normal run — it is a re-entry point, not a bypass. |
-| Frontend | `frontend/` | Next.js static export mounted by FastAPI at `/app`. Phase 8: `/app/` is the **front door** — a signed-out visitor gets the marketing homepage, a signed-in one gets the console. Design tokens live in `frontend/src/app/globals.css` under `@theme`; see [ui.md](ui.md#design-system). |
+- **`src/api/`** — FastAPI routers. Every response is a JSON envelope
+  `{ok, data|error}`; errors are human-actionable sentences (never tracebacks).
+  A revoked/expired Google token anywhere returns
+  `{ok:false, error:{code:"gmail_reconnect", message:"Reconnect Gmail to continue."}}`.
+- **`src/channels/gmail/`** — OAuth flow, token store (refresh tokens encrypted with
+  `AGENT_SECRET_KEY`-derived key), thread fetch (INBOX only, newest first,
+  metadata-format — never full bodies), label CRUD, mutation executor. Every
+  mutation goes through one choke point that (a) writes the audit row first,
+  (b) refuses any op that is not `add_label`/`remove_label`/`remove_INBOX`, and
+  (c) honors the test-isolation guard (below).
+- **`src/llm/`** — one `classify_batch()` client. Primary NVIDIA NIM
+  (OpenAI-compatible); on error, HTTP 429, or timeout it fails over to Gemini for
+  the current batch and probes NVIDIA again on the next batch (prefer returning to
+  primary). Hard per-call timeout (`AGENT_LLM_TIMEOUT_SECONDS`, default 30s) —
+  a stalled provider is impossible by construction. Records every call (provider,
+  model, tokens, latency, est. cost, fallback flag) to `llm_calls`.
+- **`src/graph/`** — the LangGraph triage graph. See spec/agent.md.
+- **`src/events/`** — in-process per-run event bus; events are also persisted as
+  `run_events` rows so a reconnecting browser replays the feed.
+- **`src/tools/undo.py`** — whole-run undo: replays the run's audit rows in reverse,
+  inverting each mutation.
+- **`frontend/`** — the single dashboard (spec/ui.md).
 
-## Data Flow — a triage run
+## Data Flow (one cleaning chunk)
 
-1. `POST /api/connections/{id}/triage` creates a `TriageRun` row (`status=running`) and starts the
-   graph in a background task; the route returns `{run_id}` immediately.
-2. `GmailAdapter.list_threads(limit)` fetches thread metadata (`format=metadata`, headers only) →
-   normalized into `Item` objects. A ~200-char snippet is taken and immediately passed through
-   `redact()`; **no body text is ever written to the database**.
-3. The cascade runs (see [`agent.md`](agent.md)): deterministic rules → sender history → batched LLM
-   (20–50 items per call) → deep-read escalation → second-pass reviewer (Phase 2) → confidence floor.
-4. Decisions are persisted with `confidence`, `reasoning`, `decided_by` tier and `rule_id`.
-5. `cluster_decisions` groups them by sender / mailing-list / domain / category into `Cluster` rows.
-6. The frontend polls `GET /api/runs/{run_id}` for progress and `GET /api/triage/clusters` for results
-   as they land.
-7. Approving a cluster (Phase 2+, dry-run off) calls `actions.apply_decision()`, which invokes the
-   adapter mutation, writes an `ActionLog` row with the request parameters and an **undo token**, and
-   marks the decision `applied`.
+1. `POST /api/runs` → create (or resume) the run row; runner starts in a background
+   task; response returns `run_id` immediately.
+2. Runner fetches the next up-to-50 undecided INBOX threads (newest first), skipping
+   any `gmail_thread_id` already in `thread_decisions` for this user.
+3. Threads are classified in metadata-only batches (≤25/batch); each decision row is
+   written before its mutation is applied; each mutation writes an audit row, then
+   executes against Gmail; each step emits a feed event.
+4. Finalize writes run totals (counts, costs) and emits `run_finished`.
+5. `POST /api/runs/{id}/undo` inverts every non-undone audit row, newest first.
 
-## Privacy & Redaction Boundary
+## Privacy Boundary (hard rule)
 
-`src/tools/redact.py` is the single egress chokepoint. Every string that leaves the machine for the
-LLM passes through it first. It removes: 4–8 digit OTP-shaped codes in security contexts, `sk-`/`ghp_`
-/`AKIA`-style API keys, 13–19 digit card numbers (Luhn-checked), and password-labelled values,
-replacing each with `[REDACTED:<kind>]`. Redaction runs **before** the prompt is assembled, not inside
-the provider.
+The only fields ever serialized into an LLM prompt: sender address + display name,
+subject, `List-Unsubscribe` presence, `Reply-To`, Gmail category tab, thread message
+count, has-user-replied flag, and the Gmail snippet (~90 chars). The prompt builder
+takes a `ClassifierView` dataclass containing exactly these fields — the body is
+unrepresentable in the type. A unit test asserts no other field can reach a prompt.
 
-Body escalation (`format=full`) is fetched **in memory only** for threads the cascade marks unsure; the
-body is redacted, sent, and discarded. Never stored.
+## Test-Isolation Guard
 
-## Concurrency & Background Work
+Reuse the repo's proven pattern: the Gmail mutation choke point checks an
+environment flag set by `tests/conftest.py`; under tests, mutations are recorded to
+the audit trail and returned as applied **without** calling Gmail's write API. Read
+paths and LLM calls stay real (keys from `.env`). E2E tests run against a seeded
+test user, never the live account's mutations.
 
-Triage runs execute in a FastAPI `BackgroundTasks` worker inside the same process, with progress
-written to the `TriageRun` row after each batch so the UI can poll. LLM batches fan out with
-LangGraph's `Send` API at a max concurrency of 4. Backlog jobs (Phase 3) are the same mechanism with a
-persisted cursor, making them cancellable and resumable.
+## Multi-User Isolation
 
-> **Assumed:** In-process background tasks + DB-persisted progress are sufficient at the stated volume
-> (a few hundred messages/day, latency not critical). No Celery/Redis/queue is introduced in v1.
-
-## Error Handling
-
-Every external call (Gmail, NVIDIA NIM) is wrapped with a timeout, 3 retries with exponential backoff,
-and explicit handling of 401 (refresh the OAuth token once, then mark the connection `reauth_required`)
-and 429 (backoff + resume). A failed LLM batch does not fail the run: its items are routed to
-`needs_your_call` with `decided_by=error` — degradation always errs toward keeping mail visible.
+Every table carries `user_id`; every query filters by the session's user; Gmail
+tokens, runs, decisions, taxonomy, profiles, and costs are all per-user. There is no
+cross-user code path.
 
 ## Stack
 
 | Layer | Choice |
-|-------|--------|
-| Language | Python 3.12+ |
-| Dependency management | `uv` (Python), `pnpm` (frontend) |
-| Agent framework | LangGraph (`StateGraph`, `Send` fan-out) — graph in [`agent.md`](agent.md) |
-| LLM provider | **NVIDIA NIM** via its OpenAI-compatible endpoint, `https://integrate.api.nvidia.com/v1` |
-| LLM default model | `nvidia/nemotron-3-nano-30b-a3b` (env: `AGENT_NVIDIA_DEFAULT_MODEL`), overridable per user |
-| LLM client | `openai` Python SDK pointed at the NIM `base_url` — a thin OpenAI-compatible client with a swappable model id; **never a hardcoded model** |
-| Backend | FastAPI + Uvicorn, port **8001** |
-| Database | SQLite via SQLAlchemy 2.0 declarative + Alembic |
-| Frontend | Next.js 15 + React 19, `output: 'export'`, `basePath: '/app'`, served by FastAPI at `/app` |
-| Styling | Tailwind v4 (`postcss.config.mjs` with `@tailwindcss/postcss`, `@source "../";` in `globals.css`) |
-| Google API | `google-auth-oauthlib` + `google-api-python-client` |
-| Token encryption | `cryptography` Fernet, key derived from `AGENT_SECRET_KEY` |
-| Session | signed cookie via `itsdangerous` |
-| Logging | `structlog` JSON to stdout |
-| Tracing | LangSmith (`LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`) — wired in Phase 1 |
-| Unit/integration tests | `pytest` |
-| E2E tests | Playwright (`@playwright/test`, chromium) in `tests/e2e/` |
+|---|---|
+| Language | Python 3.12+ (backend), TypeScript (frontend) |
+| Agent framework | LangGraph |
+| LLM primary | NVIDIA NIM — `AGENT_NVIDIA_API_KEY/BASE_URL/DEFAULT_MODEL` (default `nvidia/nemotron-3-nano-30b-a3b`) |
+| LLM fallback | Gemini — `AGENT_GEMINI_API_KEY`, `AGENT_GEMINI_FALLBACK_MODEL=gemini-2.5-flash-lite` |
+| Backend | FastAPI + uvicorn, port 8001 (`PORT`/`AGENT_PORT`) |
+| Database | SQLite via SQLAlchemy 2.x (`sqlite:///./data/agent.db`); Postgres migration path documented in Phase 3 (`docs/postgres-migration.md`) — schema uses only Postgres-compatible types |
+| Frontend | Next.js 15 + React 19, dev port 3000, `/api` proxied to backend |
+| Auth | Google OAuth 2.0 (`AGENT_GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI`), signed session cookie, refresh tokens encrypted at rest |
+| Key libraries | `google-auth`/`google-api-python-client` (Gmail), `httpx` (LLM), `sse-starlette` (SSE), `pydantic-settings` |
+| Deps | uv (Python), pnpm (frontend) |
+| Observability | LangSmith (`LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`) + structured JSON logging (request/response, latency, provider, error) from Phase 1 |
+| E2E | Playwright in `tests/e2e/` (Phase 1 deliverable) |
 
-### Provider layer contract
-
-```python
-# src/llm/providers/base.py
-class LLMProvider(Protocol):
-    async def call_model(
-        self,
-        prompt: str,
-        *,
-        system: str | None = None,
-        model: str | None = None,
-        json_schema: dict | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        disable_thinking: bool = False,
-    ) -> LLMResult: ...
-
-# LLMResult: text: str, model: str, tokens_in: int, tokens_out: int,
-#             latency_ms: int, usd: float, attempts: int, finish_reason: str
-```
-
-`call_model` is **async**; `LLMClient` wraps it and also exposes `call_model_sync` for
-use from synchronous FastAPI routes. The `model` argument overrides the default per call, so the
-per-user model preference (Phase 3) requires no code change. `disable_thinking` suppresses
-chain-of-thought tokens for providers that support it (reduces latency + cost on simple
-classification calls). `src/llm/providers/nvidia.py` implements this against the OpenAI SDK with
-`base_url=settings.nvidia_base_url`. The existing `anthropic.py` and `gemini.py` providers are
-removed — NVIDIA NIM is the only provider in v1.
-
-### Settings (`src/config/settings.py`, env prefix `AGENT_`)
-
-| Setting | Env var | Default |
-|---------|---------|---------|
-| `database_url` | `AGENT_DATABASE_URL` | `sqlite:///./data/agent.db` |
-| `nvidia_api_key` | `AGENT_NVIDIA_API_KEY` | required |
-| `nvidia_base_url` | `AGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` |
-| `nvidia_default_model` | `AGENT_NVIDIA_DEFAULT_MODEL` | `nvidia/nemotron-3-nano-30b-a3b` |
-| `llm_max_rpm` | `AGENT_LLM_MAX_RPM` | `350` — **process-wide** client-side ceiling on outbound LLM requests per minute, counting first attempts, retries and every tier. The NVIDIA account limit is **490 req/min**; 350 leaves real headroom. Enforced by a shared token bucket in `src/llm/throttle.py` (Phase 6). Must be documented in `.env.example`. |
-| `run_max_seconds` | `AGENT_RUN_MAX_SECONDS` | `3600` — per-run wall-clock ceiling; on exceeding it the run ends `resumable` with its partial decisions intact (never-stuck bound, Phase 6). Must be documented in `.env.example`. |
-| `google_client_id` | `AGENT_GOOGLE_CLIENT_ID` | required |
-| `google_client_secret` | `AGENT_GOOGLE_CLIENT_SECRET` | required |
-| `google_redirect_uri` | `AGENT_GOOGLE_REDIRECT_URI` | `http://localhost:8001/auth/google/callback` |
-| `secret_key` | `AGENT_SECRET_KEY` | required |
-| `port` | `PORT` | `8001` |
-| `log_level` | `AGENT_LOG_LEVEL` | `INFO` |
-
-Google OAuth scopes requested: `gmail.readonly`, `gmail.modify`, `gmail.settings.basic`,
-`gmail.compose`. The OAuth client is the user's own Google Cloud project in **test mode**; refresh
-tokens are stored per user, encrypted.
-
-> **Assumed:** SQLite is correct here because this is an explicitly single-user-per-install personal
-> tool, even though the schema is multi-tenant. Tests therefore run against SQLite — the same driver
-> as production — satisfying the same-driver rule.
-
-> **Assumed:** LangSmith tracing is enabled when `LANGCHAIN_API_KEY` is present and silently skipped
-> when absent; structured stdout logging is unconditional, so observability is never absent.
+> **Assumed:** SQLite is acceptable for current local hosting per the brief; the
+> Postgres path is docs-only until Phase 3.
+> **Assumed:** LangSmith tracing is enabled when `LANGCHAIN_API_KEY` is present and
+> silently disabled otherwise (structured logs always on).
+> **Assumed:** existing proven modules (`src/channels/gmail/*`, `src/llm/*`,
+> `src/security/crypto.py`, `src/events/bus.py`, undo machinery, test-isolation
+> guard) are reused where they conform to this spec; everything else in `src/` and
+> `frontend/` that this spec does not name is deleted.
