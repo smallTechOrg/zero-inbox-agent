@@ -5,6 +5,7 @@ import { api } from '@/lib/api'
 import { type Settings as SettingsShape, type VipEntry, type VipKind } from '@/lib/types'
 import { TaxonomyEditor } from '@/components/TaxonomyEditor'
 import { ErrorState, SkeletonRows } from '@/components/States'
+import AccountSection from '@/components/AccountSection'
 
 function clamp(v: number, min: number, max: number) {
   return Math.min(Math.max(v, min), max)
@@ -319,7 +320,10 @@ export default function SettingsPanel({
 
   if (!draft) {
     return (
-      <section className="space-y-4 p-4">
+      <section className="space-y-4 p-4" aria-label="Settings">
+        {/* Account & security does not depend on /api/settings, so it stays
+            usable while the settings payload is still loading. */}
+        <AccountSection />
         <div className="text-xs text-gray-500">Loading settings…</div>
       </section>
     )
@@ -327,6 +331,12 @@ export default function SettingsPanel({
 
   return (
     <section className="space-y-6 p-4" aria-label="Settings">
+      {/* Phase 8 — screen 22: Account & security, the first group, above the
+          autonomy controls. Nothing below it changes behaviour. */}
+      <AccountSection />
+
+      <div className="border-t border-gray-200" />
+
       {/* Confidence floor */}
       <SliderRow
         label="Confidence floor"
