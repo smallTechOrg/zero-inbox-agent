@@ -11,7 +11,12 @@ from __future__ import annotations
 import pytest
 
 from channels.gmail.labels import label_name_for
-from tools.rules import DEFAULT_CATEGORY_KEYS
+from tools.rules import DEFAULT_CATEGORY_KEYS, DEFAULT_TAXONOMY
+
+#: Bound to the canonical list, not hardcoded: Phase 9 added ``important`` to the
+#: seed set, and a literal here would have to be chased every time. Still an
+#: EXACT count, not a loosened one.
+SEED_COUNT = len(DEFAULT_TAXONOMY)
 from tools.taxonomy import (
     TaxonomyError,
     create_category,
@@ -79,13 +84,13 @@ class TestLabelNameDerivation:
 
 
 class TestDefaultSeeding:
-    def test_new_user_is_seeded_with_six_defaults(self, _isolated_db):
+    def test_new_user_is_seeded_with_the_defaults(self, _isolated_db):
         with _session() as session:
             created = ensure_default_taxonomy(session, USER_ID)
             session.commit()
             rows = list_categories(session, USER_ID)
 
-        assert created == 6
+        assert created == SEED_COUNT
         assert {r.key for r in rows} == set(DEFAULT_CATEGORY_KEYS)
         for row in rows:
             assert row.channel_label_name == f"ZeroInbox/{row.name}"
@@ -240,7 +245,7 @@ class TestSyncLabels:
 
             rows = list_categories(session, USER_ID)
 
-        assert len(results) == 6
+        assert len(results) == SEED_COUNT
         assert all(r["status"] == "synced" for r in results)
         assert all(row.channel_label_id is not None for row in rows)
         assert {label["name"] for label in client.list_zero_inbox_labels()} == {
@@ -258,7 +263,7 @@ class TestSyncLabels:
             sync_labels(session, USER_ID, client)
             session.commit()
 
-        assert len(client.list_zero_inbox_labels()) == 6
+        assert len(client.list_zero_inbox_labels()) == SEED_COUNT
 
     def test_sync_renames_label_after_category_rename(self, _isolated_db):
         with _session() as session:
@@ -288,6 +293,6 @@ class TestSyncLabels:
             results = sync_labels(session, USER_ID, client)
             session.commit()
 
-        assert len(results) == 6
+        assert len(results) == SEED_COUNT
         assert all(r["status"] == "unsynced" for r in results)
         assert all("error" in r for r in results)

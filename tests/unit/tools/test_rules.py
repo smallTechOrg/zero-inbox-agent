@@ -173,7 +173,11 @@ class TestSenderHistory:
         assert [i["id"] for i in unresolved] == ["b"]
 
 
-def test_default_taxonomy_is_the_specified_six():
+def test_default_taxonomy_is_the_specified_seed_set():
+    # Phase 9 added ``important`` — the third never-miss label. The reframe
+    # archives never-miss mail UNDER a label instead of holding it in the inbox,
+    # and a held thread that is neither a person nor time-sensitive had nowhere
+    # to go. It is last so the existing sort_order of the original six is stable.
     assert [c["key"] for c in DEFAULT_TAXONOMY] == [
         "newsletters",
         "notifications",
@@ -181,5 +185,6 @@ def test_default_taxonomy_is_the_specified_six():
         "outreach",
         "people",
         "urgent",
+        "important",
     ]
     assert all(c["description"] for c in DEFAULT_TAXONOMY)

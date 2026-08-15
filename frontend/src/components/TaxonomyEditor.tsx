@@ -2,8 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '@/lib/api'
-import { type Category, type DefaultAction, type TaxonomyProposal } from '@/lib/types'
+import {
+  isNeverArchiveKey,
+  NEVER_ARCHIVE_NOTE,
+  type Category,
+  type DefaultAction,
+  type TaxonomyProposal,
+} from '@/lib/types'
 import { ErrorState, SkeletonRows } from '@/components/States'
+import { TaxonomyDiscovery } from '@/components/TaxonomyDiscovery'
 
 const ACTION_LABELS: Record<DefaultAction, string> = {
   archive: 'Archive',
@@ -284,6 +291,7 @@ function CategoryRow({
   }, [nameValue, category.name, category.id, onNameChange])
 
   const isDragging = draggingIndex === dragIndex
+  const neverArchive = isNeverArchiveKey(category.key)
 
   return (
     <li
@@ -350,18 +358,44 @@ function CategoryRow({
         )}
       </div>
 
-      {/* Default action dropdown */}
-      <select
-        value={category.default_action}
-        onChange={e => void onActionChange(category.id, e.target.value as DefaultAction)}
-        className="shrink-0 rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-gray-900"
-        data-testid="category-action-select"
-        aria-label={`Default action for ${category.name}`}
-      >
-        {ACTION_OPTIONS.map(a => (
-          <option key={a} value={a}>{ACTION_LABELS[a]}</option>
-        ))}
-      </select>
+      {/* Default action dropdown.
+
+          Phase 9 / ui.md screen 29: a NEVER_ARCHIVE_KEYS category can never be
+          set to archive-by-default. The option is rendered DISABLED with the
+          reason stated beside it, not hidden — and the change handler refuses it
+          a second time, so a keyboard or scripted selection cannot slip past the
+          disabled attribute. The backend refuses it as well; this is the
+          user-visible half of the same guarantee. */}
+      <span className="flex shrink-0 flex-col items-end gap-0.5">
+        <select
+          value={category.default_action}
+          onChange={e => {
+            const next = e.target.value as DefaultAction
+            if (neverArchive && next === 'archive') return
+            void onActionChange(category.id, next)
+          }}
+          className="shrink-0 rounded border border-gray-200 bg-white px-1.5 py-1 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-gray-900"
+          data-testid="category-action-select"
+          data-never-archive={String(neverArchive)}
+          aria-label={`Default action for ${category.name}`}
+          title={neverArchive ? NEVER_ARCHIVE_NOTE : undefined}
+        >
+          {ACTION_OPTIONS.map(a => (
+            <option key={a} value={a} disabled={neverArchive && a === 'archive'}>
+              {ACTION_LABELS[a]}
+              {neverArchive && a === 'archive' ? ' — not allowed' : ''}
+            </option>
+          ))}
+        </select>
+        {neverArchive ? (
+          <span
+            data-testid="never-archive-note"
+            className="max-w-[13rem] text-right text-[9px] leading-tight text-amber-800"
+          >
+            {NEVER_ARCHIVE_NOTE}
+          </span>
+        ) : null}
+      </span>
 
       {/* Phase 7 — per-category autonomy bar */}
       <ThresholdInput category={category} onThresholdChange={onThresholdChange} />
@@ -422,7 +456,7 @@ function NewCategoryRow({ onAdd }: { onAdd: (name: string) => Promise<void> }) {
 
 // ---- Main TaxonomyEditor ----
 
-export function TaxonomyEditor() {
+export function TaxonomyEditor({ dryRun }: { dryRun?: boolean } = {}) {
   const [categories, setCategories] = useState<Category[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
@@ -516,6 +550,12 @@ export function TaxonomyEditor() {
   }, [])
 
   return (
+    <div id="taxonomy" data-testid="settings-taxonomy" className="space-y-3">
+    {/* Phase 9 — screen 26. The taxonomy derived from the user's own senders
+        sits above the hand-edited list, because rebuilding is now the primary
+        way a user gets a taxonomy that fits their mail. */}
+    <TaxonomyDiscovery categories={categories} onApplied={() => void load()} dryRun={dryRun} />
+
     <section aria-label="Taxonomy editor" className="space-y-2 rounded-lg border border-gray-200 bg-white p-3">
       <div className="flex items-center justify-between gap-2">
         <div>
@@ -571,5 +611,6 @@ export function TaxonomyEditor() {
         />
       ) : null}
     </section>
+    </div>
   )
 }

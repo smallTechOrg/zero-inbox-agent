@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '@/lib/api'
 import {
+  REMAINDER_ONLY_WHEN_NONZERO,
   REMAINDER_ORDER,
   type Category,
   type RemainderBuckets,
@@ -65,6 +66,9 @@ const BUCKET_LABEL: Record<keyof RemainderBuckets, string> = {
   below_threshold: 'not confident enough to archive on its own',
   held_by_never_miss: 'held by never-miss',
   unclassified: 'decided before this policy existed',
+  // Phase 9 (ui.md screen 28) — shown only when non-zero.
+  no_never_miss_label: 'kept in your inbox because no never-miss label could be resolved',
+  unreviewed_applied: 'archived before the reviewer covered every action (historic)',
 }
 
 /** The bucket sub-line — *why* it is held, in the user's terms. */
@@ -77,6 +81,19 @@ const BUCKET_REASON: Record<keyof RemainderBuckets, string> = {
   held_by_never_miss:
     'You have replied to these, they are from someone on your VIP list, or they look time-sensitive. This is the never-miss guarantee doing its job — the agent will never archive these behind your back.',
   unclassified: 'Decided by an earlier run, before your current policy existed.',
+  no_never_miss_label:
+    'The agent judged these too important to archive quietly, but could not resolve the label they belong under — so it left them where you can see them rather than archiving them unlabelled. Restoring the Urgent, Important or People category fixes this.',
+  unreviewed_applied:
+    'These were archived by an older build before every action was audited by the reviewer. They are counted here rather than quietly re-marked as reviewed — the database should not assert a review that never happened. Nothing was deleted; all of it is still in Gmail under its label.',
+}
+
+/** The never-miss labels, in the precedence the agent resolves them.
+ *  `ZeroInbox/{Urgent,Important,People}` — one click away in Gmail. */
+const NEVER_MISS_ORDER = ['urgent', 'important', 'people'] as const
+
+/** Deep-link to a Gmail label. Gmail encodes `/` in a label path as `-`. */
+export function gmailLabelUrl(labelName: string): string {
+  return `https://mail.google.com/mail/u/0/#label/${encodeURIComponent(labelName)}`
 }
 
 /** "A", "A and B", "A, B and C" — the taxonomy read back in the user's words. */
@@ -108,6 +125,9 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
   const [retryingReview, setRetryingReview] = useState(false)
   const [retryReviewError, setRetryReviewError] = useState<string | null>(null)
   const [categories, setCategories] = useState<Category[] | null>(null)
+  /** Live Gmail label counts, so "one click away in Gmail" can say how much is
+   *  there. Best-effort: the statement stands without the numbers. */
+  const [labelCounts, setLabelCounts] = useState<Record<string, number> | null>(null)
 
   const load = useCallback(async () => {
     if (!runId) return
@@ -137,6 +157,17 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
       })
       .catch(() => {
         // The ledger is still fully useful without the names.
+      })
+    void api
+      .inboxSummary()
+      .then(s => {
+        if (cancelled) return
+        const counts: Record<string, number> = {}
+        for (const c of s.categories ?? []) counts[c.key] = c.count
+        setLabelCounts(counts)
+      })
+      .catch(() => {
+        // Best-effort: the never-miss statement renders without the counts.
       })
     return () => {
       cancelled = true
@@ -397,6 +428,55 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
         <p className="mt-1 italic text-gray-500">Change which categories leave → Settings → Taxonomy</p>
       </div>
 
+      {/* Phase 9 (ui.md screen 28) — the redefinition, in plain words.
+          Never-miss mail no longer sits in the inbox: it is archived UNDER ITS
+          OWN LABEL, never deleted, one click away. The user must not have to
+          infer that, so it is stated, with the labels as working links. */}
+      <div
+        data-testid="never-miss-labels"
+        className="rounded-lg border border-gray-200 bg-white p-3 text-xs leading-relaxed text-gray-700"
+      >
+        <p className="font-bold text-gray-900">
+          Mail we judged important was archived under its own label — not deleted.
+        </p>
+        <p className="mt-1">
+          Anything time-sensitive, from someone you reply to, or on your VIP list leaves your inbox
+          into its own Gmail label instead of sitting there. It is one click away in the Gmail
+          sidebar, each thread marked with why it was held, and every move is undoable.
+        </p>
+        <ul className="mt-2 flex flex-wrap gap-2">
+          {NEVER_MISS_ORDER.map(key => {
+            const cat = (categories ?? []).find(c => c.key === key)
+            const labelName = cat?.channel_label_name ?? `ZeroInbox/${key[0].toUpperCase()}${key.slice(1)}`
+            const count = labelCounts?.[key]
+            return (
+              <li key={key}>
+                <a
+                  href={gmailLabelUrl(labelName)}
+                  target="_blank"
+                  rel="noreferrer"
+                  data-testid={`never-miss-label-${key}`}
+                  data-label-name={labelName}
+                  className="inline-flex items-baseline gap-1.5 rounded border border-gray-300 bg-gray-50 px-2 py-1 font-mono text-[11px] text-gray-800 hover:bg-gray-100 focus:ring-2 focus:ring-gray-500 focus:outline-none"
+                >
+                  {labelName}
+                  {typeof count === 'number' ? (
+                    <span className="font-sans font-bold tabular-nums text-gray-900">
+                      {count.toLocaleString()}
+                    </span>
+                  ) : null}
+                </a>
+              </li>
+            )
+          })}
+        </ul>
+        <p className="mt-1 text-[11px] text-gray-500">
+          Nothing is ever deleted, trashed or marked as spam — the agent has no such power. Use{' '}
+          <span className="font-semibold">Undo this run</span> to bring every one of them back to the
+          inbox exactly as it was.
+        </p>
+      </div>
+
       {/* The remainder ledger — what is held, and why, per bucket.
           Buckets at zero are de-emphasised (greyed, and labelled "none") but
           never hidden: ui.md #16 and the Phase-7 Playwright assertion both
@@ -408,8 +488,10 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
       <ul data-testid="remainder-ledger" className="divide-y divide-gray-100 rounded-lg border border-gray-200">
         {REMAINDER_ORDER.map(bucket => {
           const count = ledger.remainder?.[bucket] ?? 0
-          // `unclassified` is the one bucket rendered only when > 0 (ui.md #16).
-          if (bucket === 'unclassified' && count === 0) return null
+          // `unclassified` (ui.md #16) and the two Phase-9 buckets (ui.md #28)
+          // are the only ones rendered solely when > 0. Every other bucket
+          // renders at zero, labelled "none".
+          if (REMAINDER_ONLY_WHEN_NONZERO.includes(bucket) && count === 0) return null
           const zero = count === 0
           const label =
             bucket === 'category_keep' && keepCategoryNames.length > 0

@@ -27,6 +27,7 @@ import time
 import pytest
 from sqlalchemy import event, select
 
+from graph.autonomy import APPLIABLE_AUTONOMY_STATES
 from graph.runner import execute_triage
 
 from tests.integration._threads_fixture import (
@@ -266,7 +267,10 @@ def test_a_realistic_archive_reaches_applied_end_to_end(applied_run):
         for decision in applied:
             assert decision.review_state == "reviewed"
             assert decision.proposed_action in ("archive", "digest")
-            assert decision.autonomy_state == "auto_act"
+            # Phase 9: `held_by_never_miss` is appliable too — as a labelled,
+            # undoable archive. `graph.autonomy.APPLIABLE_AUTONOMY_STATES` is the
+            # one place that set is written down.
+            assert decision.autonomy_state in APPLIABLE_AUTONOMY_STATES
             logs = list(
                 session.execute(
                     select(ActionLog).where(ActionLog.decision_id == decision.id)
@@ -308,24 +312,56 @@ def test_distance_to_zero_is_zero_on_a_healthy_run(applied_run):
 
     ledger = _ledger(applied_run)
     with create_db_session() as session:
-        auto_act = len(
+        # Phase 9: the agent's own "this should leave the inbox" set is
+        # `auto_act` PLUS the never-miss holds it resolved a label for. Counting
+        # `auto_act` alone here would silently under-report the reframe.
+        appliable = len(
             list(
                 session.execute(
-                    select(Decision).where(Decision.autonomy_state == "auto_act")
+                    select(Decision).where(
+                        Decision.autonomy_state.in_(sorted(APPLIABLE_AUTONOMY_STATES)),
+                        Decision.proposed_action.in_(["archive", "digest"]),
+                    )
                 ).scalars()
             )
         )
-    assert ledger["applied"] == auto_act
+    assert ledger["applied"] == appliable
     assert ledger["distance_to_zero"] == 0
     assert distance_to_zero(applied_run["run_id"], USER_ID) == 0
 
 
 def test_never_miss_still_binds_after_realignment(applied_run):
-    """Gate 9 — no VIP, ever-replied or time-sensitive thread is ever archived."""
-    from db.models import Decision, Item
+    """Gate 9 — no VIP, ever-replied or time-sensitive thread is ever archived
+    **without its never-miss label** (Phase 9).
+
+    THE ONE ASSERTION UPDATED BY PHASE 9 SLICE 3, and the only change in this
+    file. It used to read::
+
+        assert item.from_email not in REPLIED_SENDERS
+        assert not decision.time_sensitive
+
+    i.e. *a `held_by_never_miss` thread remains in the inbox* — the pre-Phase-9
+    semantic. That semantic put a 227-thread floor under a product whose promise
+    is zero. From Phase 9 the same verdict is expressed as **archive under
+    `ZeroInbox/People` / `ZeroInbox/Urgent` / `ZeroInbox/Important`**: the thread
+    is one click away under a label naming the reason, and it is undoable.
+
+    The guarantee being asserted is unchanged in substance and is, if anything,
+    stronger: a never-miss thread may leave the inbox **only** under a never-miss
+    label, never bare. See
+    `spec/capabilities/never-miss-safeguards.md § Phase 9`.
+    """
+    from db.models import Category, Decision, Item
     from db.session import create_db_session
+    from graph.autonomy import NEVER_MISS_CATEGORY_KEYS
 
     with create_db_session() as session:
+        never_miss_category_ids = {
+            row.id
+            for row in session.execute(
+                select(Category).where(Category.key.in_(list(NEVER_MISS_CATEGORY_KEYS)))
+            ).scalars()
+        }
         rows = list(
             session.execute(
                 select(Decision, Item).join(Item, Item.id == Decision.item_id)
@@ -334,28 +370,51 @@ def test_never_miss_still_binds_after_realignment(applied_run):
         for decision, item in rows:
             if decision.status != "applied":
                 continue
-            assert item.from_email not in REPLIED_SENDERS, item.from_email
-            assert not decision.time_sensitive
+            if item.from_email in REPLIED_SENDERS or decision.time_sensitive:
+                assert decision.autonomy_state == "held_by_never_miss", decision.reasoning
+                assert decision.category_id in never_miss_category_ids, (
+                    "a never-miss thread may only ever be archived UNDER a "
+                    "never-miss label — a bare archive is not a permitted operation"
+                )
+                labels = set(item.channel_labels or [])
+                assert "INBOX" not in labels
+                assert labels, "the thread must carry its never-miss label"
 
 
 def test_urgent_and_people_are_untouchable(applied_run):
-    """Gate 10 — a `keep` category is never auto-acted on, at any confidence."""
+    """Gate 10 — a `keep` category is never auto-acted on, at any confidence.
+
+    Phase 9 sharpens rather than relaxes this. The forbidden thing was, and still
+    is, a **category-wide sweep**: `auto_act` on a category whose default is
+    `keep`. A per-thread never-miss archive INTO People/Urgent/Important is a
+    different operation — caused by the signal firing, always labelled, always
+    undoable — and it was never what this gate protected against. See
+    `spec/capabilities/never-miss-safeguards.md § NEVER_ARCHIVE_KEYS reconciled`.
+    """
     from db.models import Category, Decision
     from db.session import create_db_session
 
     with create_db_session() as session:
-        keep_category_ids = {
-            row.id
+        keep_categories = {
+            row.id: row.key
             for row in session.execute(
                 select(Category).where(Category.default_action == "keep")
             ).scalars()
         }
         rows = list(session.execute(select(Decision)).scalars())
         for decision in rows:
-            if decision.category_id in keep_category_ids:
+            if decision.category_id not in keep_categories:
+                continue
+            assert decision.autonomy_state != "auto_act", (
+                "a keep category is never swept as noise, at any confidence"
+            )
+            if decision.status == "applied":
+                assert decision.autonomy_state == "held_by_never_miss"
+                assert keep_categories[decision.category_id] in (
+                    "people", "urgent", "important",
+                ), decision.reasoning
+            else:
                 assert decision.proposed_action == "keep", decision.reasoning
-                assert decision.autonomy_state != "auto_act"
-                assert decision.status != "applied"
 
 
 def test_every_action_log_is_non_destructive(applied_run):

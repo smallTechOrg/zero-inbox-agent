@@ -29,12 +29,30 @@ REMAINDER_BUCKETS = (
     "needs_your_call",
     "category_keep",
     "held_by_never_miss",
+    "no_never_miss_label",
     "below_threshold",
     "unclassified",
 )
 
 #: Statuses that mean the thread has actually left the inbox.
 _APPLIED_STATUS = "applied"
+
+#: Phase 9. ``held_by_never_miss`` used to be a terminal bucket — the verdict was
+#: "leave it in the inbox", so 227 threads sat there permanently. From Phase 9 the
+#: verdict is "archive it under the label that names why", so a never-miss row is
+#: only still in the inbox for one of two reasons, and they are reported apart
+#: because they need different fixes:
+#:
+#: * ``no_never_miss_label`` — no never-miss category resolved (the user deleted
+#:   People, say), so the reframe **deliberately did not archive it**. Nothing
+#:   went wrong; the thread is safe, and the fix is to restore the category.
+#: * ``held_by_never_miss`` — a label DID resolve and the archive was attempted
+#:   and did not land. Something went wrong, and the run says so.
+#:
+#: The split is derived from ``proposed_action``: the reframe sets ``archive`` when
+#: it resolved a label and leaves the row a ``keep`` when it could not. No schema
+#: change, and no way for the two to be conflated.
+_LEAVING_ACTIONS = ("archive", "digest")
 
 
 def remainder_ledger(session: Session, *, run_id: str, user_id: str) -> dict[str, Any]:
@@ -57,12 +75,17 @@ def remainder_ledger(session: Session, *, run_id: str, user_id: str) -> dict[str
     # One grouped SELECT. ORM column expressions only — no raw SQL string, so the
     # NULL grouping behaves identically on SQLite and PostgreSQL.
     rows = session.execute(
-        select(Decision.autonomy_state, Decision.status, func.count(Decision.id))
+        select(
+            Decision.autonomy_state,
+            Decision.status,
+            Decision.proposed_action,
+            func.count(Decision.id),
+        )
         .where(Decision.run_id == run_id, Decision.user_id == user_id)
-        .group_by(Decision.autonomy_state, Decision.status)
+        .group_by(Decision.autonomy_state, Decision.status, Decision.proposed_action)
     ).all()
 
-    for autonomy_state, status, count in rows:
+    for autonomy_state, status, proposed_action, count in rows:
         count = int(count or 0)
         if status == _APPLIED_STATUS:
             # Out of the inbox. Counted once, here, whatever its autonomy state.
@@ -70,6 +93,15 @@ def remainder_ledger(session: Session, *, run_id: str, user_id: str) -> dict[str
             continue
         if autonomy_state == AUTO_ACT:
             distance_to_zero += count
+            continue
+        if (
+            autonomy_state == "held_by_never_miss"
+            and proposed_action not in _LEAVING_ACTIONS
+        ):
+            # The reframe found no never-miss label for it and deliberately left
+            # it in the inbox. Reported under its own name, never folded into
+            # the "we tried and failed" bucket.
+            buckets["no_never_miss_label"] += count
             continue
         bucket = autonomy_state if autonomy_state in buckets else None
         if bucket is None:
@@ -109,6 +141,40 @@ def remainder_ledger(session: Session, *, run_id: str, user_id: str) -> dict[str
         "apply_ok": apply_failed_reason is None and distance_to_zero == 0,
         "apply_failed_reason": apply_failed_reason,
         "dry_run": dry_run,
+        # Phase 9, item zero — the honest count of decisions that were APPLIED to
+        # the user's mailbox while carrying a `review_state` that never became
+        # `reviewed`. Live at the time of writing: 44. Migration `0008` refuses to
+        # rewrite them, because rewriting them would make the database assert a
+        # review that never happened; so the number is stated instead.
+        #
+        # It is deliberately NOT a remainder bucket: those threads are out of the
+        # inbox, so folding them in would break
+        # `inbox_remaining == sum(remainder) + distance_to_zero`. It is user-wide,
+        # not run-scoped, because the rows it counts pre-date this run.
+        "unreviewed_applied": unreviewed_applied_count(session, user_id=user_id),
         "remainder": {key: buckets[key] for key in REMAINDER_BUCKETS},
         "failures": failures,
     }
+
+
+def unreviewed_applied_count(session: Session, *, user_id: str) -> int:
+    """Decisions already applied to the mailbox that were never actually reviewed.
+
+    The migration-`0008` counterpart, read live: ``status == "applied"`` and
+    ``review_state != "reviewed"``. A row that reads ``review_failed`` or is
+    still ``provisional`` and yet has been applied is a mutation that slipped
+    past a gate which was passing vacuously (Phase 9, item zero). The class is
+    closed going forward; the history is reported, not erased.
+    """
+    from db.models import Decision
+
+    return int(
+        session.execute(
+            select(func.count(Decision.id)).where(
+                Decision.user_id == user_id,
+                Decision.status == _APPLIED_STATUS,
+                Decision.review_state != "reviewed",
+            )
+        ).scalar_one()
+        or 0
+    )

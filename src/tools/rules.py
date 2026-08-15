@@ -18,6 +18,8 @@ DEFAULT_CATEGORY_KEYS = (
     "outreach",
     "people",
     "urgent",
+    # Phase 9. The third never-miss label. See DEFAULT_TAXONOMY below.
+    "important",
 )
 
 DEFAULT_TAXONOMY: list[dict] = [
@@ -69,6 +71,26 @@ DEFAULT_TAXONOMY: list[dict] = [
         "name": "Urgent",
         "description": "Time-sensitive or high-stakes mail: deadlines, legal notices, "
         "security alerts, account lockouts, overdue invoices.",
+        "default_action": "keep",
+    },
+    {
+        # Phase 9 (slice 4). ``Important`` is the third never-miss label, added to
+        # the seed set because the reframe needs somewhere to *put* a never-miss
+        # thread that is neither a person nor time-sensitive. Before Phase 9 those
+        # threads simply stayed in the inbox, which is why 227 of them were still
+        # sitting there. Created rather than reused: no existing category fits
+        # "the reviewer stopped this from being archived", and folding it into
+        # Urgent would make Urgent mean two different things.
+        #
+        # It is in NEVER_ARCHIVE_KEYS (tools/taxonomy.py) — a *category-wide*
+        # archive default here would be a silent bulk sweep of exactly the mail a
+        # human must see. A per-thread never-miss archive into this category is a
+        # different operation and remains permitted.
+        "key": "important",
+        "name": "Important",
+        "description": "Mail the never-miss layer held back for you: high-stakes or "
+        "consequential threads that are neither a personal conversation nor a hard "
+        "deadline, but that you should still see.",
         "default_action": "keep",
     },
 ]
@@ -197,6 +219,69 @@ def apply_rules(items: list[dict], rules: list[dict]) -> tuple[list[dict], list[
         else:
             decisions.append(_rule_decision(item, hit))
     return decisions, unresolved
+
+
+# --- mined tier-1 rules (Phase 9, slice 4) ---------------------------------
+#
+# Discovery converts measured sender concentration into ordinary tier-1 rows.
+# NOTHING below changes `matches()` or `apply_rules()`: a mined rule is a plain
+# `Rule` the existing matcher already understands. That is the whole point — a
+# second classification path would make `counts.by_tier` stop being evidence
+# that the concentration was actually exploited.
+
+#: The only matcher clauses a mined rule may use. All three are already
+#: implemented by ``matches()`` above; the tuple exists so a typo in discovery
+#: fails loudly instead of minting a rule that can never fire.
+MINED_MATCHER_CLAUSES: tuple[str, ...] = ("from_email", "from_domain", "list_id")
+
+#: Mined rules classify from the sender alone, which is a far stronger signal
+#: than any LLM judgement about the same thread — comfortably above the 0.75
+#: ``confidence_floor`` and above the 0.80 autonomy bar, so a mined decision
+#: reaches ``auto_act`` rather than ``below_threshold``.
+MINED_RULE_CONFIDENCE = 0.95
+
+
+def normalise_matcher(matcher: dict | None) -> dict:
+    """Canonical, comparable form of a mined matcher.
+
+    Lower-cases the values and drops empties, so ``{"from_email": "A@B.com"}``
+    and ``{"from_email": "a@b.com "}`` are recognised as the SAME rule on a
+    re-run instead of accumulating a duplicate.
+    """
+    out: dict[str, str] = {}
+    for clause in MINED_MATCHER_CLAUSES:
+        value = (matcher or {}).get(clause)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if clause == "from_domain":
+            text = text.lstrip("@")
+        if text:
+            out[clause] = text
+    return out
+
+
+def mined_rule_action(category_key: str, default_action: str) -> dict:
+    """The ``Rule.action`` blob for a mined rule, in the EXISTING action shape.
+
+    ``_rule_decision`` reads exactly these keys, so a mined rule proposes what
+    its category says and nothing else.
+    """
+    if default_action not in VALID_ACTIONS:
+        raise ValueError(f"default_action must be one of {list(VALID_ACTIONS)}")
+    action: dict = {"set_category": category_key}
+    if default_action in ("archive", "digest"):
+        action[default_action] = True
+    return action
+
+
+def mined_rule_name(matcher: dict, category_key: str) -> str:
+    """A stable, human-readable name — it is what the user sees in Settings."""
+    normalised = normalise_matcher(matcher)
+    for clause in MINED_MATCHER_CLAUSES:
+        if clause in normalised:
+            return f"{normalised[clause]} → {category_key}"
+    return f"mined → {category_key}"
 
 
 def sender_history_decision(item: dict, stats: dict | None) -> dict | None:

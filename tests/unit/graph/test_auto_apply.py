@@ -274,9 +274,16 @@ def test_only_auto_act_rows_are_applied(_isolated_db, monkeypatch):
     assert ledger["applied"] == 1
     assert ledger["below_threshold"] == 1
     assert ledger["needs_your_call"] == 1
-    # held_by_never_miss and the NULL (unclassified) row both stay in the inbox.
-    assert ledger["kept"] == 2
-    assert ledger["distance_to_zero"] == 0
+    # The NULL (unclassified) row stays in the inbox.
+    assert ledger["kept"] == 1
+    # Phase 9: `held_by_never_miss` IS appliable — but only as a labelled archive.
+    # These rows are seeded under `newsletters`, which is not a never-miss
+    # category, so `archive_to_never_miss_label` refuses them and Gmail is never
+    # called for them. A never-miss thread is never archived bare, and the
+    # refusal is counted and named rather than silently swallowed.
+    assert ledger["failed"] == 1
+    assert "NoNeverMissLabelError" in ledger["failures"][0]["error"]
+    assert mutator.archived == ["thread0"]
 
 
 # ------------------------------------------------- the two silent-abort paths

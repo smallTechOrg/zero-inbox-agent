@@ -75,13 +75,22 @@ export type Run = {
   apply_ok?: boolean
 }
 
-/** Phase 7 — GET /api/runs/{run_id}/remainder (spec/api.md § Phase 7). */
+/** Phase 7 — GET /api/runs/{run_id}/remainder (spec/api.md § Phase 7).
+ *
+ * Phase 9 adds two buckets (spec/api.md § Run payload additions):
+ * `no_never_miss_label` — a never-miss verdict with no resolvable label, so the
+ * thread stayed in the inbox rather than being archived unlabelled — and
+ * `unreviewed_applied`, the honest historic count of rows applied before the
+ * review-gate fix landed. Both are optional so a pre-Phase-9 backend still
+ * renders the card. */
 export type RemainderBuckets = {
   needs_your_call: number
   category_keep: number
   held_by_never_miss: number
   below_threshold: number
   unclassified: number
+  no_never_miss_label?: number
+  unreviewed_applied?: number
 }
 
 export type RemainderLedger = {
@@ -102,7 +111,18 @@ export const REMAINDER_ORDER: (keyof RemainderBuckets)[] = [
   'category_keep',
   'below_threshold',
   'held_by_never_miss',
+  'no_never_miss_label',
+  'unreviewed_applied',
   'unclassified',
+]
+
+/** The buckets rendered only when non-zero (ui.md #16 for `unclassified`,
+ *  ui.md #28 for the two Phase-9 additions). Every other bucket always renders,
+ *  even at zero, labelled "none" — state is never carried by colour alone. */
+export const REMAINDER_ONLY_WHEN_NONZERO: (keyof RemainderBuckets)[] = [
+  'unclassified',
+  'no_never_miss_label',
+  'unreviewed_applied',
 ]
 
 export type ClusterKind = 'list' | 'sender' | 'domain' | 'category' | string
@@ -395,4 +415,224 @@ export class ApiError extends Error {
     this.code = code
     this.status = status
   }
+}
+
+// ─── Phase 9 — inbox-derived taxonomy and re-organisation ───────────────────
+//
+// spec/api.md § Phase 9. `lib/api.ts` is not part of this slice's file set, so
+// the Phase-9 client lives here beside its types. Same origin (the static export
+// is served by the same FastAPI process on :8001), same envelope, same errors.
+
+/** The categories that can never be set to `default_action="archive"`.
+ *  Mirrors `src/tools/taxonomy.py::NEVER_ARCHIVE_KEYS` (Phase 9 adds
+ *  `important`). A category-wide archive default is a bulk silent sweep of the
+ *  mail a human must see; a never-miss archive is per thread, always labelled
+ *  and always undoable — different operations, and only the first is blocked. */
+export const NEVER_ARCHIVE_KEYS = ['urgent', 'people', 'legal', 'important'] as const
+
+/** The one sentence the UI owes the user next to that disabled control
+ *  (spec/ui.md screen 29, spec/roadmap.md Phase 9 step 7). */
+export const NEVER_ARCHIVE_NOTE =
+  'kept for you — archived under its own label, never swept as a category.'
+
+export function isNeverArchiveKey(key: string): boolean {
+  return (NEVER_ARCHIVE_KEYS as readonly string[]).includes(key)
+}
+
+/**
+ * One sender's worth of evidence behind a proposed category.
+ *
+ * ASSUMPTION (recorded, not hidden): `spec/api.md` writes `evidence_senders: [...]`
+ * without pinning the element shape. We read the rich object form
+ * `{email, thread_count}` and also accept a bare address string, so a backend
+ * that emits either renders the senders **by name with their thread counts**,
+ * which is what the user-test step actually requires.
+ */
+export type EvidenceSender = {
+  email?: string | null
+  address?: string | null
+  sender?: string | null
+  domain?: string | null
+  list_id?: string | null
+  thread_count?: number | null
+  threads?: number | null
+  count?: number | null
+}
+
+export type EvidenceSenderInput = string | EvidenceSender
+
+/** Normalised for display: an address we can print and a count we can total. */
+export function normaliseEvidenceSender(
+  raw: EvidenceSenderInput,
+): { address: string; threadCount: number | null } {
+  if (typeof raw === 'string') return { address: raw, threadCount: null }
+  const address =
+    raw.email ?? raw.address ?? raw.sender ?? raw.domain ?? raw.list_id ?? 'unknown sender'
+  const count = raw.thread_count ?? raw.threads ?? raw.count ?? null
+  return { address, threadCount: typeof count === 'number' ? count : null }
+}
+
+/** One row of `POST /api/taxonomy/discover`'s proposal. */
+export type DiscoveredCategory = {
+  key: string
+  name: string
+  description: string
+  default_action: DefaultAction
+  rationale: string
+  evidence_senders: EvidenceSenderInput[]
+  covered_threads: number
+  /** Present when the proposal folds existing categories together. */
+  merge_keys?: string[] | null
+}
+
+export type TaxonomyCoverage = {
+  covered_threads: number
+  uncovered_threads: number
+  gap_threads_resolved: number
+  gap_threads_total: number
+  /** Optional split of the gap set, when the backend reports it. */
+  no_fit_resolved?: number | null
+  no_fit_total?: number | null
+  low_confidence_resolved?: number | null
+  low_confidence_total?: number | null
+  total_threads?: number | null
+}
+
+export type TaxonomyDiscoveryResult = {
+  proposal: DiscoveredCategory[]
+  coverage: TaxonomyCoverage
+  partial: boolean
+  partial_reason: string | null
+}
+
+export type TaxonomyApplyDiffRow = {
+  action?: string
+  key?: string
+  name?: string
+}
+
+export type TaxonomyApplyResult = {
+  created?: number | TaxonomyApplyDiffRow[]
+  renamed?: number | TaxonomyApplyDiffRow[]
+  retired?: number | TaxonomyApplyDiffRow[]
+  diff?: TaxonomyApplyDiffRow[]
+  reorg_recommended: boolean
+}
+
+/** The closed set of skip reasons (spec/api.md § Phase 9). Nothing skipped is
+ *  ever invisible, so the UI renders every one of these, zero included. */
+export const REORG_SKIP_REASONS = [
+  'not_reviewed',
+  'no_category_fit',
+  'gmail_error',
+  'already_correct',
+  'dry_run',
+  'cancelled',
+] as const
+
+export type ReorgSkipReason = (typeof REORG_SKIP_REASONS)[number] | string
+
+export type ReorgStatus = 'running' | 'completed' | 'partial' | 'cancelled' | 'failed' | string
+
+export type ReorgLedger = {
+  job_id?: string
+  status: ReorgStatus
+  total: number
+  done: number
+  skipped: Record<ReorgSkipReason, number>
+  undoable: boolean
+  error_message?: string | null
+  /** Optional live detail — rendered when the backend supplies it. */
+  phase?: string | null
+  current_category?: string | null
+  dry_run?: boolean | null
+}
+
+export type ReorgUndoResult = {
+  reversed: number
+  already_undone: number
+  failed: { thread_id: string; reason: string }[]
+}
+
+export const REORG_TERMINAL: ReorgStatus[] = ['completed', 'partial', 'cancelled', 'failed']
+
+export function isReorgActive(status: ReorgStatus): boolean {
+  return !REORG_TERMINAL.includes(status)
+}
+
+/** Sum of a skipped map, tolerant of a backend that omits it entirely. */
+export function skippedTotal(skipped: Record<string, number> | null | undefined): number {
+  if (!skipped) return 0
+  return Object.values(skipped).reduce((n, v) => n + (typeof v === 'number' ? v : 0), 0)
+}
+
+/** Same envelope contract as `lib/api.ts::request`, kept byte-compatible on
+ *  purpose: `{data, error}` with the error code surfaced as `ApiError.code`. */
+async function p9Request<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(path, {
+      ...init,
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    })
+  } catch {
+    throw new ApiError(
+      'network_error',
+      'Could not reach the server — is it running on http://localhost:8001 ?',
+      0,
+    )
+  }
+  let body: Envelope<T> | null = null
+  try {
+    body = (await res.json()) as Envelope<T>
+  } catch {
+    body = null
+  }
+  if (!res.ok || body?.error) {
+    throw new ApiError(
+      body?.error?.code ?? `http_${res.status}`,
+      body?.error?.message ?? `Request to ${path} failed (${res.status}).`,
+      res.status,
+    )
+  }
+  return body?.data as T
+}
+
+export const phase9Api = {
+  taxonomy: {
+    /** Proposal only. Mutates nothing — no category, no label, no mail. */
+    discover: () =>
+      p9Request<TaxonomyDiscoveryResult>('/api/taxonomy/discover', { method: 'POST' }),
+    /** Applies the (optionally user-edited) proposal. This is the first call
+     *  in the flow that changes anything. */
+    apply: (proposal: DiscoveredCategory[]) =>
+      p9Request<TaxonomyApplyResult>('/api/taxonomy/apply', {
+        method: 'POST',
+        body: JSON.stringify({ proposal }),
+      }),
+  },
+  reorg: {
+    start: (dryRun?: boolean) =>
+      p9Request<{ job_id: string }>('/api/reorg', {
+        method: 'POST',
+        body: JSON.stringify(dryRun === undefined ? {} : { dry_run: dryRun }),
+      }),
+    ledger: (jobId: string) =>
+      p9Request<ReorgLedger>(`/api/reorg/${encodeURIComponent(jobId)}`),
+    cancel: (jobId: string) =>
+      p9Request<ReorgLedger>(`/api/reorg/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' }),
+    /** Bulk undo — the whole re-organisation as ONE operation, idempotent. */
+    undo: (jobId: string) =>
+      p9Request<ReorgUndoResult>(`/api/reorg/${encodeURIComponent(jobId)}/undo`, {
+        method: 'POST',
+      }),
+  },
+  categories: {
+    /** The verification step that must precede any category deletion. */
+    usage: (categoryId: string) =>
+      p9Request<{ decisions: number; rules: number; items: number }>(
+        `/api/categories/${encodeURIComponent(categoryId)}/usage`,
+      ),
+  },
 }

@@ -150,6 +150,7 @@ class TestHealthyRun:
             "needs_your_call": 213,
             "category_keep": 1314,
             "held_by_never_miss": 34,
+            "no_never_miss_label": 0,
             "below_threshold": 71,
             "unclassified": 0,
         }

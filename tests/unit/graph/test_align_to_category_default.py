@@ -95,6 +95,31 @@ def test_the_reasoning_names_the_category_and_the_threshold():
     assert "Looks like a bulk newsletter." in out["reasoning"]
 
 
+def _assert_not_swept_as(out: dict, category: str) -> None:
+    """The exclusion held: this thread was NOT realigned to `category`'s default.
+
+    **Phase 9 update.** The exclusion has always meant "this thread is not swept
+    as a <category>". Before Phase 9 the only way to express that was to leave it
+    a `keep`; from Phase 9 a deterministic never-miss hold (VIP, ever-replied,
+    time-sensitive) is instead proposed as an archive **under its own never-miss
+    label**, precisely so the second-pass reviewer audits it — an unaudited row
+    can never be mutated, so a never-miss archive that skipped the reviewer would
+    silently never happen (`graph.nodes_autonomy._preresolve_never_miss_for_review`).
+
+    What must never happen, and is asserted here, is the thread being swept as
+    routine mail of its original category.
+    """
+    from graph.autonomy import NEVER_MISS_CATEGORY_KEYS
+
+    if out["proposed_action"] == "keep":
+        return
+    assert out["category"] in NEVER_MISS_CATEGORY_KEYS, out
+    assert out["category"] != category, (
+        f"a never-miss thread must never be swept as a {category} — that is the "
+        "exclusion this test exists for"
+    )
+
+
 def test_a_digest_category_converts_to_digest_not_archive():
     out = _run([_decision(category="digestible", confidence=0.9)])[0]
     assert out["proposed_action"] == "digest"
@@ -125,7 +150,7 @@ def test_a_time_sensitive_receipt_at_095_is_never_moved():
     # never-miss layer, not the category default, is the right instrument for
     # the exception — a receipt that genuinely needs action stays visible.
     out = _run([_decision(category="receipts", confidence=0.95, time_sensitive=True)])[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "receipts")
 
 
 # --- Rule C1: every exclusion, one at a time ---------------------------------
@@ -152,7 +177,7 @@ def test_exclusion_a_rule_decision_is_never_realigned_at_any_confidence():
 
 def test_exclusion_time_sensitive_is_never_realigned():
     out = _run([_decision(confidence=0.99, time_sensitive=True)])[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "newsletters")
 
 
 def test_exclusion_unsure_is_never_realigned():
@@ -165,22 +190,22 @@ def test_exclusion_an_ever_replied_sender_is_never_realigned():
         [_decision(confidence=0.99)],
         sender_stats={"news@substack.com": {"ever_replied": True}},
     )[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "newsletters")
 
 
 def test_exclusion_a_vip_email_is_never_realigned():
     out = _run([_decision(confidence=0.99)], vip={"emails": ["news@substack.com"]})[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "newsletters")
 
 
 def test_exclusion_a_vip_domain_is_never_realigned():
     out = _run([_decision(confidence=0.99)], vip={"domains": ["substack.com"]})[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "newsletters")
 
 
 def test_exclusion_a_vip_keyword_is_never_realigned():
     out = _run([_decision(confidence=0.99)], vip={"keywords": ["weekly"]})[0]
-    assert out["proposed_action"] == "keep"
+    _assert_not_swept_as(out, "newsletters")
 
 
 def test_exclusion_an_unknown_category_is_never_realigned():

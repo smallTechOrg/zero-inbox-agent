@@ -37,7 +37,22 @@ URGENT_KEY = "urgent"
 #: from real people. The never-miss layer would still hold anyone previously
 #: replied to, any VIP and anything time-sensitive — but a stranger's genuine
 #: first email is exactly the mail this product must never lose.
-NEVER_ARCHIVE_KEYS: frozenset[str] = frozenset({URGENT_KEY, "people", "legal"})
+#: Phase 9 adds ``important``. The reframe makes never-miss mail *leave* the
+#: inbox into ``ZeroInbox/{Urgent,Important,People}``, which could look like a
+#: reason to drop this guard. It is not, and the distinction is the one this
+#: phase is built on:
+#:
+#: * a **category-wide** ``default_action="archive"`` is a bulk, silent, standing
+#:   sweep of every thread that lands in the category — including a stranger's
+#:   genuine first email;
+#: * a **never-miss archive** is per thread, caused by the signal firing, always
+#:   carries its label and always carries an undo token.
+#:
+#: The guard blocked the first and never blocked the second, so it survives the
+#: reframe intact and now covers ``important`` too.
+NEVER_ARCHIVE_KEYS: frozenset[str] = frozenset(
+    {URGENT_KEY, "people", "legal", "important"}
+)
 
 
 class _Unset:
@@ -104,6 +119,13 @@ def _validate_action(key: str, default_action: str) -> None:
             f"The {key.title()} category can never carry default_action=archive — "
             "it is mail a human must see."
         )
+
+
+#: Public name for the guard above. Phase 9's mined-rule materialiser must apply
+#: the SAME check that ``create_category`` / ``update_category`` apply — a mined
+#: rule that archives into ``people`` is rejected at materialisation, not written
+#: and filtered later. Sharing the one function is what stops the two drifting.
+validate_default_action = _validate_action
 
 
 def validate_auto_act_threshold(value: float | None) -> float | None:
@@ -244,10 +266,12 @@ def sync_labels(session: Session, user_id: str, label_client: LabelClient) -> li
 
 __all__ = [
     "DEFAULT_TAXONOMY",
+    "NEVER_ARCHIVE_KEYS",
     "TaxonomyError",
     "LabelClient",
     "URGENT_KEY",
     "UNSET",
+    "validate_default_action",
     "validate_auto_act_threshold",
     "ensure_default_taxonomy",
     "list_categories",

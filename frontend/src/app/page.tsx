@@ -20,6 +20,12 @@ import { ResumeBanner } from '@/components/ResumeBanner'
 import { InboxZeroCard } from '@/components/InboxZeroCard'
 import { LiveRunFeed } from '@/components/LiveRunFeed'
 import { ActivityDrawer, openActivityDrawer } from '@/components/ActivityDrawer'
+import {
+  ReorganiseCard,
+  forgetReorgJob,
+  onReorgStarted,
+  readRememberedReorgJob,
+} from '@/components/ReorganiseCard'
 
 /**
  * In flight = not terminal AND not `resumable`.
@@ -95,6 +101,26 @@ export default function Dashboard() {
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [activeView, setActiveView] = useState<'triage' | 'settings'>('triage')
+
+  /**
+   * Phase 9 — the re-organisation job whose progress card belongs in the MAIN
+   * column (ui.md screen 27).
+   *
+   * It is started from Settings → Taxonomy, so the id arrives on a window event
+   * (and is parked in localStorage, so a reload or a tab switch never loses
+   * sight of a job that is still running). Switching the user back to the
+   * triage view on start is the point: the card must be visible with **no
+   * clicks**, and it self-updates from there.
+   */
+  const [reorgJobId, setReorgJobId] = useState<string | null>(null)
+
+  useEffect(() => {
+    setReorgJobId(readRememberedReorgJob())
+    return onReorgStarted(jobId => {
+      setReorgJobId(jobId)
+      setActiveView('triage')
+    })
+  }, [])
 
   const [clusters, setClusters] = useState<Cluster[] | null>(null)
   const [clustersLoading, setClustersLoading] = useState(false)
@@ -402,6 +428,18 @@ export default function Dashboard() {
                 autoActThreshold={me?.settings.auto_act_threshold ?? null}
                 confidenceFloor={me?.settings.confidence_floor ?? null}
               />
+
+              {/* Phase 9 — screen 27. In the main column, above the live feed,
+                  polling itself. Never drawer-only, never behind a click. */}
+              {reorgJobId ? (
+                <ReorganiseCard
+                  jobId={reorgJobId}
+                  onDismiss={() => {
+                    forgetReorgJob()
+                    setReorgJobId(null)
+                  }}
+                />
+              ) : null}
 
               {run && !RUN_ACTIVE(run.status) ? (
                 <RunSummaryCard

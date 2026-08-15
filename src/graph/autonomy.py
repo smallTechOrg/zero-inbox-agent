@@ -51,6 +51,31 @@ AUTONOMY_STATES = (
 #: Actions that take a thread out of the inbox.
 LEAVING_ACTIONS = ("archive", "digest")
 
+#: Phase 9 — the three never-miss labels, in resolution precedence order.
+#:
+#: ``people`` is a claim about a *relationship* (a VIP, or someone the user has
+#: genuinely replied to); ``urgent`` is a claim about *time*; ``important`` is
+#: what is left when the second-pass reviewer said "the user would be upset to
+#: miss this" for any other reason. They are checked in that order and the first
+#: match wins, so the label always names the strongest thing known about the
+#: thread rather than whichever guard happened to fire last.
+PEOPLE_KEY = "people"
+URGENT_KEY = "urgent"
+IMPORTANT_KEY = "important"
+NEVER_MISS_CATEGORY_KEYS: tuple[str, ...] = (PEOPLE_KEY, URGENT_KEY, IMPORTANT_KEY)
+
+#: The ``autonomy_state`` values whose decisions the apply pass is allowed to act
+#: on. Before Phase 9 this was ``auto_act`` alone, and that is precisely why 227
+#: threads could never leave the inbox: a never-miss verdict was expressed as
+#: "stay put", so the state that named the verdict also blocked the mutation.
+#:
+#: From Phase 9 a never-miss verdict is expressed as *archive under the label
+#: that names the reason*, so ``held_by_never_miss`` is appliable too — but only
+#: through :func:`tools.actions.archive_to_never_miss_label`, which refuses to
+#: run without a resolved never-miss label. ``auto_act`` keeps its own,
+#: unchanged path. Nothing else is ever appliable.
+APPLIABLE_AUTONOMY_STATES: frozenset[str] = frozenset({"auto_act", "held_by_never_miss"})
+
 #: Most-conservative-first. Used to break ties when refreshing a cluster action.
 _ACTION_CONSERVATISM = ("keep", "digest", "archive")
 
@@ -219,6 +244,60 @@ def classify_autonomy_state(
     return "below_threshold"
 
 
+def never_miss_category_key(
+    decision: dict,
+    item: dict | None,
+    *,
+    vip: dict | None = None,
+    sender_stats: dict | None = None,
+) -> str | None:
+    """Phase 9 — which never-miss label expresses this verdict? First match wins.
+
+    ``spec/capabilities/never-miss-safeguards.md § Phase 9 — how a never-miss
+    verdict is expressed``:
+
+    1. VIP match or ``ever_replied`` (post-correspondent-truth) -> ``people``
+    2. ``time_sensitive`` -> ``urgent``
+    3. a reviewer flip for any other reason -> ``important``
+    4. otherwise -> ``None``
+
+    Deterministic and free: no LLM, no session, no I/O. ``None`` is a real
+    answer, not a failure — it means *this thread stays in the inbox and the
+    ledger names it under* ``no_never_miss_label``. Silence is never the
+    fallback: an unresolvable label must never become a bare archive.
+
+    The caller is responsible for only asking about decisions whose
+    ``autonomy_state`` is ``held_by_never_miss``. Asking about any other
+    decision is meaningless — a VIP thread the agent is confident about is an
+    ``auto_act`` archive under its *own* category, not a never-miss label.
+    """
+    if is_vip(item, vip) or has_reply_history(item, sender_stats):
+        return PEOPLE_KEY
+    if decision.get("time_sensitive"):
+        return URGENT_KEY
+    if decision.get("decided_by") == "reviewer":
+        return IMPORTANT_KEY
+    return None
+
+
+def never_miss_reasoning(category: dict) -> str:
+    """The one plain sentence appended when a never-miss verdict becomes a label.
+
+    It names the Gmail label, so the history view and the thread itself both
+    explain, without a lookup, where the mail went and that it is one click
+    away rather than gone.
+    """
+    label = (
+        category.get("channel_label_name")
+        or f"ZeroInbox/{category.get('name') or category.get('key') or 'Important'}"
+    )
+    return (
+        f"This is mail you must not miss, so instead of leaving it in your inbox the "
+        f"agent files it under {label}, where it stays one click away and can be put "
+        "back at any time."
+    )
+
+
 def _most_conservative(actions: list[str]) -> str:
     for action in _ACTION_CONSERVATISM:
         if action in actions:
@@ -256,11 +335,18 @@ def refresh_cluster_actions(clusters: list[dict], decisions: list[dict]) -> list
 
 
 __all__ = [
+    "APPLIABLE_AUTONOMY_STATES",
     "AUTONOMY_STATES",
     "DEFAULT_AUTO_ACT_THRESHOLD",
+    "IMPORTANT_KEY",
     "LEAVING_ACTIONS",
     "MODEL_CEILING_WARNING_THRESHOLD",
+    "NEVER_MISS_CATEGORY_KEYS",
+    "PEOPLE_KEY",
+    "URGENT_KEY",
     "alignment_reasoning",
+    "never_miss_category_key",
+    "never_miss_reasoning",
     "classify_autonomy_state",
     "effective_threshold",
     "has_reply_history",

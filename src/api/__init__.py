@@ -204,6 +204,33 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.include_router(digest.router)
 
+    # Phase 9 — inbox-derived taxonomy (slice 4):
+    #   POST   /api/taxonomy/discover, POST /api/taxonomy/apply
+    #   DELETE /api/categories/{id}          (refused while anything references it)
+    #   GET    /api/categories/{id}/usage    (the verification step before any delete)
+    from api import categories_usage, taxonomy_discovery
+
+    app.include_router(taxonomy_discovery.router)
+    app.include_router(categories_usage.router)
+
+    # Phase 9 — the re-organisation job (slice 5). That slice EXPORTS the router
+    # and deliberately does not mount it: this file has exactly one owner, so the
+    # eight concurrent slices cannot collide here. Mounted defensively for the
+    # window in which slice 5 has not yet landed — an unmounted route is visible
+    # and loud, whereas an ImportError at startup takes the whole server down and
+    # would block every other slice's gate.
+    try:
+        from api import reorganise
+
+        app.include_router(reorganise.router)
+    except ImportError:  # pragma: no cover - only before the reorganisation slice lands
+        import sys
+
+        print(
+            "WARNING: api.reorganise not found — /api/reorg/* routes are NOT mounted",
+            file=sys.stderr,
+        )
+
     # GET /api/provider-health (Phase 6, slice 3). Mounted defensively so the app
     # still boots while that slice is in flight.
     try:

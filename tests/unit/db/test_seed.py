@@ -2,7 +2,7 @@
 
 The Phase-1 gate found 0 category rows, so every decisions.category_id was NULL
 and the UI showed category:null. spec/capabilities/taxonomy-management.md:
-"A new user is seeded with the six default categories."
+"A new user is seeded with the default categories."
 """
 
 from __future__ import annotations
@@ -10,7 +10,12 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from db.seed import ensure_default_taxonomy
-from tools.rules import DEFAULT_CATEGORY_KEYS
+from tools.rules import DEFAULT_CATEGORY_KEYS, DEFAULT_TAXONOMY
+
+#: Bound to the canonical list rather than hardcoded, so adding a seed category
+#: (Phase 9 added ``important``) cannot make this assertion drift out of date
+#: while still asserting an EXACT count.
+SEED_COUNT = len(DEFAULT_TAXONOMY)
 
 USER_ID = "user-seed"
 
@@ -30,13 +35,13 @@ def _categories(session, user_id=USER_ID):
 
 
 class TestEnsureDefaultTaxonomy:
-    def test_a_new_user_gets_exactly_the_six_defaults(self, _isolated_db):
+    def test_a_new_user_gets_exactly_the_defaults(self, _isolated_db):
         with _session() as session:
             created = ensure_default_taxonomy(session, USER_ID)
             session.commit()
             rows = _categories(session)
 
-        assert created == 6
+        assert created == SEED_COUNT
         assert {r.key for r in rows} == set(DEFAULT_CATEGORY_KEYS)
         assert all(r.is_default for r in rows)
         assert all(r.channel_label_name == f"ZeroInbox/{r.name}" for r in rows)
@@ -49,7 +54,7 @@ class TestEnsureDefaultTaxonomy:
             ensure_default_taxonomy(session, USER_ID)
             assert ensure_default_taxonomy(session, USER_ID) == 0
             session.commit()
-            assert len(_categories(session)) == 6
+            assert len(_categories(session)) == SEED_COUNT
 
     def test_backfill_fills_only_the_missing_keys_and_never_touches_user_edits(
         self, _isolated_db
@@ -86,8 +91,9 @@ class TestEnsureDefaultTaxonomy:
             session.commit()
             rows = _categories(session)
 
-        assert created == 5  # newsletters already present
-        assert len(rows) == 7  # 5 seeded + edited newsletters + custom invoices
+        assert created == SEED_COUNT - 1  # newsletters already present
+        # seeded + the edited newsletters row + the custom invoices row
+        assert len(rows) == SEED_COUNT + 1
         edited = next(r for r in rows if r.key == "newsletters")
         assert edited.name == "My Newsletters" and edited.is_default is False
 
@@ -96,8 +102,8 @@ class TestEnsureDefaultTaxonomy:
             ensure_default_taxonomy(session, "user-a")
             ensure_default_taxonomy(session, "user-b")
             session.commit()
-            assert len(_categories(session, "user-a")) == 6
-            assert len(_categories(session, "user-b")) == 6
+            assert len(_categories(session, "user-a")) == SEED_COUNT
+            assert len(_categories(session, "user-b")) == SEED_COUNT
 
 
 class TestSeedingEntryPoints:
@@ -130,7 +136,7 @@ class TestSeedingEntryPoints:
                 scopes=["gmail.readonly"],
             )
         with _session() as session:
-            assert len(_categories(session, user_id)) == 6
+            assert len(_categories(session, user_id)) == SEED_COUNT
 
     def test_load_context_backfills_an_unseeded_existing_user(self, _isolated_db):
         """The user in production connected before seeding existed — their next
@@ -145,7 +151,7 @@ class TestSeedingEntryPoints:
         # Real rows with real ids — not the in-memory fallback list.
         assert all(c["id"] is not None for c in context["categories"])
         with _session() as session:
-            assert len(_categories(session)) == 6
+            assert len(_categories(session)) == SEED_COUNT
 
     def test_persist_run_results_resolves_category_ids_via_the_safety_net(
         self, _isolated_db

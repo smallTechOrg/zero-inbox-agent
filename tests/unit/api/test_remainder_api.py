@@ -76,6 +76,7 @@ class TestRemainderEndpoint:
             "needs_your_call": 1,
             "category_keep": 1,
             "held_by_never_miss": 0,
+            "no_never_miss_label": 0,
             "below_threshold": 0,
             "unclassified": 0,
         }

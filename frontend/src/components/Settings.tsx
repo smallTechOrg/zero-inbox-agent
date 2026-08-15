@@ -490,9 +490,17 @@ export default function SettingsPanel({
         <PriorityProfileEditor />
       </div>
 
-      {/* Phase 3: real taxonomy editor */}
+      {/* Phase 3: real taxonomy editor.
+          Phase 9 adds discovery above it (ui.md screen 26) and the never-archive
+          note inside it (screen 29). `dry_run` is passed through so the
+          re-organisation offer can say plainly whether Gmail will be touched —
+          an offer that stayed silent about dry-run would be the same dishonesty
+          the Inbox-Zero card's dry-run chip exists to prevent. */}
       <div className="border-t border-gray-200 pt-4">
-        <TaxonomyEditor />
+        {/* The SAVED value, never the unsaved draft: toggling dry-run without
+            saving must not make the re-organisation offer claim a mode the
+            backend is not actually in. */}
+        <TaxonomyEditor dryRun={settings ? settings.dry_run : draft.dry_run} />
       </div>
     </section>
   )
