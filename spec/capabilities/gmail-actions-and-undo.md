@@ -67,10 +67,38 @@ token for every mutation so any action can be fully reversed in one click.
 - Mutations are applied thread-level, in batches, with per-thread success recorded individually — a
   partial batch failure never loses the record of what did succeed.
 
+### Phase 9 — two new operations, one new undo scope, no new mutation path
+
+- **`archive_to_never_miss_label(...)`** — the only path permitted to archive a `NEVER_ARCHIVE_KEYS`
+  category's thread. It **refuses to run without a resolved category label**; that refusal *is* the
+  guarantee, not an edge case. A never-miss thread is never archived bare. If no label resolves, the
+  thread stays in the inbox and the ledger reports `no_never_miss_label`. Why this is still a
+  never-miss guarantee:
+  [never-miss-safeguards](never-miss-safeguards.md#phase-9-the-never-miss-semantic-is-redefined--from-hold-to-label).
+- **`relabel_decision(..., keep_archived: bool)`** — the re-organiser's operation. Removes the old
+  `ZeroInbox/*` label, adds the new one, and with `keep_archived=True` **never re-adds `INBOX`**: mail
+  the user already archived does not come back to the inbox because its category was renamed.
+- Both go through the **same** `NotReviewedError` gate, the **same** `dry_run` check and the **same**
+  undo-token write as `apply_decision`. **There is no second mutation path in the system**, and
+  neither function accepts `force`.
+- **Bulk undo of a whole re-organisation is one operation.** `POST /api/reorg/{job_id}/undo` reverses
+  every `action_logs` row carrying that `reorg_job_id`, in reverse insertion order, restoring each
+  thread's exact pre-job label set. It is idempotent — a second call makes **zero** Gmail calls — and a
+  partially-undone job reports exactly how far it got. Per-thread undo continues to work independently.
+- The permitted operation set is unchanged and closed: `{archive, add_label, remove_label}`. Phase 9
+  adds volume, not capability — no destructive operation becomes reachable.
+
 ## Success Criteria
 - [ ] Approving a cluster with dry-run off archives those threads in the real mailbox and applies the
       matching `ZeroInbox/<Category>` label, verified by reading the threads back.
-- [ ] Nothing appears in Trash after any agent operation, ever.
+- [ ] Nothing appears in Trash after any agent operation, ever — including after a full
+      re-organisation of ~10,336 decisions.
+- [ ] **(Phase 9)** `archive_to_never_miss_label` with no resolvable category label raises and calls
+      the mutator **zero** times; the thread stays in the inbox.
+- [ ] **(Phase 9)** `relabel_decision(keep_archived=True)` on an already-archived thread swaps the
+      `ZeroInbox/*` labels and **does not** re-add `INBOX`.
+- [ ] **(Phase 9)** `POST /api/reorg/{job_id}/undo` restores every mutated thread's exact pre-job
+      label set in one call; a second call makes zero Gmail calls and returns the same counts.
 - [ ] Every mutation has an `action_logs` row with a non-null undo token.
 - [ ] Clicking Undo returns the thread to the inbox with the added label removed, verified by reading it
       back from Gmail.

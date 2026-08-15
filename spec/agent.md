@@ -103,6 +103,35 @@ user's real persisted value — which, from Phase 7, is finally read by somethin
 | `handle_error` | 1 | Sets `status="failed"`, records the error on the run, and marks any undecided item `needs_your_call` — degradation always keeps mail visible. **Phase 6:** closes the run `resumable` instead of `failed` when ≥ 1 decision is already persisted, or when the cause is `ProviderCircuitOpen` |
 | `finalize` | 1 | Sets `status="completed"`, writes final counts + cost, emits the structlog summary event. **Phase 7:** calls `apply_run_decisions(...)` (unless `dry_run`), writes the apply + remainder ledgers into `triage_runs.counts`, sets `error_message` and emits `run_apply_failed` when the apply pass failed or `distance_to_zero > 0`, and emits `inbox_zero_report` |
 
+### Phase 9 changes to the graph (no new node, one new stage, tightened contracts)
+
+- **`second_pass_reviewer` — audit scope is mutability, not the `archive` label.** It selects
+  `proposed_action in REVIEWABLE_ACTIONS`, where
+  `nodes_review.REVIEWABLE_ACTIONS == tools.actions.MUTABLE_ACTIONS == {"archive", "digest"}`, asserted
+  equal by a test. It additionally returns `audited_item_ids` in state — the ids it **actually**
+  reviewed (successful batches only).
+- **`apply_never_miss_floor` → `finalise_review(..., audited_item_ids=...)`.** Only audited rows become
+  `review_state="reviewed"`; failed batches become `review_failed`; **every other row stays
+  `provisional`** and is therefore unappliable. `upgrade_review_state` may no longer be called with
+  `item_ids=None` and `state="reviewed"` — the run-wide upgrade that made `NotReviewedError` pass
+  vacuously is no longer expressible.
+- **`mark_autonomy_state` gains a labelling stage** (still in `graph/nodes_autonomy.py`, still after
+  the whole never-miss chain). A decision stamped `held_by_never_miss` whose never-miss category
+  resolves via `autonomy.never_miss_category_key(...)` (VIP/`ever_replied` → `people`;
+  `time_sensitive` → `urgent`; other reviewer hold → `important`) is set to
+  `proposed_action="archive"` with that `category_id` and one appended sentence naming the label. If
+  no category resolves the decision **stays `keep`** and the run reports it under
+  `no_never_miss_label`. `needs_your_call` and below-floor rows are never touched by this stage. The
+  verdict is unchanged; only its expression is — see
+  [never-miss-safeguards](capabilities/never-miss-safeguards.md#phase-9-the-never-miss-semantic-is-redefined--from-hold-to-label).
+- **`apply_sender_history` (tier 2) inherits correspondent truth.** A self address (the connected
+  account or any `sendAs` alias) and a no-reply sender can never produce a reply-history prior — the
+  exclusion is enforced at ingest (`_accumulate_recipients`) *and* in the guard
+  (`tools/never_miss.apply_reply_history_guard`), tested independently at both layers.
+- **The re-organisation job is not a second graph.** `jobs/reorganise.py` drives the **existing**
+  graph, the **existing** reviewer and the **existing** `apply_decision()` gate over past decisions.
+  It has no private mutation path and never passes `force=True`.
+
 `second_pass_reviewer` and `apply_never_miss_floor` are wired in Phase 2. Phase 1 applied a simple
 floor inside `persist_decisions` (confidence < 0.75 → `needs_your_call`) which Phase 2 replaces with
 the full reviewer + floor + VIP-guard cascade.

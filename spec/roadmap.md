@@ -41,6 +41,18 @@ Gmail mutation**:
 Anything time-sensitive (deadlines, invoices, legal, security alerts) errs heavily toward staying
 visible.
 
+> **Phase 9 — what "never miss" means, redefined once, deliberately, by the user.** Until Phase 9 a
+> never-miss verdict meant *leave the thread in the inbox*, which put a hard 365-thread floor under a
+> product whose whole promise is zero. From Phase 9 a never-miss verdict means **archive the thread
+> and attach its never-miss label** — `ZeroInbox/Urgent`, `ZeroInbox/Important`, `ZeroInbox/People` —
+> so it is one click away in the Gmail sidebar, marked with the reason it was held, and undoable
+> per thread and in bulk. **The safety guarantee is preserved by labelling and recoverability, not by
+> inbox residency.** Nothing is ever deleted, and no never-miss thread is ever archived without its
+> label. This is the **one** safety rule the user has chosen to redefine, explicitly and in writing,
+> after seeing the measured numbers. Every other invariant below is unchanged and absolute, and this
+> precedent does not extend to any of them. Full reasoning and evidence:
+> [never-miss-safeguards](capabilities/never-miss-safeguards.md#phase-9-the-never-miss-semantic-is-redefined--from-hold-to-label).
+
 ## Safety Invariants (apply to every phase, forever)
 
 - **Never delete anything, ever.** Archive + label only. The Gmail `trash` and `delete` operations are
@@ -51,7 +63,13 @@ visible.
 - **needs_your_call is auto-kept.** Any thread whose confidence is below the floor is kept in the
   inbox automatically and never archived without a rule explicitly promoted to `automatic` by the user.
 - **Full undo for every mutation.** Before each Gmail mutation the pre-triage label snapshot is stored
-  in `ActionLog.undo_token`. Any run or individual action can be reversed from the dashboard.
+  in `ActionLog.undo_token`. Any run or individual action can be reversed from the dashboard. **From
+  Phase 9 a whole re-organisation of the mailbox is reversible as a single bulk-undo operation** —
+  a mutation the user cannot reverse in one action is not a shippable mutation.
+- **`review_state = "reviewed"` is a claim about a DECISION, not about a run** (Phase 9). Only rows
+  the second-pass reviewer actually audited are marked reviewed, and the reviewer audits **every**
+  action `apply_decision()` is willing to mutate. `NotReviewedError` must never be able to pass
+  vacuously.
 - **Dry-run mode (debug).** When `settings.dry_run=true` the agent classifies but performs no Gmail
   mutations. Off by default in production; only used for development and testing.
 - **Autonomy goes through the reviewer, never around it.** The agent's decision to act on its own is
@@ -112,6 +130,14 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
       inbox has actually left it — and the dashboard states the remainder by reason
       ("N archived · N need your call · N kept by category · N not confident enough · N held by
       VIP/reply history"). A run that archived nothing is impossible to mistake for a success.
+- [ ] **(Phase 9)** A completed run leaves `inbox_remaining = 0` **with no human intervention** —
+      never-miss mail is archived under its own `ZeroInbox/*` label rather than held in the inbox, is
+      one click away, and is undoable per thread and in bulk. Anything that could not be archived is
+      named in the ledger with its reason, and "we reached zero" never appears unless the inbox is
+      genuinely empty.
+- [ ] **(Phase 9)** The user can rebuild the taxonomy from their own mail and re-organise **every**
+      past decision — including already-archived threads — resumably, with a live ledger of anything
+      skipped and a single bulk undo that reverses the whole re-organisation.
 
 ## Out of Scope (v1)
 
@@ -141,7 +167,7 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 
 ## Phases of Development
 
-Eight phases: one first-win phase and seven requirements phases.
+Nine phases: one first-win phase and eight requirements phases.
 
 ---
 
@@ -1683,3 +1709,643 @@ run is applying against the live account right now.**
 > **If step 2 shows a console instead of a homepage, or step 3 requires a click to see anything, or
 > any step 11 dialog fails to state that Gmail is untouched — Phase 8 is not done, regardless of what
 > the other steps show.**
+
+---
+
+### Phase 9 — Inbox Zero Without a Human
+
+**Goal.** The inbox reaches **actual zero with no human intervention**, and the user owns the
+taxonomy that gets it there. Three things make that true, and one thing has to be fixed before any of
+them is safe to ship.
+
+1. **The review gate stops passing vacuously** (item zero — the safety foundation, below).
+2. **A never-miss verdict becomes a label, not a hold.** The 227 threads the agent is holding in the
+   inbox are archived into `ZeroInbox/Urgent` / `ZeroInbox/Important` / `ZeroInbox/People` — one
+   click away, marked with the reason, undoable. The user's instruction, verbatim: *"I have not
+   replied to anything in my inbox that I can see right now. We should move everything into relevant
+   labels."*
+3. **The taxonomy is derived from the user's actual mail**, not from a fixed default list — and the
+   user can redo it whenever they like.
+4. **When the taxonomy changes, the tool re-organises everything.** The user's instruction, verbatim:
+   *"Re-organise everything."* All ~10,336 past decisions, including relabelling threads that are
+   already archived — not just the current inbox, and never a silent sample.
+
+**The measured state this phase eliminates** (the user's real inbox after the last run):
+**227 `held_by_never_miss` · 76 `category_keep` · 46 `below_threshold` · 16 `needs_your_call` ·
+0 `unclassified` = 365.** Target: **0**.
+
+#### Sender concentration — the measured evidence, and why the taxonomy must be derived
+
+Measured on the live account. **Use these numbers directly; do not re-derive them, and do not query
+the live DB to confirm them.** The current taxonomy is 8 generic categories (newsletters, legal,
+notifications, receipts, outreach, people, urgent — plus one junk category, see *test pollution*
+below). The user's mail is extremely concentrated, and none of that concentration is served:
+
+| Cluster | Threads | Senders |
+|---------|--------:|---------|
+| Facebook | ~1,586 | `notification@facebookmail.com` (503), `notification+kr4knbaqrsga@facebookmail.com` (489), `reminders@facebookmail.com` (250), `friendsuggestion@facebookmail.com` (184), `notification@priority.facebookmail.com` (130) |
+| BookMyShow | ~635 | `no-reply@entertainment.bookmyshow.com` (423), `no-reply@updates.bookmyshow.com` (212) |
+| Jagriti Theatre | 334 | `contact@jagrititheatre.com` |
+| Apple | ~176 | `no_reply@email.apple.com`, `noreply@email.apple.com` |
+| PayPal | 78 | |
+| Twitter | 40 | |
+
+All of it currently collapses into **Notifications**. That is precisely why confidence lands below
+the floor and why 16 threads found no fitting category. A taxonomy derived from *this* inbox
+obviously wants a **Social/Facebook** category, an **Events/Tickets** category (BookMyShow + Jagriti
+≈ 970 threads, about **one fifth of his mail**) and a **Billing/Subscriptions** category — each
+classifiable **from the sender alone**, at very high confidence, with **no LLM judgement**.
+
+**The design insight this phase builds on — and the reason the success measure is reachable rather
+than aspirational.** A handful of senders account for most of the volume. Discovery therefore exists
+to **convert sender concentration into deterministic tier-1 rules**, so the dominant senders stop
+needing judgement at all: they classify deterministically at confidence well above the floor, and the
+LLM is reserved for the genuine long tail. `needs_your_call` and `below_threshold` go to zero because
+the mail that produced them is no longer being asked of the model.
+
+**This runs through the existing [cost-tiered-triage](capabilities/cost-tiered-triage.md) tier-1 /
+tier-2 machinery. Phase 9 adds no second classification path.** Discovery emits `Rule` rows
+(`kind=deterministic`, `source=mined`, `status=active`) that the existing `apply_deterministic_rules`
+node consumes unchanged; sender-history evidence flows through the existing tier-2 path. A parallel
+classifier would be a "plumbed but never wired" seam and would also make the success measure
+unreachable, because the run's own `counts.by_tier` is the proof the concentration was exploited.
+
+#### Test pollution on the live account — `e2e-actions-test`
+
+A category `key='e2e-actions-test'`, `name='E2EActionsTest'`, `default_action=archive` exists on the
+user's live account (`6b4ab0f4…`), left behind by a test that ran against production data. Nothing is
+filed under it, so it is harmless — but the user will see it the moment he opens the taxonomy editor,
+which undermines confidence in exactly the surface this phase is about. Three requirements, all
+binding:
+
+1. **Removal goes through the normal taxonomy path**, in a gated slice — `GET
+   /api/categories/{id}/usage` then `DELETE /api/categories/{id}` against the running server. **An
+   ad-hoc script against `zero_inbox.db` is forbidden** and must not be specced, written or run.
+2. **Verify, do not assume.** The deletion is permitted only after the usage endpoint reports
+   **zero** `decisions` (and zero `rules`) referencing the category. A non-zero count stops the
+   operation and is reported — it is never deleted "because it looked empty".
+3. **Root-cause it.** A structural guard makes it impossible for a test to create a category on a
+   real user's account again — the same defect class as the cached-`get_settings()` incident that
+   polluted the real DB earlier. **Slice 8 (`test-isolation-guard`) owns it.** Row deletion alone is
+   not an acceptable close-out.
+
+The 227 have two distinct causes, already diagnosed — do not re-derive them:
+
+- **A real bug — self-addressed mail (18 threads, `decided_by="sender_history"`).** All 18 are from
+  `psykrsna@gmail.com`, **the user's own address**, held with *"You have replied to
+  psykrsna@gmail.com before (24 replies of 0 received)"*. `_accumulate_recipients`
+  (`src/channels/gmail/adapter.py:458`) harvests `To`/`Cc` from the user's own `SENT` mail, so the
+  user is his own most-replied-to correspondent. `24 replies of 0 received` is the signature.
+- **The time-sensitive guard working as told (the rest, `decided_by="llm"` 186 / `"reviewer"` 23).**
+  Top held senders: `no_reply@email.apple.com` (44), `noreply@email.apple.com` (39),
+  `no-reply@accounts.google.com` (39), `reminders@facebookmail.com` (27), `security@facebookmail.com`
+  (11) — automated no-reply senders correctly judged time-sensitive. The verdict is right; only its
+  *expression* was wrong. These archive under their label from Phase 9. **A `no-reply` sender can
+  never be a genuine correspondent** — a strong, free taxonomy signal this phase makes first-class.
+
+Capabilities: [never-miss-safeguards](capabilities/never-miss-safeguards.md) (**redefined** —
+label, not hold — plus the review-gate and correspondent-truth integrity fixes),
+[inbox-derived-taxonomy](capabilities/inbox-derived-taxonomy.md) (new),
+[drive-to-inbox-zero](capabilities/drive-to-inbox-zero.md) (extended: the ledger must reach 0),
+[taxonomy-management](capabilities/taxonomy-management.md) (extended: `Important`, the reconciled
+guard), [gmail-actions-and-undo](capabilities/gmail-actions-and-undo.md) (extended: never-miss
+labelled archive, bulk relabel, bulk undo).
+
+#### Item zero — a live safety gap. Slice 1. Specced first because nothing else is safe until it lands
+
+`digest` decisions reach the same `mutator.archive_and_label(remove_label_ids=[INBOX])` as archives
+(`src/tools/actions.py:140` permits `proposed_action in ("archive", "digest")`), but
+`second_pass_reviewer` audits **only** `proposed_action == "archive"`
+(`src/graph/nodes_review.py:171-174`). `finalise_review` then upgrades `review_state` across the
+run's **whole** decision set, so a `digest` row reads `reviewed` having never been reviewed and the
+`NotReviewedError` gate passes **vacuously**. **Live: 171 digest decisions, 44 already applied
+unreviewed.**
+
+The approved fix is the deeper one, and it closes the class rather than the instance:
+
+- **`finalise_review` marks only rows that were ACTUALLY audited.** It receives the explicit set of
+  audited item ids and upgrades exactly those to `reviewed`; every other row stays `provisional`.
+  `review_state="reviewed"` becomes a claim about the **decision**, not about the run.
+- **The reviewer covers every mutating action**, not the `archive` label specifically. Scope is
+  defined by mutability: `nodes_review.REVIEWABLE_ACTIONS` and `actions.MUTABLE_ACTIONS` are one
+  contract, asserted equal by a test, so a future third mutating action cannot silently reopen the
+  hole.
+- **This matters more after the reframe, not less** — far more mail is mutated once never-miss
+  archives.
+- **Historic rows:** migration `0008` downgrades to `provisional` every `reviewed`-but-never-audited
+  row that is **not yet applied**. The 44 already-applied rows are not rewritten — they are counted in
+  a new `unreviewed_applied` ledger figure and stated in the UI. The honesty rule outranks a tidy
+  migration.
+
+#### Invariants — this phase redefines exactly one rule and adds no path around any other
+
+- **NEVER delete, trash or spam-report.** No such method on the mutator; asserted structurally.
+- **No never-miss thread is ever archived without its label.** A bare archive of a
+  `NEVER_ARCHIVE_KEYS` category is not a permitted operation. If no never-miss label resolves, the
+  thread **stays in the inbox** and the ledger names it under `no_never_miss_label`.
+- **Every mutation carries an undo token**, and the whole re-organisation is reversible as **one**
+  bulk operation.
+- **`dry_run` is absolute** — for triage and for the re-organisation job.
+- **`NotReviewedError` still fires before the mutator and is not bypassable by `force=True`.** No
+  Phase 9 path (auto-apply, re-organisation, bulk relabel) passes `force=True` or writes
+  `review_state` outside `finalise_review` / `upgrade_review_state`.
+- **No message bodies persisted or sent to the LLM** beyond headers, subject and the redacted 200-char
+  snippet. The taxonomy census carries counts and addresses — **no subjects in the census
+  aggregates**, and gap-set subjects are truncated to 60 chars exactly as the live feed already is.
+- **`NEVER_ARCHIVE_KEYS` (`urgent`, `people`, `legal`, + `important`) can never be set to
+  `default_action=archive`** — the guard is **kept and extended, not deleted**. Reconciliation with
+  the reframe is written down at
+  [never-miss-safeguards § NEVER_ARCHIVE_KEYS reconciled](capabilities/never-miss-safeguards.md#never-archive-keys-reconciled):
+  a category-wide archive default is a bulk silent sweep of the mail a human must see; a never-miss
+  archive is per thread, caused by the signal firing, always labelled and always undoable. Those are
+  different operations. The guard blocks the first and never blocked the second.
+- **Honesty:** *"we reached zero"* never appears unless the inbox is genuinely empty. A run or job
+  that could not finish sets `error_message`, emits its failure event and returns `ok=false`.
+
+#### Slices
+
+Eight slices, **fully disjoint file ownership** — no two slices own the same file, so all eight can be
+generated concurrently. Where one slice consumes something another writes it is a **spec-contract
+dependency only** (signatures pinned below); all seven land in the same gate. **Slice 1 is the safety
+foundation: no other slice may weaken, loosen, `xfail` or delete any assertion it adds, and no other
+slice may edit `src/graph/nodes_review.py` or `src/graph/persistence.py`.**
+
+| # | Slice | Owns (disjoint paths) | Depends on |
+|---|-------|----------------------|-----------|
+| 1 | `review-gate-integrity` | `src/graph/nodes_review.py`, `src/graph/persistence.py`, `alembic/versions/0008_review_state_integrity.py` (new), `tests/unit/graph/test_review_scope.py` (new), `tests/unit/graph/test_finalise_review_scope.py` (new), `tests/integration/test_review_gate_integrity.py` (new) | none |
+| 2 | `correspondent-truth` | `src/channels/gmail/adapter.py`, `src/channels/base.py`, `src/tools/correspondents.py` (new), `src/tools/never_miss.py`, `tests/unit/tools/test_correspondents.py` (new), `tests/unit/channels/test_sender_history_self.py` (new) | none |
+| 3 | `never-miss-as-label` | `src/graph/autonomy.py`, `src/graph/nodes_autonomy.py`, `src/graph/remainder.py`, `src/tools/actions.py`, `tests/unit/graph/test_never_miss_label.py` (new), `tests/unit/tools/test_actions_never_miss.py` (new), `tests/integration/test_inbox_zero_reframe.py` (new), `tests/integration/test_drive_to_zero.py` (**one assertion only** — the old never-miss semantic), `tests/fixtures/phase9/remainder_365.py` (new) | none (spec-contract: consumes slice 1's `finalise_review` signature and slice 2's `is_no_reply` / self-address exclusion) |
+| 4 | `taxonomy-discovery` | `src/tools/taxonomy_discovery.py` (new), `src/tools/taxonomy.py`, `src/tools/rules.py`, `src/prompts/taxonomy_discovery.md` (new), `src/api/taxonomy_discovery.py` (new), `src/api/categories_usage.py` (new), `src/api/__init__.py`, `tests/unit/tools/test_taxonomy_discovery.py` (new), `tests/unit/tools/test_mined_sender_rules.py` (new), `tests/integration/test_taxonomy_discovery.py` (new) | none |
+| 5 | `reorganisation-job` | `src/jobs/reorganise.py` (new), `src/api/reorganise.py` (new), `src/db/models.py`, `alembic/versions/0009_reorg_jobs.py` (new), `tests/unit/jobs/test_reorganise.py` (new), `tests/integration/test_reorganise.py` (new), `tests/fixtures/phase9/decisions_10k.py` (new) | none (spec-contract: calls slice 3's `archive_to_never_miss_label` / `relabel_decision` and slice 4's discovery result shape) |
+| 6 | `frontend-phase9` | `frontend/src/components/TaxonomyDiscovery.tsx` (new), `frontend/src/components/ReorganiseCard.tsx` (new), `frontend/src/components/Settings.tsx`, `frontend/src/components/InboxZeroCard.tsx`, `frontend/src/components/TaxonomyEditor.tsx`, `frontend/src/lib/types.ts`, `frontend/src/app/page.tsx` | none |
+| 7 | `e2e-phase9-and-spec-hygiene` | `tests/e2e/phase9/**` (new), `tests/e2e/phase1/**`, `tests/e2e/phase2/**`, `tests/e2e/phase3/**` | none |
+| 8 | `test-isolation-guard` | `tests/conftest.py`, `tests/isolation.py` (new), `tests/unit/test_isolation_guard.py` (new), `scripts/README_cleanup.md` (new, procedure only — **no executable script**) | none (spec-contract: the `e2e-actions-test` cleanup step calls slice 4's `GET /api/categories/{id}/usage`) |
+
+**Path-disjointness notes (read before writing a line of code).**
+
+- Slice 1 is the **only** slice that edits `src/graph/nodes_review.py` or `src/graph/persistence.py`.
+  Slice 3 and slice 5 *call* `finalise_review` / `upgrade_review_state`; if either appears to need a
+  change inside those files, that is a spec question — raise it, do not edit across the seam.
+- Slice 3 is the **only** slice that edits `src/tools/actions.py`. Slice 5 imports
+  `apply_decision` / `archive_to_never_miss_label` / `relabel_decision` and adds no mutation path of
+  its own.
+- Slice 5 is the **only** slice that edits `src/db/models.py` or adds migration `0009`. Slice 1 owns
+  `0008` and adds **no** model change (the `review_state` column already exists). Pinned chain:
+  `0008.down_revision = "0007_sessions_and_mailbox_ownership"`, `0009.down_revision = "0008_review_state_integrity"`.
+- Slice 4 is the **only** slice that edits `src/api/__init__.py` (it mounts both new routers:
+  `taxonomy_discovery.router` **and** slice 5's `reorganise.router` — slice 5 exports the router and
+  does not mount it).
+- Slice 6 is the only slice touching `frontend/`. Slice 7 is the only slice touching `tests/e2e/`.
+- Slice 4 is the **only** slice that edits `src/tools/rules.py` (it adds the mined-sender-rule
+  materialiser and the `important` seed entry). It **must not** change the tier-1 matcher semantics
+  in `apply_rules` — discovery produces rows the existing matcher already understands.
+- Slice 8 is the **only** slice that edits `tests/conftest.py`. No other slice may add, relax or
+  monkeypatch around the isolation guard it installs; a test that needs a real account is a spec
+  question, not a local override.
+- **Fixtures are owned, not shared.** Slice 3 owns `tests/fixtures/phase9/remainder_365.py` (the
+  227/76/46/16/0 distribution) and slice 5 owns `tests/fixtures/phase9/decisions_10k.py`. Slice 4's
+  integration test **imports** `remainder_365` and does not edit it. The existing 220-thread fixture
+  is unchanged and unowned by this phase.
+- **`tests/integration/test_drive_to_zero.py` is edited by slice 3 only, and only to update the single
+  assertion that encodes the OLD never-miss semantic** (a `held_by_never_miss` thread remains in the
+  inbox). Every other assertion in that file is untouched, and the change is named explicitly in the
+  slice's report. No other slice may edit that file.
+
+**Pinned cross-slice contracts** (each slice codes against these, not another slice's files):
+
+```python
+# slice 1 writes; slices 3 and 5 call
+graph.persistence.finalise_review(
+    session, *, run_id: str, user_id: str, decisions: list[dict],
+    audited_item_ids: list[str],              # NEW, REQUIRED — only these become "reviewed"
+    review_failed_item_ids: list[str] | None = None,
+) -> dict            # {"reviewed": n, "review_failed": n, "not_audited": n, "flipped": [...]}
+graph.nodes_review.REVIEWABLE_ACTIONS: frozenset[str]   # == tools.actions.MUTABLE_ACTIONS
+
+# slice 2 writes; slices 3 and 4 call
+tools.correspondents.is_no_reply(email: str) -> bool
+tools.correspondents.is_self_address(email: str, *, account_email: str, aliases: list[str]) -> bool
+tools.correspondents.NO_REPLY_PATTERNS: tuple[str, ...]
+
+# slice 3 writes; slice 5 calls
+tools.actions.MUTABLE_ACTIONS: frozenset[str]            # {"archive", "digest"}
+tools.actions.archive_to_never_miss_label(session, user_id, decision_id, *, mutator,
+                                          label_lookup, dry_run) -> ActionLog
+tools.actions.relabel_decision(session, user_id, decision_id, *, mutator, label_lookup,
+                               dry_run, keep_archived: bool) -> ActionLog
+graph.autonomy.never_miss_category_key(decision, item, *, vip, sender_stats) -> str | None
+
+# slice 4 writes; slices 5 and 6 call
+tools.taxonomy_discovery.build_census(session, *, user_id) -> list[dict]
+tools.taxonomy_discovery.propose_taxonomy(session, *, user_id, census, gap_set) -> dict
+    # {"proposal": [{key, name, description, default_action, rationale, evidence_senders,
+    #                covered_threads}], "coverage": {...}, "partial": bool, "partial_reason": str|None}
+tools.taxonomy_discovery.mine_sender_rules(census, proposal) -> list[dict]
+    # tier-1 Rule rows: {matcher: {from_email|from_domain|list_id}, action, category_key,
+    #                    confidence, kind:"deterministic", source:"mined", status:"active"}
+tools.taxonomy_discovery.materialise_rules(session, *, user_id, rules) -> dict   # {created, updated}
+
+# slice 5 writes; slice 6 calls
+jobs.reorganise.start(session, *, user_id, dry_run: bool) -> str        # reorg_job id
+jobs.reorganise.ledger(session, *, job_id) -> dict
+    # {"total", "done", "skipped": {reason: n}, "status", "undoable"}
+```
+
+##### Slice 1 — `review-gate-integrity` (item zero)
+
+- `nodes_review.py`: `REVIEWABLE_ACTIONS = frozenset({"archive", "digest"})`, imported from / asserted
+  equal to `tools.actions.MUTABLE_ACTIONS`. `second_pass_reviewer` selects
+  `proposed_action in REVIEWABLE_ACTIONS`, and returns the **set of item ids it actually audited**
+  (successfully-reviewed batches only) in state as `audited_item_ids`.
+- `_upgrade_review_state` passes `audited_item_ids` through; `finalise_review` marks only those rows
+  `reviewed`, marks `review_failed_item_ids` `review_failed`, and **leaves every other row untouched**
+  — reporting `not_audited` so the run ledger can state it.
+- `persistence.upgrade_review_state` keeps its signature but gains a hard rule: calling it with
+  `item_ids=None` **and** `state="reviewed"` raises — the run-wide upgrade that caused this defect is
+  no longer expressible.
+- `0008_review_state_integrity.py`: set `review_state='provisional'` where
+  `review_state='reviewed' AND proposed_action NOT IN ('archive') AND status <> 'applied'` for
+  pre-Phase-9 runs. Already-applied rows are **not** rewritten; the migration logs their exact count
+  (expected 44) so it can be reported. Idempotent and re-runnable.
+- **Tests:** `test_review_scope.py` — the two sets are equal (fails if either is changed alone); a
+  `digest` proposal is included in the reviewer's batch. `test_finalise_review_scope.py` — a run where
+  the reviewer audits 3 of 10 rows leaves exactly 3 `reviewed` and 7 `provisional`; a run-wide upgrade
+  raises. **Both fail against pre-Phase-9 code.**
+  `test_review_gate_integrity.py` (integration, `_isolated_db`) — a run seeded with 171 `digest` +
+  archive decisions and the reviewer stubbed to fail: **zero** mutations, every row `review_failed`,
+  `apply_decision` raised `NotReviewedError` before the mutator (spy proves the mutator was never
+  called), including with `force=True`.
+
+##### Slice 2 — `correspondent-truth`
+
+- `tools/correspondents.py` (new): `is_no_reply` (matches `no-reply`/`noreply`/`no_reply`/
+  `donotreply`/`do-not-reply`, case-, dot-, hyphen- and underscore-insensitive on the local part) and
+  `is_self_address` (normalises Gmail dots and `+tags`; compares against `account_email` and the
+  alias list).
+- `adapter.py`: `sender_history()` passes `self._account_email` and the `sendAs` alias list into
+  `_accumulate_recipients`, which **skips** any self address entirely — no `SenderSignal`, no
+  `replied_count`, no `ever_replied`. Aliases are fetched once via
+  `users.settings.sendAs.list`, best-effort: on failure fall back to `account_email` alone and log at
+  WARNING (never fail the run).
+- `channels/base.py`: `SenderSignal` gains `is_no_reply: bool` so the flag reaches the census and the
+  guards without a second parse.
+- `tools/never_miss.py`: defence in depth — `apply_reply_history_guard` ignores an `ever_replied`
+  claim for a self address or a no-reply sender even if a stale `sender_profiles` row still asserts
+  one. Both layers tested independently.
+- **Tests:** `test_sender_history_self.py` — a `SENT` fixture addressed to `psykrsna@gmail.com`,
+  `psy.krsna@gmail.com` and `psykrsna+news@gmail.com` produces **zero** reply signals for all three,
+  and a genuine correspondent in the same fixture still produces one. `test_correspondents.py` — the
+  full no-reply pattern matrix including the five measured live addresses, plus normal addresses that
+  must not match (`reply@`, `noreplyneeded@example.com` is documented as matching by design).
+  **Both fail against pre-Phase-9 code.**
+
+##### Slice 3 — `never-miss-as-label` (the reframe)
+
+- `autonomy.py`: `never_miss_category_key(...)` — the deterministic first-match resolution
+  (VIP/`ever_replied` → `people`; `time_sensitive` → `urgent`; other reviewer hold → `important`;
+  else `None`). `classify_autonomy_state` is unchanged: `held_by_never_miss` still names the reason —
+  it now describes *why it was labelled*, not *why it stayed*.
+- `nodes_autonomy.py`: after the never-miss chain, a `held_by_never_miss` decision whose never-miss
+  category resolves is set to `proposed_action="archive"` with that `category_id`, its reasoning
+  appended with one plain sentence naming the label. Unresolvable → stays `keep`, ledger reason
+  `no_never_miss_label`. **`needs_your_call` and below-floor rows are untouched.**
+- `remainder.py`: `held_by_never_miss` no longer counts toward `inbox_remaining` when it was archived
+  to its label; new buckets `no_never_miss_label` and `unreviewed_applied` (the honest count of the 44
+  historic rows). The documented invariant
+  `inbox_remaining == sum(remainder buckets) + distance_to_zero` still holds.
+- `actions.py`: `MUTABLE_ACTIONS`; `archive_to_never_miss_label` (refuses to run without a resolved
+  category label — that refusal is the guarantee, not an edge case); `relabel_decision(...,
+  keep_archived: bool)` for the re-organiser, which removes the old `ZeroInbox/*` label, adds the new
+  one, and **never re-adds `INBOX`** when `keep_archived=True`. Both go through the same
+  `NotReviewedError` / `dry_run` / undo-token path as `apply_decision` — no second mutation path
+  exists.
+- **Tests:** `test_never_miss_label.py` — the resolution table, including the unresolvable case;
+  `NEVER_ARCHIVE_KEYS` still rejects `default_action="archive"` while
+  `archive_to_never_miss_label` succeeds into the same category.
+  `test_actions_never_miss.py` — a never-miss archive without a resolvable label raises and calls the
+  mutator zero times; every mutation writes a non-null undo token; `dry_run` blocks both new
+  functions; `force=True` does not bypass `NotReviewedError`.
+  `test_inbox_zero_reframe.py` (integration, `_isolated_db`, real NIM via `.env`) — the load-bearing
+  gate, below.
+
+##### Slice 4 — `taxonomy-discovery`
+
+- `build_census` — deterministic, no LLM: per sender/domain/`List-Id`, `thread_count`,
+  `unread_count`, `ever_replied` (post slice 2), `is_no_reply`, `has_unsubscribe`, `in_gap_set`.
+  **No subjects in the aggregate rows.**
+- `propose_taxonomy` — census + gap set → a proposal with per-category evidence and coverage.
+  Chunked at ≤ 200 senders per call; uses the existing model-fallback chain and throttle. On total LLM
+  failure returns the deterministic-signal proposal with `partial=true` and a stated reason — and
+  **never** the seed six presented as derived. Validation rejects any evidence-free category.
+- **`mine_sender_rules` — the load-bearing step, and it runs through the EXISTING tier-1/tier-2
+  machinery. There is no second classification path in Phase 9, and no generator may introduce one.**
+  Approving a proposal materialises, for every sender / domain / `List-Id` in a category's evidence
+  list that clears the concentration bar (**≥ 10 threads** and a single dominant category), a
+  `Rule` row using the **existing** `src/db/models.py:Rule` schema and the **existing** enums —
+  `kind=RuleKind.DETERMINISTIC`, `source=RuleSource.MINED`, `status=RuleStatus.ACTIVE` — matched by
+  the **unchanged** `tools.rules.apply_rules` matcher in the **unchanged**
+  `graph.nodes.apply_deterministic_rules` node. These decisions land `decided_by="rule"` with
+  `rule_id` set, at confidence **well above `confidence_floor`**, at zero token cost. Sender-history
+  evidence continues to flow through the existing **tier-2** path; discovery writes no classifier of
+  its own, calls no LLM at triage time, and adds no node to the graph.
+  - Why this is what makes the success measure reachable: the five Facebook addresses (~1,586), the
+    two BookMyShow addresses (~635) and `contact@jagrititheatre.com` (334) — roughly **half the
+    inbox** — stop being asked of the model at all. `needs_your_call` and `below_threshold` are
+    produced by the LLM being asked to squeeze concentrated automated mail into an ill-fitting
+    generic category; remove the question and both buckets go to zero deterministically instead of
+    hopefully. The LLM is reserved for the genuine long tail.
+  - A mined rule is never silently destructive: it may not target a `NEVER_ARCHIVE_KEYS` category
+    with `action="archive"` (`_validate_action` applies unchanged), and every mined rule records its
+    evidence (`thread_count`, sender) so the user can see why it exists and disable it.
+  - Re-running discovery **updates** the matching mined rule in place rather than accumulating
+    duplicates; a `source=user` rule is never overwritten by a mined one.
+- `api/categories_usage.py` — `GET /api/categories/{id}/usage` → `{decisions: n, rules: n, items: n}`,
+  read-only, user-scoped. This is the **verification** step that must precede any category deletion,
+  including the `e2e-actions-test` cleanup. Deletion with a non-zero count is refused.
+- `api/taxonomy_discovery.py` — `POST /api/taxonomy/discover` (proposal only, mutates nothing),
+  `POST /api/taxonomy/apply` (creates/renames/retires categories and their labels, returns the diff
+  and whether a re-organisation is recommended). Both user-scoped, standard envelope.
+- `tools/taxonomy.py` — adds `important` to the seed set and to `NEVER_ARCHIVE_KEYS`; the
+  `_validate_action` guard is otherwise **unchanged**.
+- **Tests:** `test_taxonomy_discovery.py` — census correctness on the sender fixture; evidence-free
+  category rejected; LLM-failure fallback marked partial.
+  `test_mined_sender_rules.py` — the measured concentration fixture (5 Facebook addresses, 2
+  BookMyShow addresses, Jagriti, Apple, PayPal, Twitter, at the measured counts) yields a mined rule
+  for every sender ≥ 10 threads; each mined rule is matched by the **unchanged**
+  `tools.rules.apply_rules` (asserted by calling that function directly — the seam is tested, not
+  assumed); a mined `archive` rule targeting a `NEVER_ARCHIVE_KEYS` category is rejected; re-running
+  discovery updates in place and creates zero duplicates and overwrites no `source=user` rule.
+  `test_taxonomy_discovery.py` (integration, real NIM) — over the **365-row remainder fixture**
+  (227/76/46/16/0, the full set, not a sample) the discovered taxonomy re-triages to
+  `needs_your_call == 0` and `below_threshold == 0`, against 16 and 46 under the seed taxonomy —
+  **and `counts.by_tier` shows the majority resolved by tier 1/2 with `decided_by="rule"`, proving
+  the concentration was exploited deterministically rather than re-asked of the model.** A run that
+  reaches zero with the concentrated senders still `decided_by="llm"` **fails this test.**
+  `GET /api/categories/{id}/usage` returns the true counts for a category with and without
+  referencing decisions.
+
+##### Slice 5 — `reorganisation-job`
+
+- `models.py` + `0009`: `reorg_jobs` (`id`, `user_id`, `status`, `total`, `done`, `skipped` JSON,
+  `cursor`, `dry_run`, `started_at`, `finished_at`, `error_message`) and
+  `action_log.reorg_job_id` (nullable) so bulk undo is a single indexed query.
+- `jobs/reorganise.py`: re-classifies **every** decision for the user under the new taxonomy through
+  the existing graph and the existing reviewer, then mutates through slice 3's functions. Resumable
+  from `cursor`; runs under the existing process-wide throttle; `429`/`quotaExceeded` backs off and
+  retries rather than dropping a thread. **Never caps, never samples.** Every non-mutated thread is
+  counted under exactly one reason in `skipped`, and `done + sum(skipped.values()) == total` is an
+  asserted invariant. Emits `reorg_progress` at least every 3 s (Phase 7 no-silent-beat rule).
+- `api/reorganise.py`: `POST /api/reorg` (409 if a reorg or an applying run is in flight),
+  `GET /api/reorg/{job_id}`, `POST /api/reorg/{job_id}/cancel`, `POST /api/reorg/{job_id}/undo`
+  (**bulk undo, one operation, idempotent**). Exports `router`; slice 4 mounts it.
+- **Tests:** `test_reorganise.py` (unit) — ledger arithmetic; the `409` paths; bulk undo idempotency.
+  `test_reorganise.py` (integration, `_isolated_db`) — a **10,000-decision** fixture (large enough
+  that a sampled and a full run differ observably): every row accounted for; already-archived threads
+  are relabelled and **not** returned to the inbox; kill at ~40 % and resume completes with zero
+  duplicate mutations and strictly fewer LLM calls on the resume; bulk undo restores every pre-job
+  label set and a second call makes zero Gmail calls; `dry_run=true` mutates nothing; a
+  `review_failed` row is counted `not_reviewed` and never mutated.
+
+##### Slice 6 — `frontend-phase9`
+
+- `TaxonomyDiscovery.tsx` — **Rebuild my categories from my mail**: the proposal as a diff
+  (keep/rename/merge/add/retire), each row showing its evidence senders and thread count, the coverage
+  figure, and the gap-threads-resolved figure. Editable before approval. Approving offers
+  **Re-organise everything** with a plain statement of what it will do and how long it will take.
+- `ReorganiseCard.tsx` — live progress (`done / total`, current phase), the skipped-by-reason table
+  rendered **while it runs, not only at the end**, Cancel, and **Undo the whole re-organisation** as
+  one button. A partial job renders amber with its reasons, never green.
+- `InboxZeroCard.tsx` — the ledger reaches `0`, with the new `no_never_miss_label` and
+  `unreviewed_applied` rows shown when non-zero. The card must state, in plain words, that never-miss
+  mail was **archived under its label, not deleted, and is one click away** — with the label names as
+  Gmail links. "We reached zero" renders **only** when `inbox_remaining == 0`.
+- `TaxonomyEditor.tsx` / `Settings.tsx` — the `NEVER_ARCHIVE_KEYS` categories keep their disabled
+  archive control **and now carry the explanatory note**: *"kept for you — archived under its own
+  label, never swept as a category."*
+- All six component states from [ui.md](ui.md#component-states-required-for-every-interactive-component);
+  state is never colour alone.
+
+##### Slice 7 — `e2e-phase9-and-spec-hygiene`
+
+- `tests/e2e/phase9/` against the already-running supervised server on `:8001`:
+  `inbox-zero.spec.ts` (the card reaches 0 and names the labels; "we reached zero" is absent when the
+  ledger is non-zero), `taxonomy-discovery.spec.ts` (discover → proposal with evidence → edit →
+  approve → re-organise offered), `reorganise.spec.ts` (progress visible with **no clicks**, skipped
+  reasons rendered mid-run, bulk-undo button present and enabled — it asserts the **confirm dialog**
+  and does not execute a re-organisation against the live account).
+- **Obsolete-spec cleanup, taken on explicitly.** The **13 Playwright specs asserting Phase-1/2/3
+  console chrome for an anonymous visitor** are **genuinely obsolete** — Phase 8 deliberately made an
+  anonymous visitor land on the homepage, which is correct behaviour. Phase 8 forbade deleting them so
+  that phase could not go green by deletion; **Phase 9 takes them on and deletes or rewrites them**,
+  and the slice's report must list each file with `deleted` or `rewritten` and one line of why. That
+  is the whole permitted change to `tests/e2e/phase1|2|3`.
+
+##### Slice 8 — `test-isolation-guard` (root-cause for the `e2e-actions-test` pollution)
+
+The row deletion is the symptom. The defect is that a test was **able** to bind to a real user's
+account at all — the same class as the cached-`get_settings()` incident. This slice makes it
+structurally impossible and makes the failure loud.
+
+- `tests/isolation.py` (new) — the guard, as plain assertions:
+  - `assert_isolated_db(engine)`: the bound SQLAlchemy URL must resolve to a path under `tmp_path`,
+    and must **not** be `zero_inbox.db` or any file under `data/`. Raises `RealDatabaseError` with the
+    offending URL in the message.
+  - `assert_test_user(user_id)` / `assert_test_mailbox(email)`: test data must use the reserved
+    `test-` id prefix and an `@example.com`/`@test.invalid` address. The known real ids and addresses
+    (`6b4ab0f4…`, `psykrsna@gmail.com`) are a hard **deny-list**; using one raises immediately.
+- `tests/conftest.py` — `_isolated_db` calls `assert_isolated_db(engine)` after binding, and a new
+  **autouse** `_no_real_account` fixture wraps the session factory so that **committing** a
+  `Category`, `Decision`, `Rule` or `ChannelAccount` whose `user_id` is not a `test-` id **raises**.
+  The guard fires on write, not on teardown, so the offending test fails with a message naming the
+  test and the row it tried to create. It cannot be disabled by a marker or an env var.
+- `tests/unit/test_isolation_guard.py` (new) — the guard itself is tested: a deliberate attempt to
+  write a `Category` for the real user id raises `RealUserError`; an attempt to point the engine at
+  `zero_inbox.db` raises `RealDatabaseError`; a normal `test-` write succeeds. **These tests fail if
+  the guard is removed or weakened**, which is the point.
+- `scripts/README_cleanup.md` (new) — the **procedure, not a script**, for removing
+  `e2e-actions-test` from the live account, executed by a human against the running server on `:8001`
+  after the gate is green:
+  1. `GET /api/categories/{id}/usage` (slice 4). Proceed **only** if `decisions == 0`, `rules == 0`,
+     `items == 0`. A non-zero count **stops** the operation and is reported to the user.
+  2. `DELETE /api/categories/{id}` — the normal taxonomy path, which leaves the Gmail label and all
+     mail intact.
+  3. Re-`GET` the category list to confirm it is gone.
+  **Writing or running an ad-hoc script against `zero_inbox.db` is forbidden.** This file must
+  contain no executable code.
+
+#### Explicitly NOT taken on in Phase 9 (carried, not inherited)
+
+- **`tests/integration/test_resume.py::TestFullResume`** — a fixture **visibility** bug
+  (`AttributeError` at line 103). **Still out of scope. No generator may make it pass by weakening,
+  loosening, deleting or `xfail`-ing any assertion in it.** Leave it exactly as it is.
+- **The 5 pre-existing integration failures** (model-shape drift, a live-mailbox flake,
+  `RefreshError` mapping, `GmailMutator` method drift). One of these failing is not a blocker. A
+  Phase 9 test failing is. Any failure **outside** this set and the resume fixture is a new regression
+  and blocks the phase.
+
+#### Assumptions made in this phase (confirm or correct before slice 1 starts)
+
+> **Assumed:** the never-miss label set is `People` / `Urgent` / `Important`, resolved
+> deterministically in that precedence, and **`Important` is added to the seed taxonomy and to
+> `NEVER_ARCHIVE_KEYS`**. The user said *"we have labels called Urgent and Important or whatever so
+> they can go there"* — `Important` is created if it does not already exist rather than reusing an
+> ill-fitting category.
+
+> **Assumed:** account aliases are read from Gmail `users.settings.sendAs.list`, best-effort: on
+> failure the fix still applies to `channel_accounts.account_email` alone and logs at WARNING. The
+> primary bug (18 threads from the account's own address) is closed either way.
+
+> **Assumed:** "re-organise everything" means **every decision row for that user** (~10,336),
+> including already-archived threads, in one resumable job — not the current inbox, and not a sample.
+> This is a direct restatement of the user's *"Re-organise everything."*
+
+> **Assumed:** the historic **44 already-applied unreviewed** rows are **not** rewritten by migration
+> `0008`. They are counted and surfaced as `unreviewed_applied`. Rewriting them would make the
+> database assert a review that never happened.
+
+> **Assumed:** the gate's migration check runs against a throwaway
+> `data/phase9_migration_check.db` via a command-line `AGENT_DATABASE_URL` override, never against
+> `zero_inbox.db`, and the scratch file is deleted afterwards.
+
+> **Assumed:** the sender-concentration bar for minting a deterministic tier-1 rule is **≥ 10 threads
+> from one sender/domain/`List-Id` with a single dominant category**. Ten is the same threshold the
+> discovery success criterion already uses for "must be named in some category's evidence", so the
+> two cannot drift apart. It is a `user_settings`-free constant in `tools/taxonomy_discovery.py`.
+
+> **Assumed:** test data is identified by a reserved `test-` `user_id` prefix and
+> `@example.com` / `@test.invalid` addresses, with the measured real id and address as an explicit
+> deny-list. This is a convention the guard enforces; existing fixtures that violate it are updated
+> by slice 8 within its own files only.
+
+> **Assumed:** the `e2e-actions-test` deletion is a **post-gate operational step performed by a
+> human** against the running server, not an automated build step — no generator deletes a row on a
+> real account. If the usage check is non-zero, nothing is deleted and the user is told.
+
+> **Assumed:** re-organisation and triage-apply are mutually exclusive (`409 run_in_progress`). Two
+> writers against one mailbox is not a state this system is specified to support.
+
+#### Gate (exact commands, run from the repo root, real APIs via `.env`)
+
+```bash
+AGENT_DATABASE_URL="sqlite:///./data/phase9_migration_check.db" uv run alembic upgrade head
+AGENT_DATABASE_URL="sqlite:///./data/phase9_migration_check.db" uv run alembic heads
+uv run pytest tests/unit tests/integration -q
+cd frontend && pnpm install && pnpm build && cd ..
+npx playwright test tests/e2e/ --reporter=line
+```
+
+All must exit 0. `alembic heads` must print a **single** head, `0009_reorg_jobs`.
+
+- **The migration check runs against a throwaway `data/phase9_migration_check.db`, never against
+  `zero_inbox.db`.** Alembic runs in its own process and reads `AGENT_DATABASE_URL` fresh, so the
+  cached `get_settings()` hazard does not apply — but the override must be on the command line, and
+  the scratch file must be deleted afterwards.
+- **Every test uses the `_isolated_db` fixture, and slice 8's guard now enforces it structurally** —
+  a test that binds `zero_inbox.db` or writes a row for a real `user_id` fails loudly with a named
+  error rather than silently polluting production. No test runs alembic against the real DB, and no
+  test launches a full-inbox triage run — the 220-thread fixture, the 365-row remainder fixture and
+  the 10,000-decision re-organisation fixture are the entire test surface.
+- **Playwright runs against the already-running supervised server on `http://localhost:8001`. Do not
+  start a second server and do not kill or restart the supervised one.**
+
+`tests/integration/test_inbox_zero_reframe.py` is the load-bearing gate. It runs the **365-row
+remainder fixture replaying the measured live distribution (227 `held_by_never_miss` / 76
+`category_keep` / 46 `below_threshold` / 16 `needs_your_call` / 0 `unclassified`)** plus the
+220-thread fixture against the **real NVIDIA NIM endpoint** via `.env`. The 365 rows are the full set
+— a sampled answer and a full answer are observably different (227 is not reachable from a sample).
+It asserts:
+
+1. **Zero is real:** the run ends `inbox_remaining == 0` and `distance_to_zero == 0`, with **no human
+   intervention** — no approval step, no `force=True`, no manual sweep.
+2. **All 227 are labelled, not lost:** every formerly-`held_by_never_miss` thread is `status="applied"`
+   with a `ZeroInbox/{Urgent,Important,People}` label attached, a non-null `undo_token`, and `INBOX`
+   removed. **Zero threads in Trash; zero `ActionLog.operation` outside `{archive, add_label,
+   remove_label}`.**
+3. **Nothing is archived unlabelled:** a seeded never-miss thread whose category has been deleted is
+   **not** archived — it stays in the inbox and is reported under `no_never_miss_label`.
+4. **The self-address bug is dead:** the 18 self-addressed threads produce **zero** reply-history
+   holds, and `SenderProfile.ever_replied` is false for the account's own address and its aliases.
+   *(Fails against pre-Phase-9 code.)*
+5. **No-reply senders never claim correspondence:** the five measured live no-reply addresses produce
+   zero reply-history signals, while still being eligible for a time-sensitive never-miss label.
+6. **The review gate is not vacuous:** with the reviewer stubbed to fail, **zero** mutations occur,
+   every affected row is `review_failed`, and `apply_decision` raised `NotReviewedError` before the
+   mutator (spy). With the reviewer auditing a strict subset, only the audited rows are `reviewed`.
+   *(Fails against pre-Phase-9 code.)*
+7. **`digest` is audited:** every `digest` proposal in the run has a reviewer verdict; none reaches
+   the mutator as `provisional`.
+8. **The floor still binds:** a below-floor thread is `needs_your_call`, stays in the inbox, and is
+   **not** archived by the reframe.
+9. **`NEVER_ARCHIVE_KEYS` still holds:** setting `people`/`urgent`/`legal`/`important` to
+   `default_action="archive"` raises on create and on update, in the same test run in which those
+   categories successfully receive never-miss archives.
+10. **Bulk undo:** run-level undo returns all 227 threads to the inbox with their exact pre-triage
+    label sets; a second call makes zero Gmail calls.
+11. **`dry_run` is absolute:** the same run under `dry_run=true` performs zero Gmail mutations and
+    still produces the complete ledger.
+12. **No side door:** across the whole run `apply_decision` is never called with `force=True`, and
+    `Decision.review_state` is never written outside `finalise_review` / `upgrade_review_state`
+    (ORM attribute spy).
+13. **Honesty:** with the mutator patched to raise, the run reports `apply_ok=false`, a non-null
+    `error_message`, a `run_apply_failed` event, and **"we reached zero" is absent** from the ledger
+    payload.
+14. **Ledger arithmetic:** `inbox_remaining == sum(remainder buckets) + distance_to_zero`, and the
+    `unreviewed_applied` figure equals the count the `0008` migration reported.
+
+`tests/integration/test_taxonomy_discovery.py`, `tests/integration/test_reorganise.py` and
+`tests/integration/test_review_gate_integrity.py` are load-bearing alongside it.
+`tests/integration/test_no_body_persisted.py` and `tests/integration/test_drive_to_zero.py` must still
+pass — Phase 9 must not regress the privacy or Phase 7 guarantees. Where `test_drive_to_zero.py`
+asserts the **old** never-miss semantic (a `held_by_never_miss` thread remains in the inbox), slice 3
+**updates that specific assertion to the new semantic and says so in its report**; every other
+assertion in that file stays untouched.
+
+#### Production safety (binding on every implementer and the auditor)
+
+`zero_inbox.db` holds **~12,500 real decisions for 2 real accounts**, and the server on `:8001` is
+**in use**.
+
+- **Never write an ad-hoc script against the real DB.** `get_settings()` is cached and does **not**
+  honour an env override from a standalone script. Every test uses `_isolated_db`.
+- **Do not kill or restart the supervised server on `:8001`**, and do not start a second one.
+- **Do not launch a full-inbox triage run and do not launch a re-organisation against the live
+  account** while building or gating. Fixtures only.
+- Migrations `0008` and `0009` are the only sanctioned writes to real user rows, and only via
+  `uv run alembic upgrade head` — never by hand, never by script. `0008` must never rewrite an
+  already-`applied` row.
+
+#### How the user tests it
+
+1. `uv run alembic upgrade head`, then `cd frontend && pnpm build && cd .. && uv run python -m src`.
+2. Open **http://localhost:8001/app/** → **Settings → Taxonomy** → **Rebuild my categories from my
+   mail**. You get a proposal derived from *your* senders — Apple, Google, Facebook, PayPal,
+   BookMyShow appear by name, with thread counts, not a generic list. Every proposed category shows
+   the senders it will absorb and how many of your **16 no-fit** and **46 low-confidence** threads it
+   resolves. Edit anything you disagree with, then **Approve**.
+3. You are offered **Re-organise everything**. Accept. Watch the progress card on the main page —
+   **with no clicks** — count through your ~10,336 past decisions, including relabelling mail that is
+   already archived. Anything it cannot do is listed **while it runs**, by reason and count, not
+   hidden until the end.
+4. When it finishes, click **Undo the whole re-organisation** if you want your old state back: one
+   button, one operation, everything returns. Then re-run it.
+5. Run triage. When it completes the **Inbox-Zero card** reads **0 still in your inbox**. Not 365.
+6. **Check Gmail.** Your inbox is empty. The 227 threads that used to sit there are now under
+   `ZeroInbox/Urgent`, `ZeroInbox/Important` and `ZeroInbox/People` — **one click in the sidebar**,
+   each labelled with why it was held. The Apple / Google / Facebook security and sign-in notices are
+   under Urgent. **Nothing is in Trash. Nothing was deleted.**
+7. Open **Settings → Taxonomy** and try to set **People** or **Urgent** to archive-by-default. It is
+   still refused, with the note *"kept for you — archived under its own label, never swept as a
+   category."* That is the distinction this phase is built on: your Urgent mail leaves the inbox
+   **into Urgent**; the Urgent category is never treated as noise.
+8. Click **Undo this run** and confirm all 227 come back to the inbox exactly as they were. Then
+   re-run.
+9. Mail yourself something from your own address. It is **not** treated as "a sender you reply to"
+   any more — the *"24 replies of 0 received"* nonsense is gone.
+10. **Real in Phase 9:** inbox-derived taxonomy with evidence, taxonomy redo, full re-organisation of
+    all past decisions with live progress and one-button bulk undo, never-miss-as-label reaching
+    actual zero, the review gate made real, and the self-address fix. **Labelled stubs remaining:**
+    none.
+
+> **If step 5 shows anything other than 0, or step 6 finds a never-miss thread archived without a
+> label, or step 7 lets you set People to archive — Phase 9 is not done, regardless of what the other
+> steps show.**

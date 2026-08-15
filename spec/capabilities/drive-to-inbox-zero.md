@@ -357,10 +357,47 @@ and before `second_pass_reviewer`**. It is the only stage in the system that may
 7. **No body text is persisted or emitted.** The new events and ledgers carry counts, ids, categories
    and reasons only (`tests/integration/test_no_body_persisted.py` still passes).
 
+### H. Phase 9 — the target is actual zero, with no human in the loop
+
+Phase 7 made the remainder **honest**. Phase 7's remainder was still **365**, and 227 of it was
+structurally unclearable: a never-miss verdict could only be expressed as *stay in the inbox*.
+
+- **`held_by_never_miss` is no longer a floor.** From Phase 9 a never-miss verdict is expressed as
+  **archive into the never-miss category's own label**, so it leaves the inbox while keeping — and
+  improving — its findability. The full reasoning, the measured evidence and the reconciliation with
+  `NEVER_ARCHIVE_KEYS` live in
+  [never-miss-safeguards](never-miss-safeguards.md#phase-9-the-never-miss-semantic-is-redefined--from-hold-to-label).
+  This capability only consumes the outcome.
+- **The other three buckets are closed by the taxonomy, not by archiving harder.** `category_keep`
+  (76), `below_threshold` (46) and `needs_your_call` (16) are what a taxonomy that does not fit this
+  inbox looks like. [inbox-derived-taxonomy](inbox-derived-taxonomy.md) derives a fitting one and
+  re-organises past decisions to match; the measure of success is those buckets reaching **zero**.
+  **The confidence floor is not lowered and `needs_your_call` is still never archived.**
+- **The target is `inbox_remaining == 0`, not `distance_to_zero == 0`.** `distance_to_zero == 0` only
+  says the agent did what it decided to do. A run is complete for Phase 9 when the inbox is genuinely
+  empty **and no human touched it**.
+- **Two new remainder buckets, both honest:** `no_never_miss_label` (a never-miss verdict with no
+  resolvable label — the thread **stayed in the inbox** rather than being archived unlabelled) and
+  `unreviewed_applied` (the historic count of rows applied before the review-gate fix). Rule E's
+  arithmetic is unchanged: `inbox_remaining == sum(remainder buckets) + distance_to_zero`.
+- **Rule E is not relaxed.** *"We reached zero"* must never appear unless the inbox is genuinely
+  empty, and anything that could not be archived must be **named with its reason**. A phase whose
+  whole goal is zero is exactly the phase most tempted to print it early.
+
+Item 6 of Rule G above is superseded by the extended form: **`urgent`, `people`, `legal` and
+`important` all reject `default_action = archive`** — kept, extended, and reconciled with the reframe
+rather than deleted. Items 1–5 and 7 are unchanged and binding.
+
 ---
 
 ## Success Criteria
 
+- [ ] **(Phase 9)** Over the 365-row remainder fixture replaying the measured live distribution
+      (227 / 76 / 46 / 16 / 0) a run ends `inbox_remaining == 0` **and** `distance_to_zero == 0` with
+      no human intervention, and every formerly-held thread is archived **with** a `ZeroInbox/*` label
+      and a non-null undo token.
+- [ ] **(Phase 9)** With the mutator patched to raise, the ledger payload does **not** contain
+      "we reached zero", reports `apply_ok=false` and names the reason.
 - [ ] `effective_threshold` returns `0.80` for a Newsletters category with a NULL threshold and default
       settings, `0.85` for Outreach, and never returns a value below `settings.confidence_floor`.
 - [ ] Replaying the measured `fbeed060` archive distribution (0 / 22 / 522 / 71 across the

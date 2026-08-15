@@ -34,6 +34,18 @@ of the full thread for borderline cases — so most threads are resolved without
 ## Business Rules
 - **Tier 1 — deterministic rules.** Exact matches on sender, domain, `List-Id`, subject regex,
   attachment presence. No token cost. Sets `decided_by="rule"` and records `rule_id`.
+- **Tier 1 is where a derived taxonomy pays off (Phase 9).** Discovery
+  ([inbox-derived-taxonomy](inbox-derived-taxonomy.md#a6-concentration-becomes-tier-1-rules)) converts
+  the user's measured sender concentration into **ordinary tier-1 rules** — `kind=deterministic`,
+  `source=mined`, `status=active` — matched by this same matcher, unchanged. Phase 9 adds **no second
+  classification path**: a mined rule is indistinguishable at triage time from a seed or user rule,
+  lands `decided_by="rule"` with `rule_id` set, and costs zero tokens.
+  This is what makes the Phase 9 target reachable: on the measured inbox the five Facebook addresses
+  (~1,586 threads), the two BookMyShow addresses (~635) and `contact@jagrititheatre.com` (334) — about
+  half the mail — resolve here, at confidence **well above `confidence_floor`**, so they never reach
+  tier 3 to be squeezed into an ill-fitting generic category. `needs_your_call` and `below_threshold`
+  are produced by asking the model a question it cannot answer well; concentration removes the
+  question. **The LLM is reserved for the genuine long tail.**
 - **Tier 2 — sender history.** Unresolved threads only. `ever_replied = true` → keep at high
   confidence. A bulk sender the user has never opened and has repeatedly archived → archive proposal.
   Sets `decided_by="sender_history"`.
@@ -68,6 +80,12 @@ of the full thread for borderline cases — so most threads are resolved without
 - [ ] A forced LLM failure results in `needs_your_call` decisions, never `archive` decisions.
 - [ ] A thread whose sender the user has replied to is never proposed for archive.
 - [ ] The same run resumed after interruption produces no duplicate decision rows.
+- [ ] **Mined sender rules resolve at tier 1, not tier 3.** With the measured concentration fixture
+      loaded (5 Facebook addresses, 2 BookMyShow addresses, Jagriti, Apple, PayPal, Twitter at their
+      measured counts) and discovery's mined rules materialised, every thread from a sender with
+      ≥ 10 threads ends `decided_by="rule"` with a non-null `rule_id` and confidence above
+      `confidence_floor`, and **zero** of them appear in any LLM batch payload. A run that reaches the
+      same categories via `decided_by="llm"` fails this criterion.
 - [ ] A run containing 20 `decided_by="error"` rows, when resumed, re-classifies exactly those 20
       (none ends `decided_by="error"`), produces zero duplicate `(run_id, item_id)` pairs, and re-sends
       no already-`reviewed` thread to the LLM.

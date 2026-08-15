@@ -375,6 +375,66 @@ list (`src/api/account.py:_user_scoped_tables`): every table in `Base.metadata` 
 It performs **zero** Gmail calls: deleting the account does not un-archive, un-label or delete a
 single message.
 
+## Phase 9 entities
+
+### `reorg_jobs` — one re-organisation of the whole mailbox
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | text PK | |
+| `user_id` | text FK → `users.id` | user-scoped like every other table |
+| `status` | text | `running` \| `completed` \| `partial` \| `cancelled` \| `failed`. **`partial` whenever anything was skipped** — `completed` never hides a skip |
+| `total` | int | every decision in scope, including already-archived threads. Never a capped or sampled number |
+| `done` | int | successfully re-organised |
+| `skipped` | JSON | `{reason: count}` over the closed set `not_reviewed`, `no_category_fit`, `gmail_error`, `already_correct`, `dry_run`, `cancelled`. **`done + sum(skipped.values()) == total` is an invariant, asserted in tests** |
+| `cursor` | text NULL | resume point; a killed job restarts from here and re-does nothing |
+| `dry_run` | bool | absolute — a dry-run job mutates nothing and still produces the full ledger |
+| `started_at` / `finished_at` | timestamp | |
+| `error_message` | text NULL | non-null whenever `status ∈ {partial, failed}`, in human-readable words |
+
+`action_logs` gains **`reorg_job_id`** (text NULL, FK → `reorg_jobs.id`, indexed) so bulk undo of a
+whole re-organisation is a single indexed query over rows with a non-null `undo_token`, reversed in
+insertion order. No new content-bearing column is added anywhere in this phase.
+
+### `decisions.review_state` — semantics tightened (Phase 9, no schema change)
+
+The column is unchanged; what it **means** is tightened. `reviewed` is now a claim about **that
+decision** — it is written only for rows the second-pass reviewer actually audited — not a claim about
+the run it belonged to. Rows no reviewer saw stay `provisional` and are therefore unappliable. See
+[never-miss-safeguards](capabilities/never-miss-safeguards.md#review-state-is-per-decision).
+
+## Phase 9 migrations
+
+Two revisions, owned by two different slices, chained explicitly.
+
+**`0008_review_state_integrity`** (`down_revision = "0007_sessions_and_mailbox_ownership"`) — no
+schema change; a **guarded data correction**:
+
+```sql
+UPDATE decisions SET review_state = 'provisional'
+ WHERE review_state = 'reviewed'
+   AND proposed_action <> 'archive'      -- never audited under the pre-Phase-9 reviewer scope
+   AND status <> 'applied';              -- an applied row is history; it is not rewritten
+```
+
+It **counts** the rows that are `reviewed`, non-`archive` **and** already `applied` (expected: **44**)
+and logs the number rather than touching them. Those rows are surfaced honestly as the
+`unreviewed_applied` ledger figure. Rewriting them would make the database claim a review that never
+happened — the exact failure this migration exists to end. Idempotent and re-runnable; the downgrade
+is a no-op by design (there is no record of which rows were downgraded, and re-asserting a false
+`reviewed` would be worse than leaving them provisional).
+
+**`0009_reorg_jobs`** (`down_revision = "0008_review_state_integrity"`) — `CREATE TABLE reorg_jobs`,
+`ALTER TABLE action_logs ADD COLUMN reorg_job_id TEXT NULL`, and `ix_action_logs_reorg_job`. Purely
+additive; fully reversible.
+
+After both, `alembic heads` prints a **single** head, `0009_reorg_jobs`.
+
+> **Assumed:** the gate's migration check runs against a throwaway
+> `data/phase9_migration_check.db` via an `AGENT_DATABASE_URL` override on the command line, never
+> against `zero_inbox.db`. Alembic runs in its own process and reads the env fresh, so the cached
+> `get_settings()` hazard does not apply — but only for a separate process, never for an in-test call.
+
 ---
 
 ## Lifecycle

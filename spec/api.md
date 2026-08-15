@@ -295,6 +295,39 @@ and the run reports it. See
 - `user_sessions.last_seen_at` is updated at most once per 60 s per session, so the device list is
   useful without a write per request.
 
+## Phase 9 — Inbox-derived taxonomy and re-organisation
+
+All routes are user-scoped, return the standard envelope, and `404` for another user's row.
+Capability: [inbox-derived-taxonomy](capabilities/inbox-derived-taxonomy.md).
+
+### Routes
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/taxonomy/discover` | Build the sender census + gap set and return a **proposal only**. Mutates nothing — no category, no label, no mail. Response: `{proposal: [{key, name, description, default_action, rationale, evidence_senders: [...], covered_threads}], coverage: {covered_threads, uncovered_threads, gap_threads_resolved, gap_threads_total}, partial: bool, partial_reason: string\|null}` |
+| `POST` | `/api/taxonomy/apply` | Apply an (optionally user-edited) proposal: create / rename / retire categories and their `ZeroInbox/*` labels. Returns the applied diff and `reorg_recommended: bool`. `422 validation_error` if any category is evidence-free or if a `NEVER_ARCHIVE_KEYS` category carries `default_action="archive"` |
+| `POST` | `/api/reorg` | Start a re-organisation of **every** past decision for the user, including already-archived threads. Body `{dry_run?: bool}`. `409 reorg_in_progress` if one is running; `409 run_in_progress` if a triage run is applying. Returns `{job_id}` |
+| `GET` | `/api/reorg/{job_id}` | Ledger: `{status, total, done, skipped: {reason: count}, undoable, error_message}`. `status ∈ {running, completed, partial, cancelled, failed}`. **`done + sum(skipped) == total` always.** `partial` is used whenever anything was skipped — `completed` never hides a skip |
+| `POST` | `/api/reorg/{job_id}/cancel` | Cancel; already-done work stays done and is fully undoable |
+| `POST` | `/api/reorg/{job_id}/undo` | **Bulk undo — the whole re-organisation as ONE operation.** Restores every mutated thread's exact pre-job label set, in reverse order. Idempotent: a second call performs **zero** Gmail calls and returns the same counts. Returns `{reversed, already_undone, failed: [{thread_id, reason}]}` |
+
+Skip reasons are a closed set: `not_reviewed`, `no_category_fit`, `gmail_error`, `already_correct`,
+`dry_run`, `cancelled`. Anything not re-organised is named — never silently dropped, never sampled,
+never capped.
+
+### Run payload additions (Phase 9)
+
+`GET /api/runs/{id}` gains two remainder buckets: `no_never_miss_label` (a never-miss verdict with no
+resolvable label — the thread stayed in the inbox rather than being archived unlabelled) and
+`unreviewed_applied` (the honest historic count of rows applied before the review-gate fix landed).
+`inbox_remaining == sum(remainder buckets) + distance_to_zero` still holds.
+
+### SSE events (Phase 9)
+
+`reorg_progress` `{job_id, done, total, phase, current_category}` — emitted at least every 3 s while a
+job runs (the Phase 7 no-silent-beat rule applies unchanged). `reorg_finished`
+`{job_id, status, done, skipped}`. Neither carries a subject, body, snippet or unredacted content.
+
 ## Error codes
 
 `unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `already_undone` (409) ·
@@ -304,4 +337,6 @@ to resume) · `not_reviewed` (422, the decision has not passed the never-miss re
 applied) · `not_appliable` (409, the run is not `completed` so its decisions cannot be applied) ·
 `mailbox_already_connected` (409, that address is connected to a different Zero Inbox account) ·
 `not_retryable` (409, the run is not `completed` or has nothing left to review) ·
-`auth_declined` (400, the user cancelled the Google consent screen).
+`auth_declined` (400, the user cancelled the Google consent screen) ·
+`reorg_in_progress` (409, a re-organisation is already running for this user) ·
+`run_in_progress` (409, a triage run is applying — two writers against one mailbox is not supported).

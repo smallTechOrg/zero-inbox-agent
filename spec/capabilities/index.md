@@ -74,3 +74,13 @@ for the phase plan and slices.
 | [account-and-identity](account-and-identity.md) | Sign-in as its own OAuth intent (`openid email profile`) separate from mailbox consent; revocable server-side sessions with a device list and sign-out-everywhere; globally unique mailbox ownership; session hardening; disconnect a mailbox and delete an account, neither of which touches Gmail |
 | [review-recovery](review-recovery.md) | **Retry review** — re-runs the real never-miss reviewer over a completed run's `provisional` / `review_failed` decisions and applies whatever it passes, so an outage during the reviewer no longer costs a whole run. It re-enters the gate; it never bypasses it |
 | [never-miss-safeguards](never-miss-safeguards.md) | Unchanged and binding: retry-review calls the same reviewer and the same `apply_decision()`, never writes `review_state` directly and never uses `force=True` |
+
+## Phase 9 — Inbox Zero Without a Human
+
+| Capability | What it does |
+|------------|--------------|
+| [never-miss-safeguards](never-miss-safeguards.md) | **Redefined (user-authorised):** a never-miss verdict now means *archive it and label it*, not *leave it in the inbox* — the guarantee is labelling + recoverability, not inbox residency. Plus the two integrity fixes: `review_state` becomes a claim about the **decision** (only actually-audited rows are marked `reviewed`) and the reviewer's audit scope becomes **every mutating action**, not the `archive` label; and correspondent truth — the user's own address, its aliases, and no-reply senders can never generate a reply-history signal |
+| [inbox-derived-taxonomy](inbox-derived-taxonomy.md) | Discovers the category set from the user's real senders and volumes (with `needs_your_call` + `below_threshold` as the gap signal that must go to zero), lets the user redo it whenever they want, and **re-organises every past decision** — including already-archived threads — resumably, rate-limited, fully ledgered and reversible by a single bulk undo |
+| [drive-to-inbox-zero](drive-to-inbox-zero.md) | Extended: a run ends at **`inbox_remaining == 0`** with no human in the loop; anything that could not be archived is named in the ledger with its reason, and "we reached zero" is still never printed unless the inbox is genuinely empty |
+| [taxonomy-management](taxonomy-management.md) | Extended: `Important` joins the seed set and `NEVER_ARCHIVE_KEYS`; the category-wide archive guard is reconciled with the reframe and kept |
+| [gmail-actions-and-undo](gmail-actions-and-undo.md) | Extended: `archive_to_never_miss_label`, bulk relabel for re-organisation, and **bulk undo of a whole re-organisation as one operation** |

@@ -628,6 +628,60 @@ screen 14 and is restated here because Phase 8 adds a new bar (screen 24) to the
 
 ---
 
+# Phase 9 — Inbox zero without a human
+
+## Phase 9 screens
+
+### 26. Taxonomy discovery *(Phase 9 — Settings → Taxonomy)*
+
+- A primary button: **Rebuild my categories from my mail**. Loading state names what it is doing
+  (*"reading your senders — no mail is changed"*), because it can take tens of seconds.
+- The result is a **diff**, not a list: `KEEP` / `RENAME` / `MERGE` / `ADD` / `RETIRE` rows, each with
+  its **evidence** — the senders it absorbs and their thread counts — and an editable name,
+  description and `default_action`.
+- A coverage line: *"Covers 9,812 of 10,336 threads · resolves 16 of 16 threads that had no category
+  and 46 of 46 low-confidence threads."* If it resolves fewer than all of them, the remainder is
+  **named**, never rounded away.
+- A `partial` proposal (the model was unavailable) renders amber and says so. It is never presented
+  as derived when it is the seed set.
+- **Nothing is mutated until Approve.** The button says so.
+- After Approve: **Re-organise everything** is offered, with a plain statement of scope
+  (*"~10,336 past decisions, including mail already archived"*) and the fact that it is undoable in
+  one click.
+
+### 27. Re-organisation progress *(Phase 9 — main page, no clicks required)*
+
+- Renders in the main column (never only in the drawer), above the live feed while a job runs.
+- `done / total`, current phase and current category, updating at least every 3 s. **Working-but-slow
+  and stuck must look different** — the Phase 7 no-silent-beat rule applies unchanged.
+- The **skipped-by-reason table renders while the job runs**, not only at the end: one row per reason
+  (`not_reviewed`, `no_category_fit`, `gmail_error`, `already_correct`, `dry_run`, `cancelled`) with
+  its count. Nothing skipped is ever invisible.
+- **Cancel** and, on completion, **Undo the whole re-organisation** — one button, one operation, with
+  a confirm dialog naming the exact count it will reverse.
+- A job that skipped anything renders **amber with `Partial`** and its reasons. It never renders
+  green, and it never says "completed".
+
+### 28. Inbox-Zero card at actual zero *(Phase 9 — revises screen 16)*
+
+- The ledger reaches **0 still in your inbox**, with the new rows `no_never_miss_label` and
+  `unreviewed_applied` shown whenever non-zero.
+- The card states the redefinition in plain words, because the user must not have to infer it:
+  *"Mail we judged important was **archived under its own label**, not deleted — it's one click away
+  in Gmail."* — with `ZeroInbox/Urgent`, `ZeroInbox/Important` and `ZeroInbox/People` as links, each
+  showing its count.
+- **"We reached zero" renders only when `inbox_remaining === 0`.** Any other value renders the
+  remainder by reason. The Phase 8 honesty rule is unchanged.
+
+### 29. The never-archive note *(Phase 9 — Settings → Taxonomy editor)*
+
+The `NEVER_ARCHIVE_KEYS` categories (People, Urgent, Legal, Important) keep their **disabled**
+archive-by-default control, and the disabled reason is now explanatory rather than bare:
+*"kept for you — archived under its own label, never swept as a category."* Every disabled control
+still carries a reason; state is still never colour alone.
+
+---
+
 ## States (required for every list surface)
 
 | State | Treatment |
@@ -641,6 +695,8 @@ screen 14 and is restated here because Phase 8 adds a new bar (screen 24) to the
 | Signed out (Phase 8) | the homepage (screen 19) — **never** an empty console, never a console skeleton, never a spinner that resolves to nothing |
 | Signed in, no mailbox (Phase 8) | onboarding step 1 (screen 21) — not the cluster list with an empty state |
 | Completed run with `not_reviewed > 0` (Phase 8) | the amber unreviewed bar with **Retry review** (screen 24), in addition to any apply-failure bar |
+| Re-organisation running (Phase 9) | screen 27 in the main column with live counts and the mid-run skipped-by-reason table — never a bare progress bar, never drawer-only |
+| Re-organisation that skipped anything (Phase 9) | amber `Partial` with every reason and count — never green, never "completed" |
 | Session revoked elsewhere (Phase 8) | any `/api/*` returning `unauthenticated` mid-session redirects to screen 19 with the line *"You were signed out."* — never a wall of failed panels |
 
 ## Accessibility & build constraints
