@@ -20,6 +20,23 @@ class SchemaNotReady(ChannelError):
     """The db-schema slice has not provided `User` / `ChannelAccount` yet."""
 
 
+class MailboxOwnedByAnotherUser(ChannelError):
+    """Phase 8: this address is already connected to a **different** Zero Inbox user.
+
+    Two distinct users pointing at one mailbox would mean two agents mutating one
+    inbox under two independent policies. The route maps this to
+    ``409 mailbox_already_connected``; nothing is written when it is raised.
+    """
+
+    def __init__(self, account_email: str, channel: str = "gmail") -> None:
+        self.account_email = account_email
+        self.channel = channel
+        super().__init__(
+            f"{account_email} is already connected to another Zero Inbox account. "
+            "Sign in as that account, or disconnect it there first."
+        )
+
+
 def _models():
     try:
         from db import models
@@ -61,6 +78,24 @@ class SqlConnectionStore:
 
         User, ChannelAccount = _models()
         with create_db_session() as session:
+            # Phase 8 — the ownership guard runs FIRST, before a single row is
+            # created, so a rejected connect writes nothing at all (not even the
+            # `users` row a brand-new signer-in would otherwise get).
+            owner_id = (
+                session.query(ChannelAccount.user_id)
+                .filter(
+                    ChannelAccount.channel == channel,
+                    ChannelAccount.account_email == email,
+                )
+                .limit(1)
+                .scalar()
+            )
+            existing_user_id = (
+                session.query(User.id).filter(User.email == email).limit(1).scalar()
+            )
+            if owner_id is not None and owner_id != existing_user_id:
+                raise MailboxOwnedByAnotherUser(email, channel)
+
             user = session.query(User).filter(User.email == email).one_or_none()
             if user is None:
                 user = User(
@@ -101,6 +136,36 @@ class SqlConnectionStore:
 
             ensure_default_taxonomy(session, user.id)
             return user.id, account.id
+
+    def upsert_user(self, *, email: str, display_name: str) -> str:
+        """Phase 8 ``intent=signin``: the identity row and nothing else.
+
+        Writes **no** ``channel_accounts`` row, requires no refresh token, and
+        starts no triage run — signing in is not the same act as granting mailbox
+        access. The default taxonomy is seeded so the account is usable the
+        moment a mailbox is connected.
+        """
+        from db.session import create_db_session
+
+        User, _ChannelAccount = _models()
+        with create_db_session() as session:
+            user = session.query(User).filter(User.email == email).one_or_none()
+            if user is None:
+                user = User(
+                    id=str(uuid4()),
+                    email=email,
+                    display_name=display_name or email.split("@")[0],
+                    created_at=_now(),
+                )
+                session.add(user)
+                session.flush()
+            elif display_name and not user.display_name:
+                user.display_name = display_name
+
+            from db.seed import ensure_default_taxonomy
+
+            ensure_default_taxonomy(session, user.id)
+            return user.id
 
     def load_refresh_token(self, *, user_id: str, connection_id: str) -> str:
         """Decrypt the stored refresh token for one user's connection.

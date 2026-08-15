@@ -1,17 +1,27 @@
 """Google OAuth web flow + dashboard session.
 
-Completing the Gmail OAuth flow both connects the mailbox and establishes the
-session — there is no separate login in v1.
+Phase 8 splits one flow into two **intents**:
+
+* ``intent=signin`` asks Google for ``openid email profile`` only. It upserts the
+  ``users`` row, issues a session and returns. It writes **no** ``channel_accounts``
+  row, requires **no** refresh token and starts **no** triage run.
+* ``intent=connect`` (and a missing ``intent``) is the pre-Phase-8 behaviour, byte
+  for byte, including the auto-triage background task.
+
+The intent round-trips inside the **signed** ``zi_oauth_state`` cookie
+(``{state, code_verifier, intent}``) and is read only from there on the callback —
+read from the query string it would be attacker-controlled, and the scope decision
+along with it.
 
 Routes
 ------
-GET  /auth/google/start     302 → Google consent
-GET  /auth/google/callback  code → tokens → connection + session → 302 /app/
-POST /auth/logout           clears the session cookie
+GET  /auth/google/start     302 → Google consent (scopes chosen by intent)
+GET  /auth/google/callback  code → tokens → user (+ connection) + session → 302 /app/
+POST /auth/logout           revokes the current user_sessions row, clears the cookie
 
-Cookie contract (read by `api/session.py`): ``zi_session`` is an itsdangerous
-``URLSafeTimedSerializer`` token, salt ``zi-session``, payload ``{"user_id": ...}``,
-signed with ``AGENT_SECRET_KEY``.
+Cookie contract (owned by `api/session.py`): ``zi_session`` is an itsdangerous
+``URLSafeTimedSerializer`` token, salt ``zi-session-v1``, payload ``{"uid", "sid"}``,
+signed with ``AGENT_SECRET_KEY`` — which is **required**; there is no dev fallback.
 """
 
 from __future__ import annotations
@@ -22,9 +32,19 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from api.session import issue_session_token, read_session_token, set_session_cookie
+from api.session import (
+    COOKIE_NAME,
+    create_user_session,
+    issue_session_token,
+    read_session_payload,
+    read_session_token,
+    revoke_session,
+    set_session_cookie,
+)
 from channels.base import ReauthRequired
 from channels.gmail.oauth import (
+    CONNECT_SCOPES,
+    SIGNIN_SCOPES,
     OAuthConfigError,
     OAuthExchangeError,
     OAuthResult,
@@ -32,7 +52,7 @@ from channels.gmail.oauth import (
     exchange_code,
     google_oauth_config,
 )
-from channels.gmail.store import SqlConnectionStore
+from channels.gmail.store import MailboxOwnedByAnotherUser, SqlConnectionStore
 from security.crypto import TokenCipher, get_secret_key
 
 __all__ = [
@@ -43,6 +63,8 @@ __all__ = [
     "read_session_user_id",
     "OAuthExchangeError",
     "SESSION_COOKIE",
+    "INTENT_SIGNIN",
+    "INTENT_CONNECT",
 ]
 
 router = APIRouter(tags=["auth"])
@@ -55,12 +77,32 @@ SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 STATE_MAX_AGE = 60 * 10
 DASHBOARD_URL = "/app/"
 
+INTENT_SIGNIN = "signin"
+INTENT_CONNECT = "connect"
+#: A missing or unrecognised intent means `connect` — the pre-Phase-8 behaviour.
+VALID_INTENTS = (INTENT_SIGNIN, INTENT_CONNECT)
+
 
 # --- session cookie ----------------------------------------------------
 
 
+class SecretKeyMissing(RuntimeError):
+    """``AGENT_SECRET_KEY`` is unset. Phase 8 removed the dev fallback.
+
+    Signing session cookies with a public constant meant anyone could mint a
+    cookie for any user id, so a missing key now fails loudly at startup rather
+    than quietly producing forgeable sessions.
+    """
+
+
 def _serializer(salt: str) -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(get_secret_key() or "insecure-dev-key", salt=salt)
+    key = get_secret_key()
+    if not key:
+        raise SecretKeyMissing(
+            "AGENT_SECRET_KEY is not set — add it to .env. Sessions are never "
+            "signed with a fallback key."
+        )
+    return URLSafeTimedSerializer(key, salt=salt)
 
 
 # The session cookie is owned by `api/session.py` — it is the only module that
@@ -86,12 +128,22 @@ def get_connection_store() -> SqlConnectionStore:
 
 
 def get_code_exchanger():
-    """Returns `(code, state) -> OAuthResult` against the real Google endpoint."""
+    """Returns `(code, state, code_verifier, scopes=?) -> OAuthResult`.
+
+    ``scopes`` is keyword-only and optional so the connect path calls it with
+    exactly the arguments it always did.
+    """
 
     def _exchange(
-        code: str, state: str | None, code_verifier: str | None = None
+        code: str,
+        state: str | None,
+        code_verifier: str | None = None,
+        *,
+        scopes=None,
     ) -> OAuthResult:
-        return exchange_code(google_oauth_config(), code, state, code_verifier)
+        return exchange_code(
+            google_oauth_config(scopes), code, state, code_verifier
+        )
 
     return _exchange
 
@@ -114,22 +166,37 @@ def _secure_cookie(request: Request) -> bool:
 
 
 @router.get("/auth/google/start")
-def google_start(request: Request):
-    """Send the user to the real Google consent screen with a CSRF state."""
+def google_start(request: Request, intent: str | None = None):
+    """Send the user to the real Google consent screen with a CSRF state.
+
+    ``intent=signin`` requests name and email only; anything else (including no
+    intent at all) requests the Gmail connect scopes exactly as before.
+    """
+    resolved_intent = intent if intent in VALID_INTENTS else INTENT_CONNECT
+    scopes = SIGNIN_SCOPES if resolved_intent == INTENT_SIGNIN else CONNECT_SCOPES
+
     try:
-        config = google_oauth_config()
+        config = google_oauth_config(scopes)
     except OAuthConfigError as exc:
         return _error("validation_error", str(exc), 422)
 
     state = secrets.token_urlsafe(24)
-    url, code_verifier = build_authorization_url(config, state=state)
+    url, code_verifier = build_authorization_url(config, state=state, scopes=scopes)
 
     response = RedirectResponse(url, status_code=302)
     response.set_cookie(
         STATE_COOKIE,
         # The PKCE verifier rides along in the same signed, httponly cookie as
         # the CSRF state — it must reach the callback to complete the exchange.
-        _serializer(STATE_SALT).dumps({"state": state, "code_verifier": code_verifier}),
+        # So does the intent: read from the query string on the callback it would
+        # be attacker-controlled, and with it the scope decision.
+        _serializer(STATE_SALT).dumps(
+            {
+                "state": state,
+                "code_verifier": code_verifier,
+                "intent": resolved_intent,
+            }
+        ),
         max_age=STATE_MAX_AGE,
         httponly=True,
         samesite="lax",
@@ -163,16 +230,27 @@ def google_callback(
     if not code:
         return _error("validation_error", "Missing authorization code", 422)
 
-    verifier = (_read_state_cookie(request) or {}).get("code_verifier") or None
+    state_payload = _read_state_cookie(request) or {}
+    verifier = state_payload.get("code_verifier") or None
+    # The intent comes from the SIGNED cookie only — never from the query string.
+    intent = state_payload.get("intent")
+    intent = intent if intent in VALID_INTENTS else INTENT_CONNECT
 
     try:
-        result: OAuthResult = exchanger(code, state, verifier)
+        if intent == INTENT_SIGNIN:
+            result: OAuthResult = exchanger(code, state, verifier, scopes=SIGNIN_SCOPES)
+        else:
+            # Byte for byte the pre-Phase-8 call.
+            result = exchanger(code, state, verifier)
     except ReauthRequired as exc:
         return _error("reauth_required", str(exc), 409)
     except OAuthExchangeError:
         return _error(
             "provider_error", "Google could not complete the sign-in. Please retry.", 502
         )
+
+    if intent == INTENT_SIGNIN:
+        return _complete_signin(request, result, store)
 
     if not result.refresh_token:
         return _error(
@@ -187,20 +265,50 @@ def google_callback(
         )
 
     refresh_token_enc = TokenCipher().encrypt(result.refresh_token)
-    user_id, connection_id = store.upsert_user_and_connection(
-        email=result.account_email,
-        display_name=result.display_name or result.account_email.split("@")[0],
-        refresh_token_enc=refresh_token_enc,
-        scopes=list(result.scopes),
-        channel="gmail",
-    )
+    try:
+        user_id, connection_id = store.upsert_user_and_connection(
+            email=result.account_email,
+            display_name=result.display_name or result.account_email.split("@")[0],
+            refresh_token_enc=refresh_token_enc,
+            scopes=list(result.scopes),
+            channel="gmail",
+        )
+    except MailboxOwnedByAnotherUser as exc:
+        # Nothing was written — the guard runs before the first insert. Two
+        # agents must never mutate one inbox under two independent policies.
+        return _error("mailbox_already_connected", str(exc), 409)
 
     background_tasks.add_task(_auto_triage_task, user_id=user_id, connection_id=connection_id)
 
     response = RedirectResponse(DASHBOARD_URL, status_code=302)
-    set_session_cookie(response, user_id)
+    _issue_session(response, request, user_id)
     response.delete_cookie(STATE_COOKIE, path="/")
     return response
+
+
+def _complete_signin(request: Request, result: OAuthResult, store: SqlConnectionStore):
+    """`intent=signin`: identity + session, and nothing else.
+
+    No ``channel_accounts`` row, no refresh-token requirement, no triage task.
+    """
+    if not result.account_email:
+        return _error("provider_error", "Google did not return an email address.", 502)
+
+    user_id = store.upsert_user(
+        email=result.account_email,
+        display_name=result.display_name or result.account_email.split("@")[0],
+    )
+
+    response = RedirectResponse(DASHBOARD_URL, status_code=302)
+    _issue_session(response, request, user_id)
+    response.delete_cookie(STATE_COOKIE, path="/")
+    return response
+
+
+def _issue_session(response, request: Request, user_id: str) -> None:
+    """Create a fresh ``user_sessions`` row and rotate the cookie onto it."""
+    session_id = create_user_session(user_id, request)
+    set_session_cookie(response, user_id, session_id, request=request)
 
 
 def _auto_triage_task(*, user_id: str, connection_id: str) -> None:
@@ -246,6 +354,19 @@ def _auto_triage_task(*, user_id: str, connection_id: str) -> None:
 
 @router.post("/auth/logout")
 def logout(request: Request):
+    """Revoke the current ``user_sessions`` row, then clear the cookie.
+
+    Clearing the cookie alone was never enough: a copy of it replayed from
+    anywhere still authenticated. Signing out now ends the session server-side.
+    """
+    token = request.cookies.get(COOKIE_NAME)
+    payload = read_session_payload(token) if token else None
+    if payload and payload.get("sid"):
+        try:
+            revoke_session(payload["sid"], payload["uid"])
+        except Exception:  # noqa: BLE001 — sign-out must always clear the cookie
+            pass
+
     response = JSONResponse({"data": {"logged_out": True}, "error": None})
     response.delete_cookie(SESSION_COOKIE, path="/")
     response.delete_cookie(STATE_COOKIE, path="/")

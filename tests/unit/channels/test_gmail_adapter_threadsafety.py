@@ -212,7 +212,11 @@ def test_refresh_token_factory_builds_independent_http_and_credentials(monkeypat
     """
     import channels.gmail.adapter as adapter_module
 
-    built: list[tuple[int, int]] = []
+    # Hold *live* references to every object handed to `build`. Storing `id()`
+    # instead would compare addresses of objects that are already freed by the
+    # time of the assertion, and CPython recycles freed addresses — the
+    # comparison would then be meaningless (and intermittently wrong).
+    built: list[tuple[object, object]] = []
 
     class _FakeAuthorizedHttp:
         def __init__(self, credentials, http=None):
@@ -220,7 +224,7 @@ def test_refresh_token_factory_builds_independent_http_and_credentials(monkeypat
             self.http = http
 
     def _fake_build(name, version, http=None, cache_discovery=None):
-        built.append((id(http.credentials), id(http.http)))
+        built.append((http.credentials, http.http))
         return object()
 
     monkeypatch.setattr(
@@ -243,8 +247,12 @@ def test_refresh_token_factory_builds_independent_http_and_credentials(monkeypat
 
     assert len(built) == 2
     (creds_a, http_a), (creds_b, http_b) = built
-    assert creds_a != creds_b, "credentials were shared between services"
-    assert http_a != http_b, "the httplib2 connection was shared between services"
+    # All four objects are still alive here (referenced by `built`), so identity
+    # comparison is exact.
+    assert creds_a is not None and creds_b is not None
+    assert http_a is not None and http_b is not None
+    assert creds_a is not creds_b, "credentials were shared between services"
+    assert http_a is not http_b, "the httplib2 connection was shared between services"
 
 
 # --- F2: a partial fetch is never reported as complete ---------------------

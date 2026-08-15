@@ -104,6 +104,10 @@ class ChannelAccount(Base):
     __tablename__ = "channel_accounts"
     __table_args__ = (
         UniqueConstraint("user_id", "channel", "account_email", name="uq_channel_account"),
+        # Phase 8: mailbox ownership is GLOBAL. Two distinct Zero Inbox users can
+        # never point at one inbox — that would mean two agents mutating the same
+        # mailbox under two independent policies. See spec/data.md#phase-8-migration.
+        Index("uq_channel_account_global", "channel", "account_email", unique=True),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
@@ -118,6 +122,36 @@ class ChannelAccount(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="connected")
     history_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     connected_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    #: Phase 8: surfaced on screen 22. NULL renders as "not synced yet" — never
+    #: as a fabricated date, so there is no backfill.
+    last_synced_at: Mapped[datetime | None] = _ts(nullable=True)
+
+
+class UserSession(Base):
+    """A session you can see is a session you can revoke.
+
+    Carried in the session cookie as ``sid``. **No raw IP and no raw user-agent
+    string is ever stored here** — only a derived summary ("Chrome on macOS") and
+    an HMAC of the IP, and neither the hash nor anything derived from the raw
+    values is returned by any route.
+    """
+
+    __tablename__ = "user_sessions"
+    __table_args__ = (Index("ix_user_sessions_user_active", "user_id", "revoked_at"),)
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    last_seen_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    #: Non-null ⇒ every request bearing this ``sid`` is 401.
+    revoked_at: Mapped[datetime | None] = _ts(nullable=True)
+    #: Derived, e.g. "Chrome on macOS". The raw UA string is never stored.
+    user_agent_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: HMAC-SHA256 of the client IP keyed by AGENT_SECRET_KEY. The raw IP is
+    #: never stored, never logged and never returned.
+    ip_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # --- Channel-agnostic content -------------------------------------------------------
@@ -447,6 +481,7 @@ __all__ = [
     "Base",
     "User",
     "UserSettings",
+    "UserSession",
     "ChannelAccount",
     "Item",
     "SenderProfile",

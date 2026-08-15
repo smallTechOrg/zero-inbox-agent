@@ -121,7 +121,24 @@ def _install_handlers(app: FastAPI) -> None:
         return _error_response(422, VALIDATION_ERROR, message)
 
 
+def _require_secret_key() -> None:
+    """Phase 8: ``AGENT_SECRET_KEY`` is required — fail at startup, not silently.
+
+    The old ``"insecure-dev-key"`` fallback meant a deployment missing the key
+    signed every session cookie with a string published in this repository, so
+    anyone could mint a cookie for any user id. Refusing to start is the only
+    honest behaviour.
+    """
+    from config.settings import require_secret_key
+
+    # Delegated rather than re-implemented: the canonical message names the variable
+    # *and* gives the command that generates a value, and the FatalConfigError it
+    # raises carries exit_code 78 so the supervisor stops instead of respinning.
+    require_secret_key()
+
+
 def create_app() -> FastAPI:
+    _require_secret_key()
     app = FastAPI(title="Zero Inbox Agent", version=VERSION, lifespan=_lifespan)
     _install_handlers(app)
 
@@ -163,9 +180,21 @@ def create_app() -> FastAPI:
         """
         return ok({"status": "ok", "version": VERSION})
 
-    from api import actions, categories, connections, digest, events, memory, runs, session, triage
+    from api import (
+        account,
+        actions,
+        categories,
+        connections,
+        digest,
+        events,
+        memory,
+        runs,
+        session,
+        triage,
+    )
 
     app.include_router(session.router)
+    app.include_router(account.router)
     app.include_router(connections.router)
     app.include_router(runs.router)
     app.include_router(triage.router)
