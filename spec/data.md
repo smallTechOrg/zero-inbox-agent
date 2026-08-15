@@ -311,6 +311,57 @@ says so in a comment rather than guessing at the prior value.
 
 ---
 
+## Phase 8 entities
+
+### `user_sessions` — a session you can see is a session you can revoke
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | text PK | uuid; carried in the session cookie as `sid` |
+| `user_id` | text FK → `users.id` `ON DELETE CASCADE` | indexed |
+| `created_at` | timestamptz | |
+| `last_seen_at` | timestamptz | updated at most once per 60 s per session |
+| `revoked_at` | timestamptz NULL | non-null ⇒ every request bearing this `sid` is `401` |
+| `user_agent_summary` | text | **derived**, e.g. `"Chrome on macOS"` — the raw UA string is never stored and never returned |
+| `ip_hash` | text NULL | HMAC-SHA256 of the client IP keyed by `AGENT_SECRET_KEY`, for "this looks like a new device" only. **The raw IP is never stored, never logged and never returned by any route.** |
+
+Index: `ix_user_sessions_user_active (user_id, revoked_at)`.
+
+No other table is added. The audit trail (`action_logs`), the per-user isolation, and every existing
+user-scoped table are unchanged — the multi-tenant data model already exists and Phase 8 builds the
+product around it rather than replacing it.
+
+## Phase 8 migration
+
+Alembic revision **`0007_sessions_and_mailbox_ownership`** (the next free revision — existing heads are
+`0001`, `0002`, `0005`, `0006`). It touches a live database holding **~12,500 real decisions for 2 real
+accounts**, so every statement is spelled out and every one is additive or guarded.
+
+1. `CREATE TABLE user_sessions (...)` as above, plus `ix_user_sessions_user_active`. No backfill —
+   existing cookies keep working via the legacy `uid`-only path (see
+   [api.md](api.md#session-hardening-behaviour-change-no-new-route)) and gain a row on next use.
+2. **Guarded ownership constraint.** Before creating it, the migration runs
+   `SELECT channel, account_email, COUNT(DISTINCT user_id) FROM channel_accounts GROUP BY 1,2 HAVING COUNT(DISTINCT user_id) > 1`.
+   - Zero rows → `CREATE UNIQUE INDEX uq_channel_account_global ON channel_accounts (channel, account_email)`.
+   - Any rows → the migration **raises with the offending addresses named** and changes nothing. It
+     must never resolve the conflict by deleting or reassigning a row: which human owns a mailbox is
+     not a decision a migration gets to make.
+   > **Assumed:** the live database has no such duplicate (2 accounts, 2 distinct addresses), so the
+   > guard passes. The guard exists so that assumption is verified at migration time rather than
+   > trusted.
+3. `ALTER TABLE channel_accounts ADD COLUMN last_synced_at TIMESTAMP NULL` — surfaced on screen 22.
+   No backfill; a NULL renders as *"not synced yet"*, never as a fabricated date.
+
+Downgrade drops `last_synced_at`, `uq_channel_account_global`, `ix_user_sessions_user_active` and
+`user_sessions`. It is fully reversible; there is no one-way data migration in this revision.
+
+**Deletion semantics.** `DELETE /api/account` relies on the existing `ON DELETE CASCADE` from
+`users.id` throughout the schema; the migration adds no cascade and the route adds no manual delete
+loop that could miss a table. It performs **zero** Gmail calls: deleting the account does not
+un-archive, un-label or delete a single message.
+
+---
+
 ## Lifecycle
 
 ```

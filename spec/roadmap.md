@@ -122,8 +122,10 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 - Calendar, contacts, or Drive integration.
 - Mobile app / native clients. Web dashboard only.
 - Team/shared inboxes and delegated access.
-- Public multi-user signup, billing, or org administration (the system is multi-tenant *technically*;
-  onboarding is invite/self-OAuth only).
+- Billing, org administration, SSO beyond Google, SCIM, teams/roles/RBAC, an admin console and
+  audit-log export. Phase 8 makes self-serve Google sign-up, session management and account lifecycle
+  real; everything else on this line stays deferred and is not promised anywhere in the product copy.
+  See [account-and-identity](capabilities/account-and-identity.md#what-enterprise-grade-means-here--scoped-honestly).
 - Attachment content analysis.
 - Search over historical mail as a user-facing feature.
 
@@ -139,7 +141,7 @@ See [`capabilities/index.md`](capabilities/index.md) for the full list and phase
 
 ## Phases of Development
 
-Seven phases: one first-win phase and six requirements phases.
+Eight phases: one first-win phase and seven requirements phases.
 
 ---
 
@@ -1304,3 +1306,338 @@ unchanged — Phase 7 must not regress the Phase 6 durability or privacy guarant
 
 > **If step 4 or step 5 fails — if you have to open the drawer to see anything, or the screen sits
 > still — Phase 7 is not done, regardless of what the other steps show.**
+
+---
+
+### Phase 8 — The Product Front Door, Real Accounts & Review Recovery
+
+**Goal.** Zero Inbox stops being a tool that opens straight into an operator console and becomes a
+product someone can meet for the first time. A signed-out visitor to `/app/` gets a homepage that
+explains what it does, states the promise — *an inbox that holds only what needs a human* — and sells
+the thing that actually differentiates it: **when it can't be sure, it stops and says so**. Signing in
+becomes a first-class flow that asks Google for a name and an email only; mailbox access is a separate
+consent the user grants at step 1 of a three-step first run that ends in a deliberately designed
+**moment of trust** — the first thread the agent *keeps* for a never-miss reason, shown before it has
+archived anything. The already-multi-tenant data model finally gets the product around it: visible,
+revocable sessions with sign-out-everywhere, connected-mailbox management, globally unique mailbox
+ownership so two accounts can never point at one inbox, account deletion that names its exact
+consequences, and session hardening. A design system — tokens, type scale, component states,
+responsive rules, accessibility — replaces per-component styling, and the codebase's existing
+state-is-never-colour-alone discipline is promoted to a token-level requirement. Finally, the known
+recovery gap closes: a completed run holding `review_failed` decisions gets a **Retry review** action
+that re-enters the never-miss gate instead of forcing a whole new run.
+
+**Scoped honestly.** This phase does **not** build SSO/SAML, SCIM, organisations, roles, RBAC, an
+admin console, audit-log export, billing or delegated mailboxes, and the product copy promises none of
+them. Five things done properly beats a long list half-done —
+see [account-and-identity](capabilities/account-and-identity.md#what-enterprise-grade-means-here--scoped-honestly).
+
+Capabilities: [product-front-door](capabilities/product-front-door.md) (new),
+[account-and-identity](capabilities/account-and-identity.md) (new),
+[review-recovery](capabilities/review-recovery.md) (new),
+[never-miss-safeguards](capabilities/never-miss-safeguards.md) (unchanged and binding).
+
+#### Invariants — this phase adds surfaces, it does not add a path around anything
+
+Every one of these is built, tested and load-bearing today. **No new surface — sign-up, sign-in,
+onboarding, account settings, session revocation, mailbox disconnect, account deletion or Retry
+review — may create a path around any of them.** A generator that weakens one has failed the phase
+regardless of what else it delivered.
+
+- **Never delete, trash or spam-report.** No such method exists on the Gmail mutator and the absence
+  is asserted structurally. Disconnecting a mailbox and deleting an account perform **zero** Gmail
+  operations of any kind.
+- **`apply_decision()` raises `NotReviewedError` before touching the mutator**, independent of
+  `status`, and is not bypassable by `force=True`. `retry-review` re-enters this gate; it never
+  bypasses it and never writes `review_state` outside the reviewer node.
+- **A `keep`-proposed decision is never archived** except via the explicit, user-initiated `force`
+  path. No Phase 8 route uses that path.
+- **People / Urgent / Legal can never be set to `default_action=archive`** (`NEVER_ARCHIVE_KEYS`,
+  enforced on create **and** update). No account, onboarding or settings surface exposes a control
+  that could.
+- **VIP, reply-history, time-sensitive and the confidence floor all bind ahead of the reviewer**, in
+  a retry exactly as in a first pass.
+- **Every mutation carries an undo token; `dry_run` is absolute.** The onboarding "start in dry-run
+  instead" control sets the real setting and changes nothing else.
+- **No message bodies are persisted or sent to the LLM** beyond headers, subject and the redacted
+  200-char snippet. Phase 8 adds no content-bearing column and no content-bearing event; the only new
+  columns are session metadata and `last_synced_at`.
+- **`require_user_id` stays the single user-scope chokepoint.** Phase 8 adds revocation *inside* it
+  and introduces no second auth path, no bearer token and no API key. Every new route is user-scoped
+  and returns `404` for another user's row.
+- **No raw IP and no raw user-agent string is stored, logged or returned**; `refresh_token_enc` is
+  never returned by any route.
+
+#### Slices
+
+Five slices, **fully disjoint file ownership** — all five generate concurrently. There is **no true
+cross-slice build dependency**: where one slice consumes something another writes it is a
+**spec-contract dependency only** (the endpoint shapes are pinned in [api.md](api.md#phase-8--identity-account-and-review-recovery),
+the token names in [ui.md](ui.md#colour-tokens)), and all five land in the same gate.
+
+| # | Slice | Owns (disjoint paths) | Depends on |
+|---|-------|----------------------|-----------|
+| 1 | `identity-backend` | `src/api/auth.py`, `src/api/session.py`, `src/api/account.py` (new), `src/api/__init__.py`, `src/db/models.py`, `alembic/versions/0007_sessions_and_mailbox_ownership.py`, `src/channels/gmail/oauth.py`, `src/channels/gmail/store.py`, `.env.example`, `tests/unit/api/test_account.py` (new), `tests/unit/api/test_session_revocation.py` (new), `tests/unit/api/test_oauth_intent.py` (new), `tests/integration/test_identity.py` (new) | none |
+| 2 | `review-recovery` | `src/graph/review_retry.py` (new), `src/api/runs.py`, `frontend/src/components/InboxZeroCard.tsx`, `tests/unit/graph/test_review_retry.py` (new), `tests/integration/test_review_recovery.py` (new) | none |
+| 3 | `design-system-and-front-door` | `frontend/src/app/globals.css`, `frontend/src/app/page.tsx`, `frontend/src/lib/api.ts`, `frontend/src/lib/tokens.ts` (new), `frontend/src/components/Chrome.tsx`, `frontend/src/components/ConnectCard.tsx`, `frontend/src/components/AccountMenu.tsx` (new), `frontend/src/components/Onboarding.tsx` (new), `frontend/src/components/home/**` (new: `Homepage.tsx`, `Hero.tsx`, `HonestyBand.tsx`, `HowItWorks.tsx`, `SafetyModel.tsx`, `SignInCard.tsx`, `SiteFooter.tsx`) | none |
+| 4 | `account-ui` | `frontend/src/components/Settings.tsx`, `frontend/src/components/AccountSection.tsx` (new) | none |
+| 5 | `e2e-phase8` | `tests/e2e/phase8/**` (new) | none |
+
+**Path-disjointness notes (read before writing a line of code).**
+
+- Slice 3 owns `frontend/src/lib/api.ts` and `frontend/src/app/globals.css`. **Slices 2 and 4 must not
+  edit either.** Slice 4 declares its `/api/account*` fetch paths locally inside `AccountSection.tsx`;
+  slice 2 declares its `retry-review` path locally inside `InboxZeroCard.tsx`. Both consume the design
+  tokens **by class name only** — the names are pinned in [ui.md](ui.md#colour-tokens) and are a
+  contract, not a shared file.
+- Slice 1 is the only slice that edits `src/api/__init__.py`, `src/db/models.py` or `alembic/`.
+  Slice 2 needs no mount (the `runs` router is already mounted) and adds **no** model or migration.
+- Slice 2 *imports* the reviewer node and `apply_decision()`; it **must not edit**
+  `src/graph/nodes_review.py`, `src/graph/nodes.py`, `src/graph/state.py` or `src/tools/actions.py`.
+  If the retry appears to need a change in one of those files, that is a spec question — raise it,
+  do not edit across the seam.
+- No two slices own the same file. Verified file by file: the four backend/frontend source sets and
+  the e2e set intersect nowhere.
+
+##### Slice 1 — `identity-backend`
+
+- `oauth.py`: `build_authorization_url(config, *, state, scopes)` — `SIGNIN_SCOPES =
+  ("openid", "email", "profile")` and the existing Gmail set as `CONNECT_SCOPES`. The Gmail set is
+  copied, not rewritten.
+- `auth.py`: `intent` on `/auth/google/start`, carried inside the signed `zi_oauth_state` payload
+  (`{state, code_verifier, intent}`) and read **only** from there on the callback. `intent=signin`
+  upserts the `users` row, issues a session and returns — **no `channel_accounts` write, no refresh
+  token requirement, no auto-triage task**. `intent=connect` (and a missing `intent`) keeps today's
+  behaviour byte for byte, including `_auto_triage_task`. The `"insecure-dev-key"` fallback in
+  `_serializer` is deleted; a missing `AGENT_SECRET_KEY` fails at startup.
+- `store.py`: the ownership guard — a `connect` for an `account_email` already owned by a different
+  `user_id` raises, and the route maps it to `409 mailbox_already_connected` having written nothing.
+- `session.py`: cookie payload `{uid, sid}`; `require_user_id` rejects a revoked/unknown `sid`;
+  legacy `uid`-only cookies authenticate, get a `user_sessions` row and a re-issued cookie;
+  `last_seen_at` throttled to once per 60 s; `secure=(request.url.scheme == "https")`.
+- `account.py` (new): the five routes in [api.md](api.md#routes). Deletion cascades via the existing
+  FK cascades and makes **zero** Gmail calls. Disconnect revokes at Google best-effort (WARNING on
+  failure) and deletes the local ciphertext regardless.
+- `models.py` + `0007`: `user_sessions`, the guarded global unique index on
+  `(channel, account_email)`, and `channel_accounts.last_synced_at`. Per
+  [data.md](data.md#phase-8-migration), the ownership guard **raises naming the offending addresses**
+  rather than resolving a conflict.
+- **Tests:** `test_oauth_intent.py` — the two scope sets, asserted exactly, and that `intent` is read
+  from the signed cookie and ignored from the query string on the callback.
+  `test_session_revocation.py` — revoke → `401` on replay; revoke-all; legacy `uid`-only cookie is
+  upgraded in place; `last_seen_at` throttling.
+  `test_account.py` — envelope shapes; cross-user `404` on every route; no `refresh_token_enc`, raw IP
+  or raw UA in any response; `confirm_email` mismatch is `422` and deletes nothing.
+  `test_identity.py` (integration, `_isolated_db`) — a full `signin` creates a user and zero
+  connections and zero runs; a `connect` for an address owned by another user is `409` and writes zero
+  rows; account deletion removes rows from **every** user-scoped table (asserted table by table) with
+  a spy proving **zero Gmail calls**; the `0007` guard raises on a seeded duplicate and creates the
+  index when there is none.
+
+##### Slice 2 — `review-recovery`
+
+- `src/graph/review_retry.py` (new): `retry_review(*, run_id, user_id) -> dict`. Loads the run's
+  `review_state IN ('provisional','review_failed')` decisions, feeds them through the **existing**
+  reviewer node in the existing batch shape, then calls the **existing** apply pass. It never writes
+  `review_state` itself and never passes `force=True`. Emits `retry_review_started` /
+  `retry_review_finished` via the existing bus so the live feed shows it working.
+- `src/api/runs.py`: `POST /api/runs/{run_id}/retry-review` — background task, `409 not_retryable`
+  unless `completed` with ≥ 1 non-`reviewed` decision, idempotent, user-scoped (`404` cross-user).
+- `InboxZeroCard.tsx`: the amber unreviewed bar (screen 24), rendered **below** the red apply-failure
+  bar and never instead of it, with the **Retry review** button, its loading label, and the ledger
+  refetch on success.
+- **Tests:** `test_review_retry.py` — with the reviewer stubbed to succeed, rows upgrade and
+  archive-eligible ones apply; with it stubbed to fail, rows stay `review_failed` and **zero** Gmail
+  mutations occur; `apply_decision` is never called with `force=True` (spy) and `Decision.review_state`
+  is never written outside the reviewer node (ORM attribute spy); a `keep`-proposed row is never
+  mutated; a seeded VIP sender and a seeded ever-replied sender are still held.
+  `test_review_recovery.py` (integration, `_isolated_db`, real NIM via `.env`) — a completed run
+  seeded with **120** `review_failed` decisions over the 220-thread fixture (large enough that a
+  sampled retry and a full retry give different counts): the retry reviews all 120, the ledger's
+  `not_reviewed` falls by exactly the number passed, every applied row has a non-null `undo_token`,
+  `409` on a `running` run, `404` cross-user, a second immediate call performs zero LLM and zero Gmail
+  calls, and the same run under `dry_run=true` reviews and mutates nothing.
+
+##### Slice 3 — `design-system-and-front-door`
+
+- `globals.css`: the token set from [ui.md](ui.md#design-system) under `@theme` — colour, type scale,
+  spacing, radius, elevation, motion, plus the `prefers-reduced-motion` block. **The Tailwind v4 lines
+  (`@source "../";` first, `postcss.config.mjs` untouched) are preserved exactly.**
+- `components/home/**`: screen 19 and screen 20. The five safety promises verbatim, the honesty band
+  as **static copy labelled as the author's own inbox** (never wired to an API), exactly one CTA.
+- `Onboarding.tsx`: screen 21's three steps, including the corrected step-1 promise, the
+  "start in dry-run instead" control wired to `PATCH /api/settings`, the pre-first-archive pinned
+  line, and the never-miss **keep** callout (rendered only when one genuinely occurs in the first 50
+  decisions — never fabricated).
+- `ConnectCard.tsx`: the false Phase-1 copy is removed — *"Nothing is changed until you say so"* and
+  *"never in Phase 1"* are gone; the replacement promise is the true one.
+- `page.tsx`: the front-door gate — **`/api/me` 401 ⇒ render `<Homepage/>` and nothing else**, no
+  console skeleton, no flash of console chrome; no connection ⇒ onboarding; otherwise the screen-25
+  column order (Inbox-Zero card → live feed → clusters). A mid-session `unauthenticated` from any
+  `/api/*` returns the user to the homepage with *"You were signed out."* This is a surgical guard
+  around the existing console, **not** a rewrite of it.
+- `Chrome.tsx` + `AccountMenu.tsx`: the top-bar account menu (screen 23) replacing the bare address,
+  keyboard-operable, with **Account & security**, **Settings** and **Sign out** →
+  `POST /auth/logout` then a hard navigation to `/app/`.
+- `lib/api.ts`: `SIGNIN_URL` / `CONNECT_URL` for the two intents.
+- **Tests:** covered by slice 5's Playwright suite plus `pnpm build` (zero TypeScript errors). This
+  slice writes no unit test framework of its own.
+
+##### Slice 4 — `account-ui`
+
+- `AccountSection.tsx` (new): screen 22 — identity, connected mailboxes with Reconnect/Disconnect and
+  their exact-consequence confirm modals, the signed-in device list with per-row **Sign out** and
+  **Sign out everywhere**, and **Delete account** requiring the user to type their email and naming
+  the real counts from `GET /api/account`. Skeleton loading, envelope error + Retry, and an empty
+  state for "no mailbox connected". Declares its own fetch paths locally — it does **not** edit
+  `lib/api.ts`.
+- `Settings.tsx`: mounts `AccountSection` as the first group, above the autonomy controls. No change
+  to any existing control's behaviour — the Phase 7 slider, its calibration note and its
+  above-ceiling warning are untouched.
+- Every control implements all six component states from
+  [ui.md](ui.md#component-states-required-for-every-interactive-component); every disabled control
+  carries a reason.
+
+##### Slice 5 — `e2e-phase8`
+
+`tests/e2e/phase8/`, run against the already-running supervised server on `:8001`:
+
+- `front-door.spec.ts` — a **signed-out** context loading `/app/` sees the headline, the five safety
+  promises and exactly one CTA, and sees **no** run-status pill, **no** left rail and **no** cluster
+  list. It asserts the string *"Nothing is changed until you say so"* is absent from the page.
+- `auth-flow.spec.ts` — the sign-in card states the minimal-scope promise; the account menu opens by
+  keyboard (`Enter`, arrows, `Escape` returns focus); **Sign out** returns the user to the homepage
+  and a reload stays on the homepage.
+- `account.spec.ts` — a signed-in context reaches **Settings → Account**, sees its mailbox row and at
+  least one device row marked **This device**, and sees the delete confirm requiring the typed email.
+  It **does not** execute the delete against the live account.
+- `retry-review.spec.ts` — on a run whose ledger reports `not_reviewed > 0`, the amber bar and a
+  working **Retry review** button are present, and the bar coexists with the red apply-failure bar
+  when both apply. If no such run exists it **fails loudly with the reason** rather than skipping.
+- `design-system.spec.ts` — no horizontal overflow at 375px / 768px / 1440px; every element carrying
+  an `ok`/`warn`/`danger`/`info` state token resolves to non-empty accessible text (the
+  state-is-never-colour-alone rule); the Inbox-Zero card and the live feed are both present at every
+  width.
+
+#### Gate (exact commands, run from the repo root, real APIs via `.env`, production DB driver)
+
+```bash
+uv run alembic upgrade head && uv run alembic current
+uv run pytest tests/unit tests/integration -q
+cd frontend && pnpm install && pnpm build && cd ..
+npx playwright test tests/e2e/ --reporter=line
+```
+
+`alembic current` must print a revision hash including `0007_sessions_and_mailbox_ownership`.
+`pnpm build` must exit 0 with zero TypeScript errors.
+
+**Playwright runs against the already-running supervised server on `http://localhost:8001`. Do not
+start a second server and do not kill or restart the supervised one.**
+
+`tests/integration/test_review_recovery.py` and `tests/integration/test_identity.py` are the
+load-bearing gates, alongside the Phase 8 Playwright suite. `tests/integration/test_no_body_persisted.py`,
+`tests/integration/test_drive_to_zero.py` and `tests/unit/graph/test_error_channel_reducer.py` must
+still pass unchanged — Phase 8 must not regress the Phase 6 durability, the Phase 7 inbox-zero
+guarantees or the error-channel fix.
+
+#### Known issues carried, not inherited
+
+These are logged so no generator "fixes" them by weakening something. Phase 8 is judged on **its own
+tests plus no new regressions**.
+
+- **(a) `tests/integration/test_resume.py::TestFullResume` — `AttributeError` at line 103.** A fixture
+  **visibility** bug, **out of scope for Phase 8**. **No generator may make this pass by weakening,
+  loosening, deleting or `xfail`-ing any assertion in that test.** Leave it exactly as it is.
+- **(b) The `review_failed` recovery gap** — this is the gap slice 2 closes. Until slice 2 lands,
+  `POST /api/runs/{id}/apply` correctly refuses those rows; that refusal is the never-miss gate
+  working, not a bug to route around.
+- **(c) Pre-existing red, proven before this phase's first commit:** **5 integration failures**
+  (model-shape drift, a live-mailbox flake, `RefreshError` mapping, `GmailMutator` method drift) and
+  **~6 Playwright stub specs asserting Phase-2 UI that no longer exists**. One of these failing is not
+  a blocker. A Phase 8 test failing is. Any failure **outside** both sets is a new regression and
+  blocks the phase.
+  > Slice 3 rewrites `page.tsx`'s signed-out branch and `Chrome.tsx`, which may change *which*
+  > obsolete Phase-2 specs fail. Deleting or rewriting those obsolete specs to go green is **not**
+  > permitted in this phase — record the before/after set instead.
+- **(d) The `error` channel fix landed as commit `3893bb7`** (`keep_first_error` reducer in
+  `src/graph/state.py`, covered by `tests/unit/graph/test_error_channel_reducer.py`). **Build on top
+  of it. Never revert it, never re-annotate that channel, never edit that reducer or its test.** Slice
+  2 does not own `src/graph/state.py` for exactly this reason.
+
+#### Production safety (binding on every implementer and the auditor)
+
+`zero_inbox.db` holds **~12,500 real decisions for 2 real accounts**, and **a real 903-thread resumed
+run is applying against the live account right now.**
+
+- **Never write an ad-hoc script against the real DB.** `get_settings()` is cached and does **not**
+  honour an env override from a standalone script — a previous agent polluted the real DB exactly that
+  way. Every test uses the existing `_isolated_db` fixture pattern.
+- **Do not kill or restart the supervised server on `:8001`**, and do not start a second one.
+- **Do not launch a full-inbox run** while building or gating. The 220-thread fixture is the test
+  surface.
+- **Never execute `DELETE /api/account`, `DELETE /api/account/connections/{id}` or
+  `POST /api/account/sessions/revoke-all` against a real account.** Every test of those routes runs
+  against `_isolated_db` with a synthetic user. Playwright asserts the delete **confirm dialog** and
+  stops there.
+- **Do not start a `retry-review` against the live run in flight.** Slice 2's integration test seeds
+  its own completed run in `_isolated_db`.
+- Migration `0007` is the only sanctioned write to real user rows, and only via
+  `uv run alembic upgrade head` — never by hand, never by script. Its duplicate-mailbox guard must
+  **raise**, never resolve a conflict.
+
+#### How the user tests it
+
+1. `uv run alembic upgrade head`, then `cd frontend && pnpm build && cd .. && uv run python -m src`.
+2. Open **http://localhost:8001/app/ in a private window** (no session). You get a **homepage**, not
+   an empty console: the headline *"An inbox that holds only what needs a human"*, the honesty band
+   describing the real run that stopped and told the truth rather than archiving 350 unread threads,
+   the three-step explanation, the five safety promises, and **one** button — **Sign in with Google**.
+3. Click it. The sign-in card says signing in asks Google for **your name and email only**, and that
+   mail access is a separate step. Complete it. Check the Google consent screen: it asks for
+   **no Gmail scope**. You now have an account with no mailbox attached.
+4. You land on **onboarding step 1 — Connect your mailbox**, with the scopes in plain English and the
+   *true* promise (it archives on its own once confident; it never deletes; everything is undoable).
+   The old sentence *"Nothing is changed until you say so"* is gone from the whole app.
+5. Connect. **Step 2** tells you what is about to happen before it happens, and offers
+   **Start in dry-run instead** if you'd rather watch a full pass change nothing.
+6. **Step 3 — the moment of trust.** The live feed fills the screen and rows arrive with **no click**.
+   Above it: *"Nothing has been archived yet — the reviewer checks every decision first."* When the
+   agent keeps its first thread for a never-miss reason, a callout names it —
+   *"Kept: '…' — you've replied to this sender before."* **The product proves it protects before it
+   proves it cleans.** On the first real archive the line becomes *"Archiving now — N so far. Undo any
+   of it."* with a live **Undo this run**.
+7. When the run finishes, the **Inbox-Zero card** and the definition are where they have always been,
+   and the feed collapses to its one-line summary. Reload: you are a returning user now, and you land
+   straight on the daily loop — card, feed, clusters — with onboarding never shown again.
+8. **Open the account menu** in the top bar (keyboard works: `Enter`, arrows, `Escape`). Go to
+   **Account & security**. You see your identity, your connected mailbox with its status and last
+   sync, and **your signed-in devices** — with **This device** marked. Sign in from a second browser
+   and watch a second row appear.
+9. Click **Sign out** on the *other* device's row. Reload that browser: it is signed out and back on
+   the homepage. Then try **Sign out everywhere** from the second browser — every session including
+   the current one drops to the homepage. **A session you can see is a session you can revoke.**
+10. **Try to connect the same Gmail address from a second account.** You get a clear
+    *"{address} is already connected to another Zero Inbox account"* — not a silent second agent
+    mutating one inbox.
+11. Read the **Disconnect** and **Delete account** confirm dialogs (do **not** confirm them on your
+    real account). Each names the exact consequence and the exact counts, and each states the honest
+    part: **your Gmail is untouched — archived mail stays archived and nothing is deleted.**
+12. **Retry review.** If a run left threads that never got past the reviewer, the Inbox-Zero card now
+    shows an amber bar — *"N threads never got past the reviewer, so they were left in your inbox
+    rather than archived unseen"* — with **Retry review**. Click it and watch the reviewer rows arrive
+    in the live feed. Threads the reviewer passes are archived with undo tokens; threads it flips to
+    keep stay in your inbox. If the reviewer fails again the bar returns with the new reason — it
+    never quietly marks anything reviewed.
+13. **Check Gmail.** Nothing in Trash. People, Urgent and Legal still in the inbox. Nothing about
+    signing in, signing out, disconnecting or deleting changed a single message.
+14. Resize the window to phone width and back. Nothing overflows; the Inbox-Zero card and the live
+    feed are still the two things you can see.
+15. **Real in Phase 8:** the signed-out homepage, minimal-scope sign-in separate from mailbox consent,
+    the three-step onboarding with the never-miss moment of trust, the steady-state daily loop, the
+    account menu, Account & security with mailbox and device management and account deletion,
+    globally unique mailbox ownership, session hardening, the design system, and **Retry review**.
+    **Labelled stubs remaining:** none.
+
+> **If step 2 shows a console instead of a homepage, or step 3 requires a click to see anything, or
+> any step 11 dialog fails to state that Gmail is untouched — Phase 8 is not done, regardless of what
+> the other steps show.**

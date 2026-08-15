@@ -329,6 +329,286 @@ triage agent, watching it think is the product.
 - Rows and chips carry text, never colour alone; the feed is a landmark region and is keyboard
   reachable.
 
+---
+
+# Phase 8 — Design system, front door and account
+
+Everything below is Phase 8. It does not change any Phase 1–7 screen's behaviour; where it revises an
+existing screen that is stated explicitly.
+
+## Design system
+
+The console is dense and calm and stays that way. The front door is the opposite register: spacious,
+confident, few words. One token set serves both — the difference is spacing and type scale, never a
+second palette.
+
+### Colour tokens
+
+Declared once as CSS custom properties in `frontend/src/app/globals.css` under `@theme`, consumed via
+Tailwind utility classes. **No component may introduce a raw hex value.** Token names are a pinned
+cross-slice contract — other slices consume these names and never redefine them.
+
+| Token | Value | Used for |
+|-------|-------|----------|
+| `--zi-bg` | `#ffffff` | page background |
+| `--zi-bg-subtle` | `#f7f8f8` | rails, cards on white, marketing section bands |
+| `--zi-bg-inverse` | `#111827` | the homepage hero band, primary buttons |
+| `--zi-fg` | `#111827` | primary text |
+| `--zi-fg-muted` | `#4b5563` | secondary text, reasoning, timestamps |
+| `--zi-fg-faint` | `#9ca3af` | disabled text, zero-count ledger rows |
+| `--zi-border` | `#e5e7eb` | hairlines, card borders |
+| `--zi-border-strong` | `#d1d5db` | inputs, dividers that must read as structural |
+| `--zi-accent` | `#111827` | the single primary action colour — deliberately neutral, so *state* colour is never competing with brand colour |
+| `--zi-ok` | `#047857` | live / applied / connected |
+| `--zi-warn` | `#b45309` | provisional, dry run, stale, resumable |
+| `--zi-danger` | `#b91c1c` | apply failure, degraded provider, destructive confirms |
+| `--zi-info` | `#1d4ed8` | running, in-flight |
+| `--zi-focus` | `#2563eb` | focus ring, on every interactive element without exception |
+
+**Binding token-level rule — state is never colour alone.** Every token in the `ok` / `warn` /
+`danger` / `info` family may only be used on an element that *also* carries a text label or an
+`aria-label` naming the state. A bare coloured dot, bar, chip or border that conveys meaning with no
+text is a defect. This codifies the rule the codebase already follows (tier badges, review chips) and
+extends it to every new surface. Playwright asserts it on the new surfaces: each state element
+resolves to non-empty accessible text.
+
+### Type scale
+
+Single family stack (`ui-sans-serif, system-ui, …`); no webfont is added — a font that has to load is
+a blank front door for people on slow connections.
+
+| Token | Size / line-height / weight | Used for |
+|-------|------------------------------|----------|
+| `zi-display` | 44px / 1.1 / 700 (28px below `md`) | the homepage headline, once per page |
+| `zi-h1` | 28px / 1.2 / 600 | page titles, marketing section heads |
+| `zi-h2` | 20px / 1.3 / 600 | card headers |
+| `zi-h3` | 15px / 1.4 / 600 | row headers, settings group labels |
+| `zi-body` | 14px / 1.5 / 400 | default console text |
+| `zi-body-lg` | 17px / 1.6 / 400 | marketing prose only |
+| `zi-mono` | 12px / 1.4 / 500, tabular-nums | counts, model ids, confidences, timestamps |
+| `zi-caption` | 12px / 1.4 / 500 | chips, badges, helper text |
+
+Counts and confidences always use `tabular-nums` so a live-updating number does not reflow its row.
+
+### Spacing, radius, elevation, motion
+
+- **Spacing scale:** `4 · 8 · 12 · 16 · 24 · 32 · 48 · 64` px only. Console density uses 4–16;
+  marketing uses 24–64.
+- **Radius:** `zi-r-sm` 4px (chips, inputs), `zi-r-md` 8px (cards, buttons), `zi-r-lg` 12px
+  (marketing panels). Nothing is fully rounded except avatars.
+- **Elevation:** exactly three levels — `flat` (border only, the console default), `raised`
+  (`0 1px 2px rgba(17,24,39,.06)`, cards), `overlay` (`0 8px 24px rgba(17,24,39,.12)`, menus, modals,
+  the drawer). No other shadow exists.
+- **Motion:** 120 ms ease-out for hover/focus, 180 ms for a row entering the live feed, 0 ms for
+  anything that would delay reading a number. Everything is wrapped in
+  `@media (prefers-reduced-motion: reduce)` → no transform/opacity animation, content still updates.
+
+### Component states (required for every interactive component)
+
+Every button, input, select, link and row must define **all six**: `default`, `hover`, `focus-visible`
+(2px `--zi-focus` ring, 2px offset), `active`, `disabled` (60% opacity **plus** a `title`/tooltip
+saying *why*, never opacity alone), and `loading` (in-place spinner **plus** the control's label
+changed to the present participle — "Archiving…" — never a label that disappears). A disabled control
+with no explanation is a defect: this is the same failure mode as the Phase 7 autonomy slider.
+
+### Responsive layout
+
+Three breakpoints: `< 768px` (single column, left rail becomes a horizontal scrolling tab strip
+pinned under the top bar, the Activity drawer becomes a bottom sheet), `768–1279px` (rail + content),
+`≥ 1280px` (rail + content + max content width 1120px, centred). The live run feed and the
+Inbox-Zero card are **never** the surfaces that get dropped on narrow viewports — they are the two
+things users watch; anything gets collapsed before they do.
+
+### Accessibility (extends the existing rules, does not replace them)
+
+- All new state elements carry text (see the binding token rule above).
+- Landmarks: `banner` (top bar), `navigation` (rail), `main`, `complementary` (drawer),
+  `contentinfo` (marketing footer). The live feed is a labelled `region` with `aria-live="polite"`
+  and `aria-relevant="additions"` — announcing arrivals, never re-announcing the whole list.
+- Colour contrast ≥ 4.5:1 for body text, ≥ 3:1 for borders and large text, at every token pairing.
+- The account menu is a real menu: `Escape` closes, focus returns to the trigger, arrow keys move.
+- Every modal traps focus and is dismissible with `Escape`; destructive confirms require typing
+  nothing but do name the consequence and count.
+
+---
+
+## Phase 8 screens
+
+### 19. Homepage *(signed out — the front door, Phase 8)*
+
+`http://localhost:8001/app/` for a visitor with no valid session. **This is a full replacement for
+today's behaviour, where an unauthenticated visitor lands on an empty operator console.** The console
+is never rendered, even skeletally, to a signed-out visitor.
+
+- **Top bar:** wordmark "Zero Inbox" on the left; **Sign in** on the right. Nothing else — no rail,
+  no run pill, no dry-run banner.
+- **Hero:** headline *"An inbox that holds only what needs a human."* Sub-line: *"Zero Inbox reads
+  your Gmail, decides what is noise, and archives it — never deletes it, always undoably, and never
+  when it isn't sure."* One primary CTA: **Sign in with Google**. One secondary text link:
+  *"How the safety model works ↓"* (anchors to the safety section). **There is exactly one CTA on
+  this page**; a second competing button is a spec violation.
+- **The honesty band — the differentiator, above the fold on desktop.** A short, factual panel
+  titled *"What it does when it can't be sure"*:
+  > On a real 2,122-thread inbox it archived 1,219 threads and took the inbox from 2,177 to 589.
+  > Mid-run the model provider went down. It retried, switched models, and when every model failed
+  > it stopped and left 350 threads unread **and told the user so** — rather than archiving mail it
+  > had never looked at.
+  This is prose, not a testimonial card, and it is not decorated with an illustration. The numbers
+  are **static copy** in this phase — they describe a measured result, not the visitor's account —
+  and are labelled as such (*"measured on the author's own inbox"*). Presenting them as live stats
+  would be a lie; a generator must not wire them to an API.
+- **How it works — three steps, no icons-only:** *1. Connect Gmail (read + archive + label; never
+  delete).* *2. It classifies every thread in clusters — "142 threads from Substack newsletters" —
+  with the reason it decided.* *3. You watch it work live and undo anything, per action or per run.*
+- **The safety model, stated as promises** (each one a real, tested guarantee — a generator may not
+  add a promise that is not in this list):
+  - *It never deletes. There is no delete, no trash, no spam-report anywhere in the system.*
+  - *Every change is undoable — per action or the whole run — from a snapshot taken before the change.*
+  - *It never archives mail it wasn't confident about, and never mail from anyone you've replied to,
+    anyone on your VIP list, or anything time-sensitive.*
+  - *People, Urgent and Legal mail can never be set to auto-archive. The setting does not exist.*
+  - *Only headers, subjects and a redacted 200-character snippet ever leave your machine. Message
+    bodies are never stored.*
+- **Footer:** links to the safety section, `/health`, and a plain-text privacy statement. No newsletter
+  signup, no social icons, no cookie banner (the only cookie is the session cookie, stated in the
+  footer text).
+- Fully responsive; renders and is readable with JavaScript disabled for the hero and safety copy.
+
+### 20. Sign in / sign up *(Phase 8)*
+
+One screen, not two — **there is no separate sign-up**. First successful Google sign-in creates the
+account; a returning user signs into the existing one. The copy says so: *"New here? Signing in
+creates your account."*
+
+- Single card: **Continue with Google**.
+- Explicit scope honesty, the thing the old ConnectCard conflated: *"Signing in asks Google for your
+  name and email address only. Access to your mail is a separate, later step you approve
+  individually."* This is real — see [api.md Phase 8](api.md#phase-8--identity-account-and-review-recovery):
+  `intent=signin` requests `openid email profile` only.
+- Error states rendered inline from the envelope: `auth_declined` (*"You cancelled sign-in."* +
+  Retry), `provider_error`, `validation_error`.
+- On success → screen 21 if the user has no connected mailbox, otherwise screen 25.
+
+### 21. First run — onboarding *(Phase 8)*
+
+A three-step flow with a persistent step indicator (`1 · 2 · 3`, current step named in text, never a
+bare dot row). It is not skippable, but every step is reversible and the user can sign out from any
+step.
+
+**Step 1 — Connect your mailbox.** The existing `ConnectCard` content, corrected: the Phase-1 copy
+still claims *"nothing is changed until you say so"* and *"never in Phase 1"*, which is no longer
+true — the agent archives autonomously. Replacement promise, which **is** true: *"It archives on its
+own once it's confident, and it labels everything it touches. It never deletes, and everything is
+undoable."* Scope list stays, with each scope in plain English and why it is needed. CTA:
+**Connect Gmail** → `/auth/google/start?intent=connect`.
+
+> A first-run flow that overstates the safety promise is worse than no flow. The corrected copy is
+> load-bearing, and Playwright asserts the old sentence is gone.
+
+**Step 2 — What happens next, stated before it happens.** Shown for the few seconds between the
+callback and the first classification row. Plain list, no spinner-only state:
+*"We're about to read your inbox headers · classify every thread in clusters · archive only what
+we're confident about · leave People, Urgent, Legal and anyone you've replied to alone. You'll watch
+every decision as it's made. Nothing is hidden from you and nothing is permanent."*
+Includes a **"Start in dry-run instead"** secondary control which sets `dry_run=true` before the run
+— for a user who wants to watch a full pass change nothing. It is a real control wired to
+`PATCH /api/settings`, not a stub.
+
+**Step 3 — The moment of trust (design this one deliberately).** The live run feed (screen 18) takes
+the whole viewport for the first run, with no rail and no other card competing. As rows arrive the
+user reads real subjects from their own mailbox with real reasons. Three things must be true within
+the first ten seconds, and Playwright asserts the first:
+1. **Rows are visibly arriving** with no click — the Phase 7 guarantee, now the centrepiece of
+   onboarding.
+2. A pinned line above the feed reads *"Nothing has been archived yet — the reviewer checks every
+   decision first."* It is replaced, on the first real archive, by
+   *"Archiving now — {n} so far. Undo any of it."* with an **Undo this run** button that is live from
+   the first mutation, not after the run ends.
+3. The first thread the agent **keeps** for a never-miss reason is surfaced as a callout above the
+   feed — *"Kept: '{subject}' — you've replied to this sender before."* **This is the moment of
+   trust**: the product proves it protects before it proves it cleans. If no such thread occurs in
+   the first 50 decisions the callout is not faked; it is simply absent.
+
+The run completes → the Inbox-Zero card (screen 16) with the definition and the remainder ledger, and
+a one-time onboarding completion line: *"That's the whole loop. From now on it runs on its own —
+you'll find everything here."* Onboarding is then never shown again for this user.
+
+### 22. Account & security *(Phase 8 — Settings → Account)*
+
+A new section in the existing Settings panel, above the autonomy controls. Read from
+`GET /api/account`.
+
+- **You:** display name, email, avatar-less initial, account created date. Identity is the Google
+  account; there is no editable password and the screen says so.
+- **Connected mailboxes:** one row per `channel_accounts` row — address, channel, status
+  (`connected` / `reauth_required`, as text), connected date, and last successful sync. Each row has
+  **Reconnect** (when `reauth_required`) and **Disconnect**. Disconnect opens a confirm modal naming
+  the consequence exactly: *"Disconnect {address}? We revoke our access at Google and delete the
+  stored token. Your triage history stays, and nothing in Gmail changes — nothing is un-archived and
+  nothing is deleted."* This is the honest statement: disconnecting is not an undo.
+- **Signed-in devices:** one row per active `user_sessions` row — device/browser summary from the
+  user agent, first seen, last seen, and **This device** on the current one. **Sign out** per row,
+  and **Sign out everywhere** for all of them (the current session included, which then redirects to
+  screen 19). This is the enterprise capability that actually matters here: a session you can see is
+  a session you can revoke.
+- **Delete account:** a confirm modal naming the exact counts read from the API
+  (*"This permanently deletes your account, {n} decisions, {m} action logs and {k} connected
+  mailboxes. Your Gmail is untouched — archived mail stays archived and labelled. This cannot be
+  undone."*), requiring the user to type their email address. Danger styling **plus** the word
+  "Delete" — never red alone.
+- Everything on this screen has a loading skeleton, an envelope error + Retry, and an empty state
+  (*"No mailbox connected yet"* with the Connect CTA).
+
+### 23. Account menu *(Phase 8 — top bar, revises screen "Global chrome")*
+
+Replaces the bare connected-address text in the console top bar. A button showing the user's initial
+and email, opening an `overlay`-elevation menu: the signed-in email (not a link), **Account &
+security** (→ screen 22), **Settings**, a divider, **Sign out**. Keyboard-operable per the a11y rules
+above. On sign-out: `POST /auth/logout`, then a hard navigation to `/app/` which now renders screen 19.
+
+### 24. Recover a stuck run — "Retry review" *(Phase 8 — Inbox-Zero card)*
+
+Closes a real gap: a `completed` run holding `review_failed` decisions can never be applied, because
+the never-miss gate correctly refuses them — and `POST /api/runs/{id}/apply` cannot clear them. Today
+the only recovery is a whole new run.
+
+On the Inbox-Zero card (screen 16), when the remainder ledger reports `not_reviewed > 0`, an amber bar
+sits **below** the red apply-failure bar (never replacing it — both can be true):
+
+> **{n} threads never got past the reviewer**, so they were left in your inbox rather than archived
+> unseen. The reviewer failed or was unavailable during this run.
+> **[ Retry review ]**
+
+- The button calls `POST /api/runs/{run_id}/retry-review`, disables with the label **Retrying
+  review…**, and on success refetches the ledger; the `not_reviewed` count falls and the archived
+  count rises only for threads the reviewer actually passed.
+- **What it must not become:** it re-runs the *real* reviewer. It never sets `review_state` directly,
+  never applies with `force=True`, and a thread the reviewer flips to keep stays kept. If the reviewer
+  fails again, the bar returns with the new reason — it never silently marks anything reviewed.
+- While a retry is in flight the live feed (screen 18) shows the reviewer rows arriving, so this is
+  not an opaque button.
+- `409 not_retryable` (run not `completed`, or nothing to retry) clears the bar and shows the envelope
+  error.
+
+### 25. The steady-state daily loop *(Phase 8 — revises the console landing)*
+
+For a returning user with a connected mailbox and at least one completed run, `/app/` renders, top to
+bottom, in this fixed order:
+
+1. **Inbox-Zero card** (screen 16) — where you are relative to zero, and why the remainder is there.
+2. **Live run feed** (screen 18) — active run streaming, or its one-line idle summary
+   (*"Last run: 142 archived · 2m ago"*).
+3. Cluster list (screen 2).
+
+The two primary surfaces are 1 and 2 and they stay above the fold on a 900px-tall viewport. The
+"Run triage" button remains in the top bar. Nothing about the daily loop requires opening the drawer.
+
+Anything a returning user needs to *notice* — a resumable run, a degraded provider, a failed apply, an
+unreviewed remainder — renders in this column, never only in the drawer. That rule is unchanged from
+screen 14 and is restated here because Phase 8 adds a new bar (screen 24) to the same column.
+
+---
+
 ## States (required for every list surface)
 
 | State | Treatment |
@@ -339,6 +619,10 @@ triage agent, watching it think is the product.
 | Partial/failed run | the banner "This run failed partway — undecided threads were kept in your inbox and counted as auto-kept (low confidence)" |
 | Resumable run | the Resume banner (screen 13) — never the failed-run banner |
 | Completed run that archived nothing | the red apply-failure bar on the Inbox-Zero card (screen 16) with the reason and **Retry archiving** — never the neutral "run complete" state |
+| Signed out (Phase 8) | the homepage (screen 19) — **never** an empty console, never a console skeleton, never a spinner that resolves to nothing |
+| Signed in, no mailbox (Phase 8) | onboarding step 1 (screen 21) — not the cluster list with an empty state |
+| Completed run with `not_reviewed > 0` (Phase 8) | the amber unreviewed bar with **Retry review** (screen 24), in addition to any apply-failure bar |
+| Session revoked elsewhere (Phase 8) | any `/api/*` returning `unauthenticated` mid-session redirects to screen 19 with the line *"You were signed out."* — never a wall of failed panels |
 
 ## Accessibility & build constraints
 
@@ -359,3 +643,14 @@ triage agent, watching it think is the product.
   first paint, and the row count **strictly increases** across three polls ≥ 3 s apart. A screenshot
   of the mid-run main page is captured as an artifact. Asserting only that SSE events arrived is not
   acceptable evidence.
+- Phase 8 Playwright (`tests/e2e/phase8/`) additionally asserts, against the live app: a signed-out
+  visit to `/app/` renders the homepage headline, the safety promises and exactly one CTA, and renders
+  **no** console element (no run pill, no rail, no cluster list); the corrected onboarding copy is
+  present and the stale sentence *"Nothing is changed until you say so"* is **absent** anywhere in the
+  app; the account menu opens by keyboard and Sign out returns the user to the homepage; the
+  Account & security screen lists connected mailboxes and signed-in devices; every element carrying an
+  `ok`/`warn`/`danger`/`info` token resolves to non-empty accessible text (the state-is-never-colour-
+  alone rule); and the layout has no horizontal overflow at 375px, 768px and 1440px.
+- Design tokens live in `frontend/src/app/globals.css` under `@theme` and are consumed by class name.
+  The Tailwind v4 lines (`postcss.config.mjs`, `@source "../";` first in `globals.css`) are never
+  removed or reordered when the tokens are added.

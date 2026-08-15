@@ -44,7 +44,9 @@ SQLite via SQLAlchemy 2.0 + Alembic  (headers, IDs, decisions, reasoning — nev
 | Domain models | `src/domain/` | Pydantic models — `Item`, `Decision`, `Cluster`, `Rule`, `TriageOutcome` |
 | Security | `src/security/crypto.py` | Fernet encryption of OAuth refresh tokens at rest, keyed from `AGENT_SECRET_KEY` |
 | Observability | `src/observability/` | structlog JSON logging + LangSmith tracing + per-call cost accounting |
-| Frontend | `frontend/` | Next.js static export mounted by FastAPI at `/app` |
+| Identity & account | `src/api/session.py`, `src/api/auth.py`, `src/api/account.py` (Phase 8) | Signed session cookie carrying `{uid, sid}`; revocable `user_sessions` rows; the two OAuth intents (`signin` = `openid email profile`, `connect` = Gmail scopes); account/connection/session/delete routes. **Every `/api/*` route depends on `require_user_id`, which is the single user-scope chokepoint — Phase 8 adds revocation to it and adds no second auth path.** |
+| Review recovery | `src/graph/review_retry.py` (Phase 8) | Re-runs the existing reviewer node over a completed run's non-`reviewed` decisions and then the ordinary apply pass. Calls the same reviewer and the same `apply_decision()` as a normal run — it is a re-entry point, not a bypass. |
+| Frontend | `frontend/` | Next.js static export mounted by FastAPI at `/app`. Phase 8: `/app/` is the **front door** — a signed-out visitor gets the marketing homepage, a signed-in one gets the console. Design tokens live in `frontend/src/app/globals.css` under `@theme`; see [ui.md](ui.md#design-system). |
 
 ## Data Flow — a triage run
 

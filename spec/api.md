@@ -221,10 +221,74 @@ Changes to existing routes:
   emits; see [triage-transparency Rule I2](capabilities/triage-transparency.md#rules--i-not-one-beat-without-a-log)
   for the required log events.
 
+## Phase 8 — Identity, account and review recovery
+
+### Sign-in is separate from mailbox connection
+
+`GET /auth/google/start` gains an `intent` query parameter. The two intents request **different
+scopes**, which is what makes "sign in" an honest first-class flow rather than a side effect of
+granting mailbox access.
+
+| `intent` | Scopes requested | Refresh token required | Result |
+|----------|------------------|------------------------|--------|
+| `signin` | `openid email profile` | no | Upserts the `users` row, issues a session, 302 → `/app/`. **Writes no `channel_accounts` row and triggers no triage run.** |
+| `connect` (default when `intent` is absent — preserves the existing behaviour exactly) | the existing Gmail scopes | yes | Upserts `users` + `channel_accounts` (token encrypted), issues a session, triggers the auto-triage background task, 302 → `/app/` |
+
+`intent` round-trips inside the existing signed `zi_oauth_state` cookie payload
+(`{state, code_verifier, intent}`), never as an unsigned query parameter on the callback — otherwise
+the scope decision would be attacker-controlled.
+
+**Mailbox ownership.** A `connect` callback whose `account_email` already belongs to a **different**
+user returns `409 mailbox_already_connected` and writes nothing: *"{address} is already connected to
+another Zero Inbox account. Sign in as that account, or disconnect it there first."* Reconnecting a
+mailbox you already own is the existing idempotent upsert and is unaffected.
+
+> **Assumed:** identity **is** the Google account. Two humans sharing one Google login share one Zero
+> Inbox user and one set of data — that is the correct answer, not a bug, and screen 22 states it.
+> What Phase 8 forbids is two *distinct* Zero Inbox users pointing at the same mailbox, which would
+> mean two agents mutating one inbox with two independent policies.
+
+### Routes
+
+| Method | Path | Body / Query | Returns |
+|--------|------|--------------|---------|
+| `GET` | `/auth/google/start` | `?intent=signin\|connect` | 302 to Google consent with the scope set for the intent |
+| `POST` | `/auth/logout` | | `{logged_out: true}` — **revokes the current `user_sessions` row** (`revoked_at`), then clears the cookie. Unchanged shape; the revocation is new. |
+| `GET` | `/api/account` | | `{user: {id, email, display_name, created_at}, connections: [{id, channel, account_email, status, connected_at, last_synced_at}], sessions: [{id, created_at, last_seen_at, user_agent_summary, current: bool}], counts: {decisions, action_logs, connections}}` — **never returns `refresh_token_enc`, a raw user agent string, or an IP address** |
+| `DELETE` | `/api/account/connections/{connection_id}` | | `{disconnected: true}` — best-effort token revocation at Google, then deletes the `channel_accounts` row. Triage history is retained. `404` for another user's connection. Performs **zero** Gmail mutations. |
+| `DELETE` | `/api/account/sessions/{session_id}` | | `{revoked: true}` — sets `revoked_at`. `404` for another user's session. Revoking the current session also clears the cookie. |
+| `POST` | `/api/account/sessions/revoke-all` | | `{revoked: n}` — revokes every session for the user including the current one, and clears the cookie |
+| `DELETE` | `/api/account` | `{confirm_email: "..."}` | `{deleted: true}` — `422 validation_error` unless `confirm_email` equals the user's email. Cascade-deletes every user-scoped row and clears the cookie. **Performs no Gmail mutation of any kind** — archived mail stays archived. |
+| `POST` | `/api/runs/{run_id}/retry-review` | | `{retried: n, reviewed: n, still_failed: n, applied: n}` — re-runs the **real** never-miss reviewer over this run's `review_state IN ('provisional','review_failed')` decisions, then runs the ordinary apply pass for whatever the reviewer upgraded. Background task; returns immediately with `{run_id, status: "retrying_review"}` and the counts land on `GET /api/runs/{run_id}/remainder`. `409 not_retryable` unless `status == "completed"` and at least one non-`reviewed` decision exists. Idempotent: a second call while one is in flight is a no-op. |
+
+**`retry-review` may not weaken any guarantee.** It calls the same reviewer node as a normal run and
+the same `apply_decision()`; it never writes `review_state` directly, never passes `force=True`, and
+never applies a `keep`-proposed decision. If the reviewer fails again the rows stay `review_failed`
+and the run reports it. See
+[never-miss-safeguards](capabilities/never-miss-safeguards.md) and
+[review-recovery](capabilities/review-recovery.md).
+
+### Session hardening (behaviour change, no new route)
+
+- The session cookie payload becomes `{"uid": ..., "sid": ...}` where `sid` is a `user_sessions` row
+  id. `require_user_id` additionally rejects a token whose `sid` is revoked or unknown → `401`.
+- **Legacy compatibility:** a cookie carrying only `uid` (every session issued before Phase 8) stays
+  valid until it expires; on its next authenticated request a `user_sessions` row is created and the
+  cookie is re-issued with a `sid`. No user is signed out by this migration.
+- `set_session_cookie` sets `secure=True` whenever the request scheme is `https` (it is currently
+  hardcoded `False`), keeps `httponly` and `samesite=lax`, and rotates the token on every sign-in.
+- `AGENT_SECRET_KEY` becomes **required**: the `"insecure-dev-key"` fallback in `api/auth.py` is
+  removed, and the app fails to start without the key rather than signing cookies with a public string.
+- `user_sessions.last_seen_at` is updated at most once per 60 s per session, so the device list is
+  useful without a write per request.
+
 ## Error codes
 
 `unauthenticated` (401) · `forbidden` (403) · `not_found` (404) · `already_undone` (409) ·
 `reauth_required` (409, the Gmail refresh token is invalid) · `rate_limited` (429) ·
 `provider_error` (502) · `validation_error` (422) · `not_resumable` (409, the run has no partial work
 to resume) · `not_reviewed` (422, the decision has not passed the never-miss reviewer and can never be
-applied) · `not_appliable` (409, the run is not `completed` so its decisions cannot be applied).
+applied) · `not_appliable` (409, the run is not `completed` so its decisions cannot be applied) ·
+`mailbox_already_connected` (409, that address is connected to a different Zero Inbox account) ·
+`not_retryable` (409, the run is not `completed` or has nothing left to review) ·
+`auth_declined` (400, the user cancelled the Google consent screen).

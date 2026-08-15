@@ -65,3 +65,12 @@ for the phase plan and slices.
 | [cost-tiered-triage](cost-tiered-triage.md) | Extended: `decided_by="error"` rows are not treated as decided — a resume re-classifies the tail |
 | [gmail-actions-and-undo](gmail-actions-and-undo.md) | Extended: retry-apply (`POST /api/runs/{run_id}/apply`) recovers a failed apply pass without re-classifying |
 | [triage-transparency](triage-transparency.md) | Extended (rules H/I/J): the live classification feed renders **inline on the main page with no clicks** while a run is active (the drawer stays as full history); continuity is guaranteed by logging at the right granularity through the structlog→bus bridge plus a self-arming watchdog, so no gap exceeds 3 s — including inside a single 29-thread tier-3 LLM call; and replay-on-connect is verified so a mid-run load or reload paints a populated feed |
+
+## Phase 8 — Product Front Door, Account & Review Recovery
+
+| Capability | What it does |
+|------------|--------------|
+| [product-front-door](product-front-door.md) | A signed-out homepage that explains the product and sells its honesty, a first-class sign-in, a three-step first-run flow ending in the moment of trust, the steady-state daily loop, and the design system (tokens, component states, responsive, a11y) every surface is built from |
+| [account-and-identity](account-and-identity.md) | Sign-in as its own OAuth intent (`openid email profile`) separate from mailbox consent; revocable server-side sessions with a device list and sign-out-everywhere; globally unique mailbox ownership; session hardening; disconnect a mailbox and delete an account, neither of which touches Gmail |
+| [review-recovery](review-recovery.md) | **Retry review** — re-runs the real never-miss reviewer over a completed run's `provisional` / `review_failed` decisions and applies whatever it passes, so an outage during the reviewer no longer costs a whole run. It re-enters the gate; it never bypasses it |
+| [never-miss-safeguards](never-miss-safeguards.md) | Unchanged and binding: retry-review calls the same reviewer and the same `apply_decision()`, never writes `review_state` directly and never uses `force=True` |
