@@ -1,55 +1,19 @@
-"""A triage decision: category, confidence, reasoning and which tier fired."""
+"""Decision — one classification outcome for one thread (spec/agent.md)."""
 
-from __future__ import annotations
+from dataclasses import dataclass
 
-from datetime import datetime
+from domain.enums import DecisionSource
 
-from pydantic import BaseModel, ConfigDict, Field
-
-from domain.enums import DecidedBy, DecisionStatus, ProposedAction
-
-
-class Decision(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: str | None = None
-    user_id: str
-    item_id: str
-    run_id: str
-    cluster_id: str | None = None
-    category_id: str | None = None
-
-    proposed_action: ProposedAction = ProposedAction.KEEP
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Full human-readable justification, expandable in the UI.
-    reasoning: str = ""
-    #: The which-tier-fired indicator surfaced as a badge in the queue.
-    decided_by: DecidedBy
-    rule_id: str | None = None
-    time_sensitive: bool = False
-    status: DecisionStatus = DecisionStatus.PROPOSED
-    decided_at: datetime | None = None
-
-    def below_floor(self, confidence_floor: float) -> bool:
-        """True when this decision is too uncertain to ever archive automatically."""
-        return self.confidence < confidence_floor
-
-    def enforce_floor(self, confidence_floor: float) -> "Decision":
-        """Never-miss guard: an archive below the floor becomes ``needs_your_call``.
-
-        Errs toward keeping mail visible, never toward hiding it.
-        """
-        if (
-            self.proposed_action is ProposedAction.ARCHIVE
-            and self.below_floor(confidence_floor)
-        ):
-            return self.model_copy(
-                update={
-                    "proposed_action": ProposedAction.KEEP,
-                    "status": DecisionStatus.NEEDS_YOUR_CALL,
-                }
-            )
-        return self
+#: Below this confidence the decision keeps its best-guess category AND is
+#: flagged needs_review (spec/agent.md classify_batch).
+NEEDS_REVIEW_CONFIDENCE_THRESHOLD = 0.7
 
 
-__all__ = ["Decision"]
+@dataclass(frozen=True, slots=True)
+class Decision:
+    gmail_thread_id: str
+    category_id: str
+    confidence: float                 # 0–1
+    reason: str                       # one line, plain English
+    needs_review: bool
+    source: DecisionSource = DecisionSource.LLM

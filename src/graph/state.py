@@ -1,75 +1,131 @@
+"""Graph state and value types for the triage run.
+
+The privacy boundary (spec/architecture.md) is enforced by construction: the
+canonical :class:`llm.views.ClassifierView` — re-exported here — is the ONLY
+shape that ever reaches an LLM prompt, and an email body is unrepresentable in
+it. :func:`view_from_mapping` is the graph's tolerant constructor for whatever
+the Gmail layer hands over: every key outside the allowed prompt fields is
+dropped on the floor.
+"""
+
 from __future__ import annotations
 
-import operator
-from typing import Annotated, TypedDict
+from dataclasses import dataclass, field, asdict
+from typing import Any, Mapping, TypedDict
+
+from llm.views import ALLOWED_PROMPT_FIELDS, ClassifierView
+
+__all__ = [
+    "ALLOWED_PROMPT_FIELDS",
+    "CONFIDENCE_REVIEW_THRESHOLD",
+    "INVALID_OUTPUT_REASON",
+    "LABEL_NAMESPACE",
+    "ClassifierView",
+    "ClassifyOutcome",
+    "CostTotals",
+    "Decision",
+    "RunState",
+    "TaxonomyEntry",
+    "label_for",
+    "view_from_mapping",
+]
+
+#: Confidence below this ⇒ keep the best-guess category AND flag for review.
+CONFIDENCE_REVIEW_THRESHOLD = 0.7
+
+#: All agent-created Gmail labels are namespaced so they are fully removable.
+LABEL_NAMESPACE = "ZI"
+
+#: Reason recorded when the classifier returned nothing usable for a thread.
+INVALID_OUTPUT_REASON = "classifier output invalid"
 
 
-def keep_first_error(current: str | None, incoming: str | None) -> str | None:
-    """Reducer for the ``error`` channel. Keeps the FIRST real error.
+def label_for(category_name: str) -> str:
+    """The Gmail label an agent category materialises as: ``ZI/<Category>``."""
+    return f"{LABEL_NAMESPACE}/{category_name}"
 
-    ``error`` is a hard gate: any truthy value routes the graph to
-    ``handle_error`` and ends the run. Without a reducer it is a LastValue
-    channel, so when several tier-3 batches fan out via ``Send`` and finish in
-    the SAME superstep — each returning ``{"error": ...}``, success or failure —
-    LangGraph raises ``InvalidUpdateError: At key 'error': Can receive only one
-    value per step`` and the whole run dies. That is what broke the 220-thread
-    full-resume path while fixture-scale runs (one batch, one write per step)
-    passed: the bug only appears once there are enough threads to produce
-    concurrent batches.
 
-    ``current or incoming`` is deliberate in both directions:
-      * a concurrent SUCCESS (``None``) must never erase a sibling's real error,
-        or a fatal batch would be silently swallowed and the run would carry on;
-      * the first error wins over later ones, so the reported cause is the one
-        that actually stopped things rather than whichever landed last.
+def view_from_mapping(data: Mapping[str, Any]) -> ClassifierView:
+    """Build a ClassifierView from any mapping, dropping every disallowed key.
+
+    Even a leaky upstream that includes ``body`` cannot get it into a prompt:
+    the field does not survive this constructor and is unrepresentable in the
+    frozen, slotted ClassifierView type.
     """
-    return current or incoming
+    allowed = {k: v for k, v in data.items() if k in ALLOWED_PROMPT_FIELDS}
+    allowed.setdefault("sender_address", "")
+    return ClassifierView(**allowed)
 
 
-class TriageState(TypedDict, total=False):
-    """State of one cost-tiered triage run. See spec/agent.md."""
+@dataclass(frozen=True, slots=True)
+class TaxonomyEntry:
+    """One user category as the graph needs it (loaded fresh each run)."""
 
-    # identity / scope
+    id: str
+    name: str
+    description: str = ""
+    rule: str = "label_only"  # label_only | label_and_archive
+    is_needs_review: bool = False
+
+
+@dataclass(slots=True)
+class Decision:
+    """One per-thread decision (spec/agent.md)."""
+
+    thread_id: str
+    category_id: str
+    category_name: str
+    confidence: float
+    reason: str
+    needs_review: bool
+    # Carried for feed sentences and the thread_decisions row; header data only.
+    subject: str = ""
+    sender: str = ""
+
+
+@dataclass(slots=True)
+class CostTotals:
+    calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    est_cost_usd: float = 0.0
+    fallback_events: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ClassifyOutcome:
+    """What one batched ``classify_batch()`` LLM call produced.
+
+    Adapter over :class:`llm.BatchClassification`: results are strict
+    ``{thread_id, category, confidence, reason}`` dicts; anything missing or
+    malformed is reported, never guessed. Provider/fallback metadata powers the
+    ``fallback`` feed event and the cost ticker.
+    """
+
+    results: list[dict[str, Any]] = field(default_factory=list)
+    missing_ids: list[str] = field(default_factory=list)
+    provider: str = "nvidia"
+    model: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    est_cost_usd: float = 0.0
+    latency_ms: int = 0
+    was_fallback: bool = False
+    fallback_reason: str = ""
+
+
+class RunState(TypedDict, total=False):
     run_id: str
     user_id: str
-    channel_account_id: str
-    limit: int
-    dry_run: bool
-    fetch_after: str | None  # ISO timestamp; only threads newer than this are fetched
-
-    # per-user context, loaded once
-    categories: list[dict]
-    rules: list[dict]
-    sender_stats: dict[str, dict]
-    settings: dict
-    vip: dict                        # {emails: [], domains: [], keywords: []}
-    priorities_profile: str
-
-    # working set
-    items: list[dict]
-    resolved: Annotated[list[dict], operator.add]
-    llm_queue: list[dict]
-    deep_queue: Annotated[list[dict], operator.add]
-    batches: list[list[dict]]
-    batch: list[dict]
-    llm_decisions: Annotated[list[dict], operator.add]
-    llm_calls: Annotated[list[dict], operator.add]
-
-    # outputs
-    decisions: list[dict]
-    clusters: list[dict]
-    counts: dict
-    cost: dict
-
-    # resume (Phase 6, spec/capabilities/durable-resumable-runs.md)
-    #: item ids (both persisted ids and channel thread ids) this run has already
-    #: decided — filtered out of every tier queue so they are never re-classified.
-    already_decided_item_ids: list[str]
-    #: how many threads the interrupted leg(s) already decided (progress denominator)
-    already_decided_count: int
-    #: item ids whose reviewer pass could not complete — never applied
-    review_failed_item_ids: list[str]
-
-    # control
-    error: Annotated[str | None, keep_first_error]
-    status: str
+    chunk_limit: int
+    threads: list[ClassifierView]
+    batches: list[list[ClassifierView]]
+    batch_index: int
+    decisions: list[Decision]
+    applied_count: int  # decisions[:applied_count] have had their actions applied
+    counts: dict[str, int]
+    cost: CostTotals
+    error: str | None

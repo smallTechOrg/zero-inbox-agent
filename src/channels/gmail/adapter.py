@@ -38,10 +38,6 @@ GMAIL_PAGE_SIZE = 100
 GMAIL_HTTP_TIMEOUT = 60
 #: Concurrent per-thread metadata fetches. Each worker owns its own TLS socket.
 GMAIL_MAX_WORKERS = 10
-DRY_RUN_MESSAGE = (
-    "Phase 1 is dry-run: the Gmail adapter performs no mutations. "
-    "Real mutations ship in Phase 2 behind explicit approval + undo."
-)
 
 
 class GmailAdapter(ChannelAdapter):
@@ -448,15 +444,21 @@ class GmailAdapter(ChannelAdapter):
         ]
 
     # --- mutate -------------------------------------------------------
+    # Every write goes through the ONE choke point in channels/gmail/mutations.py
+    # (four whitelisted ops, audit-row-first, test-isolation guard). These ABC-
+    # required methods delegate to it; they never touch the Gmail API directly.
     def archive_and_label(
         self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
     ) -> dict:
         from channels.gmail.mutations import GmailMutator
 
         mutator = GmailMutator(self._service)
+        result: dict = {}
+        for label_id in add_label_ids:
+            result = mutator.apply("add_label", thread_id, label_id=label_id)
         if remove_inbox:
-            return mutator._modify(thread_id, add_label_ids=add_label_ids, remove_label_ids=["INBOX"])
-        return mutator._modify(thread_id, add_label_ids=add_label_ids, remove_label_ids=[])
+            result = mutator.apply("remove_inbox", thread_id)
+        return result
 
     def undo_archive_and_label(
         self, thread_id: str, add_label_ids: list[str], *, remove_inbox: bool = True
@@ -464,16 +466,27 @@ class GmailAdapter(ChannelAdapter):
         from channels.gmail.mutations import GmailMutator
 
         mutator = GmailMutator(self._service)
-        return mutator._modify(thread_id, add_label_ids=["INBOX"], remove_label_ids=add_label_ids)
+        result: dict = mutator.apply("restore_inbox", thread_id)
+        for label_id in add_label_ids:
+            result = mutator.apply("remove_label", thread_id, label_id=label_id)
+        return result
 
     def create_label(self, name: str) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+        from channels.gmail.labels import GmailLabelManager
+
+        return GmailLabelManager(self._service).ensure_label(name)
 
     def create_filter(self, criteria: dict, action: dict) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+        raise DryRunViolation(
+            "create_filter is not a Zero Inbox operation — only the four "
+            "reversible label mutations exist (spec/architecture.md)."
+        )
 
     def create_draft(self, external_thread_id: str, body: str) -> dict:
-        raise DryRunViolation(DRY_RUN_MESSAGE)
+        raise DryRunViolation(
+            "create_draft is not a Zero Inbox operation — only the four "
+            "reversible label mutations exist (spec/architecture.md)."
+        )
 
 
 def _service_factory_for_refresh_token(config, refresh_token: str) -> Callable[[], object]:

@@ -2,19 +2,15 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 /**
- * The root layout deliberately mounts NOTHING that talks to the API.
- *
- * `<ActivityDrawer />` used to live here, which meant a signed-out visitor on
- * the marketing homepage mounted `useSse()`, opened `new EventSource('/api/events')`,
- * got a 401, and then sat in an exponential reconnect loop on the front door.
- * The drawer is now mounted only inside the authenticated branches of
- * `app/page.tsx`, so no `EventSource` is ever constructed for a signed-out
- * visitor — not hidden, not unmounted after the fact: never created.
+ * The root layout mounts NOTHING that talks to the API — a signed-out visitor
+ * never constructs a fetch or an EventSource. All API access lives inside the
+ * signed-in branch of `app/page.tsx`.
  */
 
 export const metadata: Metadata = {
-  title: 'Zero Inbox Agent',
-  description: 'Clustered, explainable Gmail triage — dry run in Phase 1.',
+  title: 'Zero Inbox',
+  description:
+    'One button cleans your Gmail inbox — every action narrated live, every run undoable with one click.',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -1,29 +1,44 @@
-"""Atomic Gmail thread mutation — archive + label in a single ``modify()`` call.
+"""The ONE choke point for every Gmail write this system performs.
 
-spec/capabilities/gmail-actions-and-undo.md is the source of truth:
+spec/architecture.md is the source of truth. Exactly four reversible mutations
+exist, and nothing else is representable:
 
-- **Archive means exactly one thing**: removing the ``INBOX`` label. It is applied in
-  the *same* atomic ``threads().modify()`` call as adding the matching category label —
-  a thread is never left labelled-but-still-in-inbox or archived-but-uncategorized by a
-  partial write.
-- **Never delete.** This module — and the entire mutation code path built on it — has
-  no ``trash()``, ``delete()``, or ``report_spam()`` method anywhere. Only
-  :meth:`GmailMutator.archive_and_label` and its exact inverse
-  :meth:`GmailMutator.undo_archive_and_label` exist. This is a structural guarantee: the
-  methods to perform a destructive operation do not exist to be called, not merely
-  "we don't call them".
+=================  ============================================  ==============
+op                 Gmail effect                                  inverse
+=================  ============================================  ==============
+``add_label``      add one label to a thread                     ``remove_label``
+``remove_label``   remove one label from a thread                ``add_label``
+``remove_inbox``   remove the ``INBOX`` label (== archive)       ``restore_inbox``
+``restore_inbox``  re-add the ``INBOX`` label                    ``remove_inbox``
+=================  ============================================  ==============
 
-Talks to a built ``googleapiclient`` Gmail service directly, mirroring
-``channels.gmail.labels.GmailLabelManager`` and ``channels.gmail.adapter.GmailAdapter``'s
-transport conventions (3x retry with backoff, 401/403 -> ``ReauthRequired``,
-429/5xx -> backoff-then-``RateLimited``).
+Guarantees enforced *here*, not by callers:
+
+1. **Audit row first.** ``audit_writer`` (when provided) is invoked with the
+   mutation record *before* the Gmail API is touched. A crash between the two
+   leaves an audit row for a mutation that may not have happened — which undo
+   handles idempotently — never a mutation without an audit row.
+2. **Closed op set.** Any op outside :data:`ALLOWED_MUTATIONS` raises
+   :class:`ForbiddenMutation`. There is no delete/trash/spam surface anywhere.
+3. **Test-isolation guard.** When ``AGENT_GMAIL_WRITE_DISABLED=1`` (set by the
+   test suite / e2e fixtures) the mutation is recorded and returned as applied
+   without calling Gmail's write API. Read paths stay real. Additionally,
+   ``tests/conftest.py`` wraps :meth:`GmailMutator._execute` so a real
+   ``googleapiclient`` request can never be executed from inside a test.
+
+Transport: 3x retry with backoff, 401/403/invalid-grant → :class:`ReauthRequired`
+(the caller maps it to the structured ``gmail_reconnect`` error — never a
+traceback), 429/5xx → backoff then :class:`RateLimited`.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
+from typing import Any
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from channels.base import ChannelError, RateLimited, ReauthRequired
@@ -31,21 +46,67 @@ from channels.base import ChannelError, RateLimited, ReauthRequired
 INBOX_LABEL_ID = "INBOX"
 MAX_ATTEMPTS = 3
 
+MUTATION_ADD_LABEL = "add_label"
+MUTATION_REMOVE_LABEL = "remove_label"
+MUTATION_REMOVE_INBOX = "remove_inbox"
+MUTATION_RESTORE_INBOX = "restore_inbox"
+
+#: The exactly-four reversible mutations. This tuple IS the whitelist.
+ALLOWED_MUTATIONS: tuple[str, ...] = (
+    MUTATION_ADD_LABEL,
+    MUTATION_REMOVE_LABEL,
+    MUTATION_REMOVE_INBOX,
+    MUTATION_RESTORE_INBOX,
+)
+
+#: Undo applies the inverse of each audit row, newest first (spec/data.md).
+INVERSE_MUTATION: dict[str, str] = {
+    MUTATION_ADD_LABEL: MUTATION_REMOVE_LABEL,
+    MUTATION_REMOVE_LABEL: MUTATION_ADD_LABEL,
+    MUTATION_REMOVE_INBOX: MUTATION_RESTORE_INBOX,
+    MUTATION_RESTORE_INBOX: MUTATION_REMOVE_INBOX,
+}
+
+#: The env flags honoured by the test-isolation guard (see module docstring).
+#: Either one being "1" disables live Gmail writes.
+WRITE_DISABLED_ENV = "AGENT_GMAIL_WRITE_DISABLED"
+TEST_ISOLATION_ENV = "AGENT_TEST_ISOLATION"
+
+
+class ForbiddenMutation(ChannelError):
+    """An op outside the four-op whitelist was requested. Always a bug."""
+
+
+def gmail_writes_disabled() -> bool:
+    """True when the test-isolation guard has switched Gmail writes off."""
+    return (
+        os.environ.get(WRITE_DISABLED_ENV, "") == "1"
+        or os.environ.get(TEST_ISOLATION_ENV, "") == "1"
+    )
+
 
 class GmailMutator:
-    """Atomic add/remove-label mutations against one Gmail thread.
+    """Applies exactly one of the four whitelisted mutations to one thread.
 
-    No delete/trash/spam surface exists on this class, full stop.
+    ``audit_writer`` — optional callable invoked with the mutation record
+    *before* Gmail is called::
+
+        {"op", "gmail_thread_id", "label_id", "reason"}
+
+    The runs/undo slice passes a writer that persists the audit row; the
+    mini-audit and all read paths never construct a mutator at all.
     """
 
     def __init__(
         self,
         service,
         *,
+        audit_writer: Callable[[dict[str, Any]], None] | None = None,
         backoff_seconds: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._service = service
+        self._audit_writer = audit_writer
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep
 
@@ -55,6 +116,13 @@ class GmailMutator:
         for attempt in range(MAX_ATTEMPTS):
             try:
                 return request.execute()
+            except RefreshError as exc:
+                # A revoked/expired refresh token fails when google-auth mints
+                # the access token — never as an HttpError. Unmapped it escapes
+                # as a raw traceback; the user must see "reconnect Gmail".
+                raise ReauthRequired(
+                    "Gmail rejected the stored credentials — reconnect Gmail"
+                ) from exc
             except HttpError as exc:
                 status = getattr(exc.resp, "status", None)
                 if status in (401, 403):
@@ -68,60 +136,152 @@ class GmailMutator:
                 raise ChannelError(f"Gmail request failed with HTTP {status}") from exc
         raise RateLimited("Gmail is rate limiting; retries exhausted") from last
 
-    def _modify(self, thread_id: str, *, add_label_ids: list[str], remove_label_ids: list[str]) -> dict:
+    # --- reads used by the undo machinery -------------------------------
+    def get_thread_labels(self, thread_id: str) -> list[str]:
+        """Current Gmail label IDs for a thread (pre-mutation snapshot)."""
+        result = self._execute(
+            self._service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="minimal")
+        )
+        return list((result or {}).get("labelIds") or [])
+
+    # --- THE choke point -------------------------------------------------
+    def apply(
+        self,
+        op: str,
+        thread_id: str,
+        *,
+        label_id: str | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Apply one whitelisted mutation. Everything above calls this and only this.
+
+        Returns ``{"thread_id", "op", "label_id", "applied", "simulated"}`` —
+        ``simulated`` is True only under the test-isolation guard.
+        """
+        if op not in ALLOWED_MUTATIONS:
+            raise ForbiddenMutation(
+                f"mutation {op!r} is not one of {ALLOWED_MUTATIONS} — "
+                "no other Gmail write exists in this system"
+            )
+        if op in (MUTATION_ADD_LABEL, MUTATION_REMOVE_LABEL) and not label_id:
+            raise ForbiddenMutation(f"mutation {op!r} requires a label_id")
+        if op in (MUTATION_REMOVE_INBOX, MUTATION_RESTORE_INBOX):
+            label_id = INBOX_LABEL_ID
+        if not thread_id:
+            raise ForbiddenMutation("mutation requires a gmail thread id")
+
+        record = {
+            "op": op,
+            "gmail_thread_id": thread_id,
+            "label_id": label_id,
+            "reason": reason,
+        }
+        # (1) Audit row FIRST — before Gmail is touched.
+        if self._audit_writer is not None:
+            self._audit_writer(dict(record))
+
+        # (3) Test-isolation guard: recorded as applied, Gmail write API untouched.
+        if gmail_writes_disabled():
+            return {**record, "applied": True, "simulated": True}
+
+        add = [label_id] if op in (MUTATION_ADD_LABEL, MUTATION_RESTORE_INBOX) else []
+        remove = [label_id] if op in (MUTATION_REMOVE_LABEL, MUTATION_REMOVE_INBOX) else []
         result = self._execute(
             self._service.users()
             .threads()
             .modify(
                 userId="me",
                 id=thread_id,
-                body={"addLabelIds": add_label_ids, "removeLabelIds": remove_label_ids},
+                body={"addLabelIds": add, "removeLabelIds": remove},
             )
         )
         return {
-            "thread_id": thread_id,
+            **record,
+            "applied": True,
+            "simulated": False,
             "label_ids": list((result or {}).get("labelIds") or []),
         }
 
-    # --- the only two mutations that exist ------------------------------
-    def get_thread_labels(self, thread_id: str) -> list[str]:
-        """Return the current Gmail label IDs for a thread (pre-mutation snapshot)."""
-        result = self._execute(
-            self._service.users()
-            .threads()
-            .get(userId="me", id=thread_id, format="metadata")
+    def apply_inverse(self, op: str, thread_id: str, *, label_id: str | None = None, reason: str = "") -> dict:
+        """Apply the inverse of ``op`` — the undo primitive."""
+        if op not in INVERSE_MUTATION:
+            raise ForbiddenMutation(f"mutation {op!r} has no inverse — not a whitelisted op")
+        return self.apply(INVERSE_MUTATION[op], thread_id, label_id=label_id, reason=reason)
+
+
+def execute_mutation(
+    db,
+    *,
+    user_id: str,
+    run_id: str,
+    gmail_thread_id: str,
+    action: str,
+    label_name: str | None = None,
+    reason: str = "",
+) -> dict:
+    """The triage-graph entry point (graph/runner contract, spec/roadmap.md).
+
+    Validates the op, writes the ``mutations`` audit row FIRST on the caller's
+    session, then applies the Gmail write through :class:`GmailMutator` (which
+    also enforces the test-isolation guard). ``label_name`` is ensured as a
+    real Gmail label lazily on the live path only.
+    """
+    if action not in ALLOWED_MUTATIONS:
+        raise ForbiddenMutation(
+            f"mutation {action!r} is not one of {ALLOWED_MUTATIONS} — "
+            "no other Gmail write exists in this system"
         )
-        return list((result or {}).get("labelIds") or [])
+    if action in (MUTATION_ADD_LABEL, MUTATION_REMOVE_LABEL) and not label_name:
+        raise ForbiddenMutation(f"mutation {action!r} requires a label_name")
+    if not gmail_thread_id:
+        raise ForbiddenMutation("mutation requires a gmail thread id")
 
-    def archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict:
-        """One atomic ``modify()``: add the category label, remove ``INBOX``.
+    from db.models import Mutation
 
-        Archive *is* the removal of ``INBOX`` — there is no separate archive call.
-        """
-        return self._modify(
-            thread_id,
-            add_label_ids=[category_label_id],
-            remove_label_ids=[INBOX_LABEL_ID],
+    # (1) Audit row FIRST — before Gmail is touched.
+    db.add(
+        Mutation(
+            user_id=user_id,
+            run_id=run_id,
+            gmail_thread_id=gmail_thread_id,
+            action=action,
+            label_name=label_name,
+            reason=reason or "",
         )
+    )
+    db.flush()
 
-    def undo_archive_and_label(self, thread_id: str, *, category_label_id: str) -> dict:
-        """The exact inverse, also atomic: re-add ``INBOX``, remove the category label."""
-        return self._modify(
-            thread_id,
-            add_label_ids=[INBOX_LABEL_ID],
-            remove_label_ids=[category_label_id],
-        )
+    record = {
+        "op": action,
+        "gmail_thread_id": gmail_thread_id,
+        "label_id": None,
+        "reason": reason or "",
+    }
+    # (2) Test-isolation guard: recorded as applied, Gmail write API untouched.
+    if gmail_writes_disabled():
+        return {**record, "applied": True, "simulated": True}
 
-    def restore_labels(
-        self, thread_id: str, *, add_label_ids: list[str], remove_label_ids: list[str]
-    ) -> dict:
-        """Generic restore: add back the given labels, remove the ones triage added.
+    from channels.gmail.labels import GmailLabelManager
+    from channels.gmail.store import adapter_for_user
 
-        Used by the run-level undo to restore exactly the pre-triage label state
-        captured in ``ActionLog.undo_token['original_label_ids']``.
-        """
-        return self._modify(
-            thread_id,
-            add_label_ids=add_label_ids,
-            remove_label_ids=remove_label_ids,
-        )
+    adapter = adapter_for_user(user_id=user_id)
+    service = adapter._service  # noqa: SLF001 — serial single-caller use
+    label_id: str | None = None
+    if action in (MUTATION_ADD_LABEL, MUTATION_REMOVE_LABEL):
+        label_id = GmailLabelManager(service).ensure_label(label_name)["id"]
+        if label_id:
+            # Write the lazily-created label id back onto the category so the
+            # undo path can invert add_label rows (api/runs.label_lookup).
+            from db.models import Category
+
+            bare = label_name.split("/", 1)[1] if "/" in label_name else label_name
+            db.query(Category).filter(
+                Category.user_id == user_id,
+                Category.name == bare,
+                Category.gmail_label_id.is_(None),
+            ).update({"gmail_label_id": label_id}, synchronize_session=False)
+    return GmailMutator(service).apply(
+        action, gmail_thread_id, label_id=label_id, reason=reason or ""
+    )

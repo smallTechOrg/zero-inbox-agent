@@ -1,8 +1,9 @@
-"""Shared HTTP helpers: the response envelope, error codes and small serializers.
+"""Shared HTTP helpers — the JSON envelope, error codes, small serializers.
 
-Every JSON route returns ``{"data": ..., "error": null}`` via :func:`ok`, or raises
-:func:`api_error`, which FastAPI renders as ``{"data": null, "error": {code, message}}``
-through the exception handler installed in :mod:`api`.
+Every route returns ``{"ok": true, "data": …}`` via :func:`ok`, or raises
+:func:`api_error`, rendered by the handlers in :mod:`api.app` as
+``{"ok": false, "error": {"code": …, "message": …}}`` (spec/api.md). Error
+messages are human-actionable sentences — never tracebacks.
 """
 
 from datetime import datetime
@@ -10,34 +11,35 @@ from typing import Any
 
 from fastapi import HTTPException
 
-# Canonical error codes (spec/api.md § Error codes).
-UNAUTHENTICATED = "unauthenticated"
-FORBIDDEN = "forbidden"
+# Canonical error codes (spec/api.md).
+SIGNED_OUT = "signed_out"                # 401 — no/invalid session cookie
+GMAIL_RECONNECT = "gmail_reconnect"      # any Google token failure, anywhere
 NOT_FOUND = "not_found"
-DRY_RUN_VIOLATION = "dry_run_violation"
-REAUTH_REQUIRED = "reauth_required"
+CONFLICT = "conflict"                    # 409 — active run, needs-review delete, …
+VALIDATION_ERROR = "validation_error"
 RATE_LIMITED = "rate_limited"
 PROVIDER_ERROR = "provider_error"
-VALIDATION_ERROR = "validation_error"
-#: spec/api.md:133 — the decision has not passed the never-miss reviewer and
-#: can never be applied while provisional. Distinct from validation_error so
-#: the UI can say WHY, and never 404 (the decision plainly exists).
-NOT_REVIEWED = "not_reviewed"
+
+#: The one sentence every Google-token failure surfaces as (spec/architecture.md).
+GMAIL_RECONNECT_MESSAGE = "Reconnect Gmail to continue."
 
 _STATUS_FOR_CODE = {
-    UNAUTHENTICATED: 401,
-    FORBIDDEN: 403,
+    SIGNED_OUT: 401,
+    GMAIL_RECONNECT: 409,
     NOT_FOUND: 404,
-    DRY_RUN_VIOLATION: 409,
-    REAUTH_REQUIRED: 409,
+    CONFLICT: 409,
+    VALIDATION_ERROR: 422,
     RATE_LIMITED: 429,
     PROVIDER_ERROR: 502,
-    VALIDATION_ERROR: 422,
 }
 
 
 def ok(data: Any) -> dict:
-    return {"data": data, "error": None}
+    return {"ok": True, "data": data}
+
+
+def error_body(code: str, message: str) -> dict:
+    return {"ok": False, "error": {"code": code, "message": message}}
 
 
 def api_error(code: str, message: str, status_code: int | None = None) -> HTTPException:
@@ -47,12 +49,20 @@ def api_error(code: str, message: str, status_code: int | None = None) -> HTTPEx
     )
 
 
+def signed_out() -> HTTPException:
+    return api_error(SIGNED_OUT, "You are signed out — sign in with Google to continue.")
+
+
+def gmail_reconnect() -> HTTPException:
+    return api_error(GMAIL_RECONNECT, GMAIL_RECONNECT_MESSAGE)
+
+
 def not_found(what: str) -> HTTPException:
     return api_error(NOT_FOUND, f"{what} not found")
 
 
 def iso(value: datetime | None) -> str | None:
-    """Timestamps cross the wire as ISO-8601 UTC strings, or null."""
+    """Timestamps cross the wire as ISO-8601 strings, or null."""
     if value is None:
         return None
     return value.isoformat()

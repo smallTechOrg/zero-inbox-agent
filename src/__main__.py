@@ -51,4 +51,4 @@ def _check_fatal_config() -> None:
 
 if __name__ == "__main__":
     _check_fatal_config()
-    uvicorn.run("api:app", host="0.0.0.0", port=_port(), reload=False)
+    uvicorn.run("api.app:app", host="0.0.0.0", port=_port(), reload=False)

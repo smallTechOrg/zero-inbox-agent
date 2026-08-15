@@ -1,10 +1,20 @@
-"""Idempotent seed data — the six default categories every user starts with.
+"""Default-taxonomy seeding (spec/capabilities/taxonomy-management.md).
 
-spec/capabilities/taxonomy-management.md: "A new user is seeded with the six
-default categories." Seeding runs at OAuth-connect time (``channels/gmail/store``)
-and again defensively before every triage run (``graph/persistence``), so an
-existing user whose taxonomy was never materialised is backfilled on their next
-run — without ever creating duplicate rows (unique on ``(user_id, key)``).
+    Seed defaults on first sign-in: Finance, Newsletters, Notifications,
+    Personal, Shopping, Travel, Needs review.
+
+Each category carries a per-category ``rule`` — ``label_only`` or
+``label_and_archive`` (Newsletters auto-archive by default; Finance label-only
+by default). "Needs review" is reserved: never deletable, rule fixed
+``label_only``.
+
+Seeding is **first-sign-in** semantics: a user with ANY existing category is
+left completely alone (the model keys categories by ``(user_id, name)``, so a
+rename must never be "backfilled" away). The reserved "Needs review" row is the
+one exception — identified structurally by ``is_needs_review``, it is restored
+if missing because the classifier and the API both rely on its existence.
+
+Called at OAuth-callback time (auth slice) and lazily by ``GET /api/taxonomy``.
 """
 
 from __future__ import annotations
@@ -12,61 +22,120 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tools.rules import DEFAULT_TAXONOMY
+#: Gmail labels the agent creates are namespaced under this prefix so all agent
+#: state in Gmail is identifiable and fully removable
+#: (spec/capabilities/taxonomy-management.md, "Assumed": ``ZI/<Category>``).
+LABEL_PREFIX = "ZI/"
 
-#: Phase 7 per-category autonomy bars (spec/capabilities/drive-to-inbox-zero.md § B).
-#: Every other category is seeded NULL and inherits the global
-#: ``user_settings.auto_act_threshold`` (0.80), which is what keeps the global
-#: slider load-bearing.
-#:
-#: - ``outreach`` is the one archive-by-default category where a false archive
-#:   costs a real opportunity (a genuine intro reads like recruiter spam), so it
-#:   sits one measured confidence band above the global bar.
-#: - ``receipts`` is ``default_action = archive`` (Phase 7 — keeping it meant a
-#:   permanent ~715-thread inbox floor, so "inbox zero" could never be true), and
-#:   its bar is therefore **live**, not inert. Financial records earn the same
-#:   one-band margin as outreach: a wrongly-archived invoice is far more costly
-#:   than a wrongly-kept one, and the never-miss layer still holds anything
-#:   ``time_sensitive`` regardless of this bar.
-SEEDED_AUTO_ACT_THRESHOLDS: dict[str, float] = {
-    "outreach": 0.85,
-    "receipts": 0.85,
-}
+#: The two per-category rules (spec/data.md § categories).
+VALID_RULES: tuple[str, ...] = ("label_only", "label_and_archive")
+
+NEEDS_REVIEW_NAME = "Needs review"
+
+#: The seed set, in display order. Only Newsletters auto-archives by default;
+#: everything else starts conservative (label only) — the user can flip any
+#: rule except "Needs review"'s from the taxonomy panel.
+DEFAULT_TAXONOMY: list[dict] = [
+    {
+        "name": "Finance",
+        "rule": "label_only",
+        "description": "Bank statements, bills, invoices, payment confirmations, "
+        "tax and billing mail. Stays in the inbox: label only.",
+    },
+    {
+        "name": "Newsletters",
+        "rule": "label_and_archive",
+        "description": "Subscribed bulk mail: newsletters, digests, marketing "
+        "blasts — anything with an unsubscribe link you opted into.",
+    },
+    {
+        "name": "Notifications",
+        "rule": "label_only",
+        "description": "Automated app and service notifications: social updates, "
+        "CI results, delivery updates, calendar and account noise.",
+    },
+    {
+        "name": "Personal",
+        "rule": "label_only",
+        "description": "Genuine person-to-person mail written by a human to you, "
+        "including ongoing conversations and replies.",
+    },
+    {
+        "name": "Shopping",
+        "rule": "label_only",
+        "description": "Order confirmations, shipping notices, promotions and "
+        "offers from shops you buy from.",
+    },
+    {
+        "name": "Travel",
+        "rule": "label_only",
+        "description": "Bookings, itineraries, boarding passes, check-in "
+        "reminders and travel account mail.",
+    },
+    {
+        "name": NEEDS_REVIEW_NAME,
+        "rule": "label_only",
+        "description": "Reserved: anything the classifier is not confident "
+        "about. Stays in the inbox for your decision.",
+    },
+]
+
+DEFAULT_CATEGORY_NAMES: tuple[str, ...] = tuple(c["name"] for c in DEFAULT_TAXONOMY)
 
 
 def ensure_default_taxonomy(session: Session, user_id: str) -> int:
-    """Insert any missing default categories for ``user_id``. Returns rows created.
+    """Seed the defaults for a brand-new user. Returns rows created.
 
-    Idempotent by construction: only keys absent from the user's taxonomy are
-    inserted, so user-created and user-edited categories are never touched.
+    * User has no categories at all → insert the full default set.
+    * User has categories but the reserved "Needs review" row is missing
+      (matched by ``is_needs_review``, so renaming it is fine) → restore it.
+    * Otherwise → no-op. User edits are never touched.
     """
     from db.models import Category
 
-    existing = {
-        row.key
-        for row in session.execute(
-            select(Category).where(Category.user_id == user_id)
-        ).scalars()
-    }
+    existing = session.execute(
+        select(Category).where(Category.user_id == user_id)
+    ).scalars().all()
 
-    created = 0
-    for order, spec in enumerate(DEFAULT_TAXONOMY):
-        if spec["key"] in existing:
-            continue
+    if not existing:
+        for position, spec in enumerate(DEFAULT_TAXONOMY):
+            session.add(
+                Category(
+                    user_id=user_id,
+                    name=spec["name"],
+                    description=spec["description"],
+                    rule=spec["rule"],
+                    is_needs_review=spec["name"] == NEEDS_REVIEW_NAME,
+                    position=position,
+                )
+            )
+        session.flush()
+        return len(DEFAULT_TAXONOMY)
+
+    if not any(c.is_needs_review for c in existing):
+        spec = DEFAULT_TAXONOMY[-1]
         session.add(
             Category(
                 user_id=user_id,
-                key=spec["key"],
-                name=spec["name"],
+                name=_free_name(existing, NEEDS_REVIEW_NAME),
                 description=spec["description"],
-                channel_label_name=f"ZeroInbox/{spec['name']}",
-                default_action=spec["default_action"],
-                auto_act_threshold=SEEDED_AUTO_ACT_THRESHOLDS.get(spec["key"]),
-                is_default=True,
-                sort_order=order,
+                rule="label_only",
+                is_needs_review=True,
+                position=max(c.position for c in existing) + 1,
             )
         )
-        created += 1
-    if created:
         session.flush()
-    return created
+        return 1
+
+    return 0
+
+
+def _free_name(existing, wanted: str) -> str:
+    """A name not colliding with (user_id, name) uniqueness."""
+    taken = {c.name.lower() for c in existing}
+    name = wanted
+    suffix = 2
+    while name.lower() in taken:
+        name = f"{wanted} {suffix}"
+        suffix += 1
+    return name

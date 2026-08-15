@@ -1,10 +1,10 @@
-"""Persistence of a connected mailbox: users + channel_accounts.
+"""Persistence of the Gmail connection: ``users`` + ``gmail_accounts``.
 
-The refresh token is Fernet-encrypted *before* it reaches the database and is
-never returned, logged, or included in an error message.
-
-`src/db/models.py` is owned by the db-schema slice; it is imported lazily so
-this module has no import-time coupling to it.
+spec/data.md: users 1—1 gmail_accounts. The refresh token is Fernet-encrypted
+*before* it reaches the database and is never returned, logged, or included in
+an error message. Disconnect deletes the row; a failed refresh flips ``status``
+to ``needs_reconnect``; reconnecting overwrites the token and restores
+``connected``.
 """
 
 from __future__ import annotations
@@ -12,44 +12,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from channels.base import ChannelError, ReauthRequired
+from channels.base import ReauthRequired
 from security.crypto import TokenCipher
-
-
-class SchemaNotReady(ChannelError):
-    """The db-schema slice has not provided `User` / `ChannelAccount` yet."""
-
-
-class MailboxOwnedByAnotherUser(ChannelError):
-    """Phase 8: this address is already connected to a **different** Zero Inbox user.
-
-    Two distinct users pointing at one mailbox would mean two agents mutating one
-    inbox under two independent policies. The route maps this to
-    ``409 mailbox_already_connected``; nothing is written when it is raised.
-    """
-
-    def __init__(self, account_email: str, channel: str = "gmail") -> None:
-        self.account_email = account_email
-        self.channel = channel
-        super().__init__(
-            f"{account_email} is already connected to another Zero Inbox account. "
-            "Sign in as that account, or disconnect it there first."
-        )
-
-
-def _models():
-    try:
-        from db import models
-    except Exception as exc:  # pragma: no cover - db package always importable
-        raise SchemaNotReady("db.models is not importable") from exc
-    user = getattr(models, "User", None)
-    account = getattr(models, "ChannelAccount", None)
-    if user is None or account is None:
-        raise SchemaNotReady(
-            "db.models.User / db.models.ChannelAccount are not defined yet "
-            "(owned by the db-schema slice) — run alembic upgrade head"
-        )
-    return user, account
 
 
 def _now() -> datetime:
@@ -57,7 +21,7 @@ def _now() -> datetime:
 
 
 class SqlConnectionStore:
-    """Upserts the user + their connected mailbox, keyed by (email, channel)."""
+    """All reads/writes of the encrypted per-user Gmail connection."""
 
     def __init__(self, cipher: TokenCipher | None = None) -> None:
         self._cipher = cipher or TokenCipher()
@@ -69,133 +33,152 @@ class SqlConnectionStore:
         self,
         *,
         email: str,
-        display_name: str,
-        refresh_token_enc: str,
-        scopes: list[str],
-        channel: str = "gmail",
+        name: str = "",
+        picture_url: str = "",
+        refresh_token_encrypted: str,
     ) -> tuple[str, str]:
+        """One consent → user row + gmail_accounts row, idempotently.
+
+        Reconnecting overwrites the stored token and restores ``connected``.
+        A new user is seeded with the default taxonomy (idempotent).
+        """
+        from db.models import GmailAccount, User
         from db.session import create_db_session
 
-        User, ChannelAccount = _models()
         with create_db_session() as session:
-            # Phase 8 — the ownership guard runs FIRST, before a single row is
-            # created, so a rejected connect writes nothing at all (not even the
-            # `users` row a brand-new signer-in would otherwise get).
-            owner_id = (
-                session.query(ChannelAccount.user_id)
-                .filter(
-                    ChannelAccount.channel == channel,
-                    ChannelAccount.account_email == email,
-                )
-                .limit(1)
-                .scalar()
-            )
-            existing_user_id = (
-                session.query(User.id).filter(User.email == email).limit(1).scalar()
-            )
-            if owner_id is not None and owner_id != existing_user_id:
-                raise MailboxOwnedByAnotherUser(email, channel)
-
             user = session.query(User).filter(User.email == email).one_or_none()
             if user is None:
                 user = User(
                     id=str(uuid4()),
                     email=email,
-                    display_name=display_name,
+                    name=name or email.split("@")[0],
+                    picture_url=picture_url or None,
                     created_at=_now(),
                 )
                 session.add(user)
                 session.flush()
+            else:
+                if name and not user.name:
+                    user.name = name
+                if picture_url and not user.picture_url:
+                    user.picture_url = picture_url
 
             account = (
-                session.query(ChannelAccount)
-                .filter(
-                    ChannelAccount.user_id == user.id,
-                    ChannelAccount.channel == channel,
-                    ChannelAccount.account_email == email,
-                )
+                session.query(GmailAccount)
+                .filter(GmailAccount.user_id == user.id)
                 .one_or_none()
             )
             if account is None:
-                account = ChannelAccount(
+                account = GmailAccount(
                     id=str(uuid4()),
                     user_id=user.id,
-                    channel=channel,
-                    account_email=email,
+                    google_email=email,
+                    refresh_token_encrypted=refresh_token_encrypted,
                     connected_at=_now(),
                 )
                 session.add(account)
-            account.refresh_token_enc = refresh_token_enc
-            account.scopes = list(scopes)
+            account.google_email = email
+            account.refresh_token_encrypted = refresh_token_encrypted
             account.status = "connected"
             session.flush()
 
-            # A new user is seeded with the six default categories (idempotent —
-            # reconnecting or a user with an edited taxonomy adds nothing).
             from db.seed import ensure_default_taxonomy
 
             ensure_default_taxonomy(session, user.id)
             return user.id, account.id
 
-    def upsert_user(self, *, email: str, display_name: str) -> str:
-        """Phase 8 ``intent=signin``: the identity row and nothing else.
-
-        Writes **no** ``channel_accounts`` row, requires no refresh token, and
-        starts no triage run — signing in is not the same act as granting mailbox
-        access. The default taxonomy is seeded so the account is usable the
-        moment a mailbox is connected.
-        """
+    def load_refresh_token(self, *, user_id: str) -> str:
+        """Decrypt the stored refresh token — scoped to one user, or reauth."""
+        from db.models import GmailAccount
         from db.session import create_db_session
 
-        User, _ChannelAccount = _models()
-        with create_db_session() as session:
-            user = session.query(User).filter(User.email == email).one_or_none()
-            if user is None:
-                user = User(
-                    id=str(uuid4()),
-                    email=email,
-                    display_name=display_name or email.split("@")[0],
-                    created_at=_now(),
-                )
-                session.add(user)
-                session.flush()
-            elif display_name and not user.display_name:
-                user.display_name = display_name
-
-            from db.seed import ensure_default_taxonomy
-
-            ensure_default_taxonomy(session, user.id)
-            return user.id
-
-    def load_refresh_token(self, *, user_id: str, connection_id: str) -> str:
-        """Decrypt the stored refresh token for one user's connection.
-
-        Scoped by `user_id` — a connection belonging to another user is not found.
-        """
-        from db.session import create_db_session
-
-        _User, ChannelAccount = _models()
         with create_db_session() as session:
             account = (
-                session.query(ChannelAccount)
-                .filter(
-                    ChannelAccount.id == connection_id,
-                    ChannelAccount.user_id == user_id,
-                )
+                session.query(GmailAccount)
+                .filter(GmailAccount.user_id == user_id)
+                .one_or_none()
+            )
+            if account is None or not account.refresh_token_encrypted:
+                raise ReauthRequired("no stored refresh token — reconnect Gmail")
+            return self._cipher.decrypt(account.refresh_token_encrypted)
+
+    def connection_for(self, user_id: str) -> dict | None:
+        """``{"id", "google_email", "status", "connected_at"}`` or None.
+
+        Never the token, in any form.
+        """
+        from db.models import GmailAccount
+        from db.session import create_db_session
+
+        with create_db_session() as session:
+            account = (
+                session.query(GmailAccount)
+                .filter(GmailAccount.user_id == user_id)
                 .one_or_none()
             )
             if account is None:
-                raise ChannelError("no such mailbox connection for this user")
-            if not account.refresh_token_enc:
-                raise ReauthRequired("no stored refresh token — reconnect Gmail")
-            return self._cipher.decrypt(account.refresh_token_enc)
+                return None
+            return {
+                "id": account.id,
+                "google_email": account.google_email,
+                "status": account.status,
+                "connected_at": account.connected_at,
+            }
+
+    def mark_needs_reconnect(self, user_id: str) -> bool:
+        """Flip the connection to ``needs_reconnect`` (revoked/expired token).
+
+        Every surface that catches ``ReauthRequired`` calls this so the
+        dashboard's reconnect banner is consistent app-wide. Idempotent.
+        """
+        from db.models import GmailAccount
+        from db.session import create_db_session
+
+        with create_db_session() as session:
+            account = (
+                session.query(GmailAccount)
+                .filter(GmailAccount.user_id == user_id)
+                .one_or_none()
+            )
+            if account is None:
+                return False
+            account.status = "needs_reconnect"
+            return True
+
+    def disconnect(self, user_id: str) -> str | None:
+        """Delete the token row (spec: disconnect deletes the row).
+
+        Returns the decrypted refresh token so the caller can best-effort revoke
+        it at Google — the local ciphertext is deleted regardless.
+        """
+        from db.models import GmailAccount
+        from db.session import create_db_session
+
+        with create_db_session() as session:
+            account = (
+                session.query(GmailAccount)
+                .filter(GmailAccount.user_id == user_id)
+                .one_or_none()
+            )
+            if account is None:
+                return None
+            plaintext: str | None = None
+            if account.refresh_token_encrypted:
+                try:
+                    plaintext = self._cipher.decrypt(account.refresh_token_encrypted)
+                except Exception:  # noqa: BLE001 — an undecryptable token still gets deleted
+                    plaintext = None
+            session.delete(account)
+            return plaintext
 
 
-def adapter_for_connection(*, user_id: str, connection_id: str, **kwargs):
-    """Build a ready-to-use `GmailAdapter` for one user's connected mailbox."""
+def adapter_for_user(*, user_id: str, **kwargs):
+    """Build a ready-to-use :class:`GmailAdapter` for one user's mailbox.
+
+    Raises ``ReauthRequired`` when no valid token is stored — callers map it to
+    the structured ``gmail_reconnect`` error.
+    """
     from channels.gmail.adapter import GmailAdapter
 
-    refresh_token = SqlConnectionStore().load_refresh_token(
-        user_id=user_id, connection_id=connection_id
-    )
+    refresh_token = SqlConnectionStore().load_refresh_token(user_id=user_id)
     return GmailAdapter.for_refresh_token(refresh_token, user_id=user_id, **kwargs)

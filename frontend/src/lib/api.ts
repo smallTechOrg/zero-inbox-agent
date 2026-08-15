@@ -2,46 +2,29 @@
 
 import {
   ApiError,
-  type ActionLogRow,
-  type ApplyResult,
-  type ApproveAndApplyResult,
+  type AuditSnapshot,
   type Category,
-  type Cluster,
-  type DefaultAction,
-  type DigestData,
+  type CategoryRule,
   type Envelope,
   type Me,
-  type PriorityProfile,
-  type RemainderLedger,
   type Run,
-  type RunSummary,
-  type Settings,
-  type TaxonomyProposal,
-  type TriageItem,
-  type UndoRunResult,
-  type VipEntry,
-  type VipKind,
 } from './types'
 
-/**
- * The static export is served by the same FastAPI process that serves the API
- * (http://localhost:8001/app/), so every path below is same-origin and absolute.
- */
+/** Sign-in and OAuth entry points — spec/api.md § Auth & Account. */
+export const LOGIN_URL = '/auth/google/login'
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
     res = await fetch(path, {
       ...init,
       credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(init?.headers ?? {}),
-      },
+      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     })
   } catch {
     throw new ApiError(
       'network_error',
-      'Could not reach the server — is it running on http://localhost:8001 ?',
+      'Could not reach the server — is the backend running on port 8001?',
       0,
     )
   }
@@ -53,196 +36,131 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     body = null
   }
 
-  if (!res.ok || body?.error) {
+  if (!res.ok || body?.ok === false || body?.error) {
     const code = body?.error?.code ?? `http_${res.status}`
-    const message = body?.error?.message ?? `Request to ${path} failed (${res.status}).`
+    const message = body?.error?.message ?? `Request failed (${res.status}).`
     throw new ApiError(code, message, res.status)
   }
   return body?.data as T
 }
 
+export function isSignedOut(e: unknown): boolean {
+  return e instanceof ApiError && (e.code === 'signed_out' || e.status === 401)
+}
+
+export function isGmailReconnect(e: unknown): boolean {
+  return e instanceof ApiError && e.code === 'gmail_reconnect'
+}
+
+/* ── Normalizers — tolerate the data.md column names (`*_json`) if the API
+   returns rows verbatim; the shape the UI consumes is fixed here. ────────── */
+
+function asRecord(v: unknown): Record<string, unknown> {
+  if (typeof v === 'string') {
+    try {
+      return JSON.parse(v) as Record<string, unknown>
+    } catch {
+      return {}
+    }
+  }
+  return (v as Record<string, unknown>) ?? {}
+}
+
+function normalizeMe(raw: unknown): Me {
+  const r = asRecord(raw)
+  const user = asRecord(r.user ?? r)
+  const status = (r.gmail_status ?? r.gmail ?? asRecord(r.gmail_account).status ?? 'none') as
+    | Me['gmail_status']
+    | undefined
+  return {
+    email: String(user.email ?? ''),
+    name: (user.name as string) ?? null,
+    picture_url: (user.picture_url as string) ?? null,
+    gmail_status: status === 'connected' || status === 'needs_reconnect' ? status : 'none',
+  }
+}
+
+function normalizeAudit(raw: unknown): AuditSnapshot | null {
+  if (raw == null) return null
+  const r = asRecord(raw)
+  let senders = (r.top_senders ?? r.top_senders_json) as unknown
+  if (typeof senders === 'string') {
+    try {
+      senders = JSON.parse(senders)
+    } catch {
+      senders = []
+    }
+  }
+  const senderList: unknown[] = Array.isArray(senders) ? senders : []
+  return {
+    total_inbox_threads: Number(r.total_inbox_threads ?? 0),
+    unread: Number(r.unread ?? 0),
+    oldest_days: Number(r.oldest_days ?? 0),
+    top_senders: senderList.map((s) => {
+      const row = asRecord(s)
+      return { address: String(row.address ?? row.sender ?? ''), count: Number(row.count ?? 0) }
+    }),
+    category_tab_counts: asRecord(r.category_tab_counts ?? r.category_tab_counts_json) as Record<
+      string,
+      number
+    >,
+    created_at: (r.created_at as string) ?? null,
+  }
+}
+
+function normalizeRun(raw: unknown): Run {
+  const r = asRecord(raw)
+  return {
+    id: String(r.id ?? r.run_id ?? ''),
+    status: (r.status as Run['status']) ?? 'completed',
+    chunk_limit: Number(r.chunk_limit ?? 50),
+    started_at: (r.started_at as string) ?? null,
+    finished_at: (r.finished_at as string) ?? null,
+    threads_decided: Number(r.threads_decided ?? 0),
+    counts: asRecord(r.counts ?? r.counts_json) as Record<string, number>,
+    llm_calls: Number(r.llm_calls ?? 0),
+    tokens_in: Number(r.tokens_in ?? 0),
+    tokens_out: Number(r.tokens_out ?? 0),
+    est_cost_usd: Number(r.est_cost_usd ?? 0),
+    fallback_events: Number(r.fallback_events ?? 0),
+    interrupt_reason: (r.interrupt_reason as string) ?? null,
+    undone_at: (r.undone_at as string) ?? null,
+  }
+}
+
+/* ── The API surface, exactly spec/api.md Phase 1 ────────────────────────── */
+
 export const api = {
-  me: () => request<Me>('/api/me'),
+  me: async () => normalizeMe(await request<unknown>('/api/me')),
+  logout: () => request<unknown>('/api/auth/logout', { method: 'POST' }),
+  disconnectGmail: () => request<unknown>('/api/gmail/disconnect', { method: 'POST' }),
 
-  startTriage: (connectionId: string, limit = 10_000, onlyNew = false) =>
-    request<{ run_id: string }>(`/api/connections/${connectionId}/triage`, {
-      method: 'POST',
-      body: JSON.stringify({ limit, only_new: onlyNew }),
-    }),
+  runAudit: async () => normalizeAudit(await request<unknown>('/api/audit', { method: 'POST' })),
+  latestAudit: async () => normalizeAudit(await request<unknown>('/api/audit/latest')),
 
-  run: (runId: string) => request<Run>(`/api/runs/${runId}`),
-
-  /** The most recent completed/running run, or null if none exists yet. */
-  latestRun: () => request<Run | null>('/api/runs/latest'),
-
-  /** Live counts straight from Gmail: total left in inbox, plus a per-category
-   * label breakdown. Each count is one cheap labels().get() call server-side. */
-  inboxSummary: () =>
-    request<{
-      inbox_total: number
-      needs_your_call: number
-      categories: { key: string; name: string; count: number; channel_label_name: string }[]
-    }>('/api/inbox-summary'),
-
-  cancelRun: (runId: string) =>
-    request<{ status: string }>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
-
-  clusters: (runId: string) =>
-    request<Cluster[]>(`/api/triage/clusters?run_id=${encodeURIComponent(runId)}`),
-
-  clusterItems: (clusterId: string) =>
-    request<TriageItem[]>(`/api/triage/items?cluster_id=${encodeURIComponent(clusterId)}`),
-
-  itemsByStatus: (runId: string, status: string) =>
-    request<TriageItem[]>(
-      `/api/triage/items?run_id=${encodeURIComponent(runId)}&status=${encodeURIComponent(status)}`,
-    ),
-
-  decide: (decisionId: string, status: 'approved' | 'rejected') =>
-    request<TriageItem>(`/api/triage/decisions/${decisionId}`, {
-      method: 'POST',
-      body: JSON.stringify({ status }),
-    }),
-
-  /** Approve/reject every cluster in a run in one call — needs_your_call is
-   * always excluded server-side, same rule as the per-cluster endpoint. */
-  reviewAllClusters: (runId: string, status: 'approved' | 'rejected') =>
-    request<{ updated: number; skipped_needs_your_call: number }>(
-      `/api/triage/runs/${runId}/review-all`,
-      { method: 'POST', body: JSON.stringify({ status }) },
-    ),
-
-  decideCluster: (clusterId: string, status: 'approved' | 'rejected') =>
-    request<{ updated: number }>(`/api/triage/clusters/${clusterId}/approve`, {
-      method: 'POST',
-      body: JSON.stringify({ status }),
-    }),
-
-  // --- Phase 2 ---
-
-  updateSettings: (patch: Partial<Settings>) =>
-    request<Settings>('/api/settings', {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
-
-  /**
-   * Performs the real Gmail mutations for already-approved decisions. Only
-   * ever called when dry_run is off — the server itself enforces this
-   * (409 dry_run_violation) but the client never calls it in dry-run mode
-   * either, and never for a `rejected` decision.
-   */
-  applyDecisions: (decisionIds: string[], force = false) =>
-    request<ApplyResult[]>('/api/actions/apply', {
-      method: 'POST',
-      body: JSON.stringify({ decision_ids: decisionIds, force }),
-    }),
-
-  undoAction: (actionLogId: string) =>
-    request<ActionLogRow>(`/api/actions/${actionLogId}/undo`, { method: 'POST' }),
-
-  actions: () => request<ActionLogRow[]>('/api/actions'),
-
-  vip: {
-    list: () => request<VipEntry[]>('/api/vip'),
-    add: (kind: VipKind, value: string) =>
-      request<VipEntry>('/api/vip', {
-        method: 'POST',
-        body: JSON.stringify({ kind, value }),
-      }),
-    remove: (id: string) => request<{ deleted: boolean }>(`/api/vip/${id}`, { method: 'DELETE' }),
+  taxonomy: {
+    list: () => request<Category[]>('/api/taxonomy'),
+    add: (body: { name: string; description: string; rule: CategoryRule }) =>
+      request<Category>('/api/taxonomy', { method: 'POST', body: JSON.stringify(body) }),
+    patch: (id: string, patch: Partial<Pick<Category, 'name' | 'description' | 'rule'>>) =>
+      request<Category>(`/api/taxonomy/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+    remove: (id: string) => request<unknown>(`/api/taxonomy/${id}`, { method: 'DELETE' }),
   },
-
-  profile: {
-    get: () => request<PriorityProfile>('/api/profile'),
-    put: (text: string) =>
-      request<PriorityProfile>('/api/profile', {
-        method: 'PUT',
-        body: JSON.stringify({ text }),
-      }),
-  },
-
-  // --- Phase 3 ---
-
-  runSummary: (runId: string) => request<RunSummary>(`/api/runs/${runId}/summary`),
-
-  approveAndApply: (runId: string) =>
-    request<ApproveAndApplyResult>(`/api/runs/${runId}/approve-and-apply`, { method: 'POST' }),
 
   runs: {
-    undo: (runId: string) =>
-      request<UndoRunResult>(`/api/runs/${runId}/undo`, { method: 'POST' }),
-
-    // --- Phase 7 (spec/api.md § Phase 7 — Drive to Inbox Zero) ---
-
-    /** The single honest answer to "how far from zero am I, and why?".
-     *  Computed live from `decisions`, never from cached counts. */
-    remainder: (runId: string) =>
-      request<RemainderLedger>(`/api/runs/${encodeURIComponent(runId)}/remainder`),
-
-    /** Re-runs the apply pass for a `completed` run without re-classifying a
-     *  single thread. Idempotent — the recovery path behind "Retry archiving". */
-    apply: (runId: string) =>
-      request<Record<string, unknown>>(`/api/runs/${encodeURIComponent(runId)}/apply`, {
+    /** 409-with-active-run_id is surfaced by the caller via ApiError. */
+    start: (chunkLimit?: number) =>
+      request<{ run_id: string }>('/api/runs', {
         method: 'POST',
+        body: JSON.stringify(chunkLimit ? { chunk_limit: chunkLimit } : {}),
       }),
+    list: async () => ((await request<unknown[]>('/api/runs')) ?? []).map(normalizeRun),
+    get: async (id: string) => normalizeRun(await request<unknown>(`/api/runs/${id}`)),
+    undo: (id: string) => request<unknown>(`/api/runs/${id}/undo`, { method: 'POST' }),
+    /** SSE endpoint URL — consumed by useRunFeed, not fetch. */
+    eventsUrl: (id: string, afterSeq: number) =>
+      `/api/runs/${encodeURIComponent(id)}/events?after_seq=${afterSeq}`,
   },
-
-  digestLatest: () => request<DigestData>('/api/digest/latest'),
-
-  categories: {
-    list: () => request<Category[]>('/api/categories'),
-    create: (name: string, defaultAction: DefaultAction = 'keep', key?: string) =>
-      request<Category>('/api/categories', {
-        method: 'POST',
-        body: JSON.stringify({ name, default_action: defaultAction, key: key ?? name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') }),
-      }),
-    patch: (
-      id: string,
-      patch: {
-        name?: string
-        default_action?: DefaultAction
-        sort_order?: number
-        /** Phase 7 — per-category autonomy bar; `null` clears it back to inherit. */
-        auto_act_threshold?: number | null
-      },
-    ) =>
-      request<Category>(`/api/categories/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(patch),
-      }),
-    propose: () =>
-      request<{ proposals: TaxonomyProposal[]; model: string; tokens: number }>('/api/categories/propose', {
-        method: 'POST',
-      }),
-  },
-}
-
-/**
- * Phase 8 — signing in and connecting a mailbox are two different consents.
- *
- * `intent=signin` asks Google for `openid email profile` only; it creates the
- * account and the session and touches no mail. `intent=connect` is the existing
- * Gmail scope set. The backend reads `intent` from the signed `zi_oauth_state`
- * cookie, never from the callback query string (spec/api.md § Phase 8).
- */
-export const SIGNIN_URL = '/auth/google/start?intent=signin'
-export const CONNECT_URL = '/auth/google/start?intent=connect'
-
-/** Kept for pre-Phase-8 callers: a bare start is `connect`, byte for byte. */
-export const AUTH_START_URL = '/auth/google/start'
-
-export const LOGOUT_URL = '/auth/logout'
-
-/** True when the backend says this session is gone — the signal to return the
- *  user to the homepage with "You were signed out.", never a wall of failed
- *  panels (spec/ui.md § States). */
-export function isUnauthenticated(e: unknown): boolean {
-  return e instanceof ApiError && (e.code === 'unauthenticated' || e.status === 401)
-}
-
-export async function logout(): Promise<void> {
-  await request<{ logged_out: boolean }>(LOGOUT_URL, { method: 'POST' })
 }
 
 export { ApiError }

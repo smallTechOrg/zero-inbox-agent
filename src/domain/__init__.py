@@ -1,40 +1,37 @@
-from domain.cluster import Cluster
-from domain.decision import Decision
+"""Domain types shared across the backend — enums, the privacy-bounded
+ClassifierView, Decision, and cost accounting. No SQLAlchemy, no FastAPI."""
+
+from domain.classifier_view import CLASSIFIER_VIEW_FIELDS, SNIPPET_MAX_CHARS, ClassifierView
+from domain.costs import CostTotals
+from domain.decision import NEEDS_REVIEW_CONFIDENCE_THRESHOLD, Decision
 from domain.enums import (
-    Channel,
-    ClusterKind,
-    ConnectionStatus,
-    DecidedBy,
-    DecisionStatus,
-    ProposedAction,
-    RuleKind,
-    RuleSource,
-    RuleStatus,
-    RunKind,
+    MUTATION_INVERSE,
+    CategoryRule,
+    DecisionSource,
+    GmailAccountStatus,
+    LlmProvider,
+    MutationAction,
+    ProfileOrigin,
+    RunEventType,
     RunStatus,
+    RunTrigger,
 )
-from domain.item import SNIPPET_MAX_CHARS, Item
-from domain.rule import Rule, RuleAction, RuleMatcher
-from domain.triage import TriageOutcome
 
 __all__ = [
-    "Channel",
-    "Cluster",
-    "ClusterKind",
-    "ConnectionStatus",
-    "DecidedBy",
-    "Decision",
-    "DecisionStatus",
-    "Item",
-    "ProposedAction",
-    "Rule",
-    "RuleAction",
-    "RuleKind",
-    "RuleMatcher",
-    "RuleSource",
-    "RuleStatus",
-    "RunKind",
-    "RunStatus",
+    "CLASSIFIER_VIEW_FIELDS",
+    "MUTATION_INVERSE",
+    "NEEDS_REVIEW_CONFIDENCE_THRESHOLD",
     "SNIPPET_MAX_CHARS",
-    "TriageOutcome",
+    "CategoryRule",
+    "ClassifierView",
+    "CostTotals",
+    "Decision",
+    "DecisionSource",
+    "GmailAccountStatus",
+    "LlmProvider",
+    "MutationAction",
+    "ProfileOrigin",
+    "RunEventType",
+    "RunStatus",
+    "RunTrigger",
 ]

@@ -1,37 +1,41 @@
+"""Routing predicates for the triage graph (spec/agent.md § Edges).
+
+Every post-node route first checks the error channel: any node that trapped an
+exception routes to ``error_handler``, which humanizes it and hands off to
+``finalize``. No exception ever escapes the graph as a traceback.
+"""
+
 from __future__ import annotations
 
-from collections.abc import Callable
+from graph.state import RunState
 
-from graph.state import TriageState
-
-
-def guard(next_node: str) -> Callable[[TriageState], str]:
-    """Route to ``next_node`` unless the state carries an error."""
-
-    def _route(state: TriageState) -> str:
-        return "handle_error" if state.get("error") else next_node
-
-    return _route
+ERROR = "error_handler"
 
 
-def route_after_history(state: TriageState) -> str:
-    """`"llm"` iff anything survived tiers 1-2, else skip the LLM entirely."""
+def has_threads(state: RunState) -> bool:
+    """Anything to do this run? New threads OR recovered unapplied decisions."""
+    return bool(state.get("threads")) or bool(state.get("decisions"))
+
+
+def more_batches(state: RunState) -> bool:
+    return state.get("batch_index", 0) < len(state.get("batches", []))
+
+
+def route_after_load(state: RunState) -> str:
     if state.get("error"):
-        return "handle_error"
-    return "llm" if state.get("llm_queue") else "skip_llm"
+        return ERROR
+    return "match_profiles" if has_threads(state) else "finalize"
 
 
-def route_after_llm(state: TriageState) -> str:
-    """Always continue through ``deep_read_escalation`` (a no-op when its queue
-    is empty). Every ``llm_classify_batch`` branch spawned via ``Send`` for a
-    multi-batch run MUST take the same number of hops before converging on
-    ``cluster_decisions`` — letting some branches skip straight to
-    ``cluster_decisions`` while others detour through an extra
-    ``deep_read_escalation`` step causes uneven-depth fan-in at scale, which
-    LangGraph cannot resolve for the unreduced ``decisions`` key (see
-    ``graph/nodes_review.py`` and the InvalidUpdateError this used to raise on
-    the 220+-thread never-miss fixture).
-    """
+def route_after_match(state: RunState) -> str:
+    return ERROR if state.get("error") else "classify_batch"
+
+
+def route_after_classify(state: RunState) -> str:
+    return ERROR if state.get("error") else "apply_actions"
+
+
+def route_after_apply(state: RunState) -> str:
     if state.get("error"):
-        return "handle_error"
-    return "deep"
+        return ERROR
+    return "classify_batch" if more_batches(state) else "finalize"

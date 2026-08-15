@@ -1,57 +1,71 @@
-"""The LLM layer's public surface.
+"""The LLM layer's public surface: one ``classify_batch()`` client.
 
 Everything in the app talks to :class:`LLMClient`; nothing imports a provider
-directly. The model id is **always** swappable per call (Phase 3 adds a UI
-dropdown that simply passes ``model=`` through — no code change needed).
+directly. Semantics (spec/architecture.md `src/llm/`):
+
+* **Primary NVIDIA NIM, automatic Gemini fallback.** On error, HTTP 429, or
+  timeout the current batch fails over to Gemini; the NEXT batch tries NVIDIA
+  first again (prefer returning to primary — there is no sticky failover state).
+* **Hard per-call timeout** (``AGENT_LLM_TIMEOUT_SECONDS``): a stalled provider
+  is impossible by construction (``asyncio.wait_for`` in the provider layer).
+* **Full accounting surfaced to callers**: every underlying provider call comes
+  back on ``BatchClassification.calls`` (provider, model, tokens, latency, usd,
+  fallback flag) and every failover on ``fallback_events`` — the caller persists
+  ``llm_calls`` rows and emits feed events from these.
+* **Privacy by type**: ``classify_batch`` accepts ONLY ``ClassifierView``
+  instances — an email body is unrepresentable in the input type.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
+import os
 import re
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
 
 from config.settings import get_settings
-from llm.health import ProviderCircuitOpen
 from llm.providers.base import (
     BatchClassification,
+    FallbackEvent,
     LLMError,
     LLMProvider,
     LLMResult,
     LLMSchemaError,
     estimate_cost_usd,
 )
+from llm.providers.gemini import GeminiProvider
 from llm.providers.nvidia import NvidiaProvider
+from llm.views import ClassifierView
 
 __all__ = [
     "LLMClient",
     "get_llm_client",
     "reset_llm_client",
+    "make_primary_provider",
+    "make_fallback_provider",
     "BatchClassification",
+    "ClassifierView",
+    "FallbackEvent",
     "LLMResult",
     "LLMError",
     "LLMSchemaError",
-    # Re-exported so call sites can catch it without importing llm.health directly.
-    # It is NOT an LLMError: it must never be swallowed by a retry/degrade path.
-    "ProviderCircuitOpen",
 ]
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 def _log() -> Any:
-    """Structured logger. Every line here is bridged to the user's SSE feed by
-    ``observability.logging.activity_bus_processor`` — a single LLM call over a
-    whole batch must not be a silent minute in the UI. ``run_id``/``user_id``
-    come from the structlog contextvars the caller bound; without a ``user_id``
-    the bridge drops the event, which is the intended default off-run."""
+    """Structured logger; bridged to the user's SSE feed by the observability
+    layer so a single LLM call over a whole batch is never a silent minute."""
     from observability.logging import get_logger
 
     return get_logger("zero_inbox.llm")
+
 
 _BATCH_SYSTEM = (
     "You are a precise classification engine. You classify a batch of items in a "
@@ -59,34 +73,152 @@ _BATCH_SYSTEM = (
     "explanation outside the JSON."
 )
 
+_ID_FIELD = "thread_id"
 
-def make_provider(settings: Any | None = None) -> LLMProvider:
-    """Build the configured provider. NVIDIA NIM is the only provider in v1."""
+
+def _setting(settings: Any, name: str, env_var: str, default: str = "") -> str:
+    """Read a spec'd setting, tolerating the settings slice landing in parallel."""
+    value = str(getattr(settings, name, "") or "").strip()
+    return value or os.environ.get(env_var, "").strip() or default
+
+
+def make_primary_provider(settings: Any | None = None) -> NvidiaProvider:
+    """The primary provider: NVIDIA NIM."""
     s = settings or get_settings()
     return NvidiaProvider(
         api_key=s.nvidia_api_key,
         base_url=s.nvidia_base_url,
         default_model=s.nvidia_default_model,
         timeout_s=s.llm_timeout_seconds,
-        max_retries=s.llm_max_retries,
+        max_retries=min(int(getattr(s, "llm_max_retries", 2) or 2), 2),
+    )
+
+
+def make_fallback_provider(settings: Any | None = None) -> GeminiProvider | None:
+    """The automatic fallback: Gemini. ``None`` when no key is configured."""
+    s = settings or get_settings()
+    api_key = _setting(s, "gemini_api_key", "AGENT_GEMINI_API_KEY")
+    if not api_key:
+        return None
+    # Spec names gemini-2.5-flash-lite, but Google has retired 2.x model ids for
+    # new API keys (404 "no longer available to new users", verified live
+    # 2026-08-15). `gemini-flash-lite-latest` is Google's stable alias for the
+    # current flash-lite generation — same tier, same intent.
+    model = _setting(
+        s, "gemini_fallback_model", "AGENT_GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest"
+    )
+    return GeminiProvider(
+        api_key=api_key,
+        default_model=model,
+        timeout_s=s.llm_timeout_seconds,
+        max_retries=min(int(getattr(s, "llm_max_retries", 2) or 2), 2),
     )
 
 
 class LLMClient:
-    """Thin, async, provider-agnostic entry point to the LLM."""
+    """NVIDIA-primary, Gemini-fallback client with per-batch failover."""
 
     def __init__(
         self,
-        provider: LLMProvider | None = None,
+        primary: LLMProvider | None = None,
+        fallback: LLMProvider | None = None,
         *,
         default_model: str | None = None,
+        _no_fallback: bool = False,
     ) -> None:
-        self._provider = provider if provider is not None else make_provider()
-        self._default_model = default_model or self._provider.default_model
+        self._primary = primary if primary is not None else make_primary_provider()
+        if fallback is not None:
+            self._fallback: LLMProvider | None = fallback
+        elif _no_fallback:
+            self._fallback = None
+        else:
+            self._fallback = make_fallback_provider()
+        self._default_model = default_model or self._primary.default_model
 
     @property
     def default_model(self) -> str:
         return self._default_model
+
+    @property
+    def has_fallback(self) -> bool:
+        return self._fallback is not None
+
+    # ------------------------------------------------------------- failover
+
+    async def _call_with_failover(
+        self, prompt: str, *, model: str | None, **kwargs: Any
+    ) -> tuple[LLMResult, FallbackEvent | None]:
+        """One completion: primary first, Gemini on any primary failure.
+
+        Every entry point starts here at the PRIMARY — a batch that fell over to
+        Gemini does not stick; the next batch probes NVIDIA again automatically.
+        """
+        log = _log()
+        model_id = model or self._default_model
+        started = time.perf_counter()
+        log.info("llm.call_started", provider=self._primary.name, model=model_id)
+        try:
+            result = await self._primary.call_model(prompt, model=model_id, **kwargs)
+        except LLMError as primary_exc:
+            log.warning(
+                "llm.primary_failed",
+                provider=self._primary.name,
+                model=model_id,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                error=str(primary_exc)[:300],
+            )
+            if self._fallback is None:
+                raise
+            event = FallbackEvent(
+                from_provider=self._primary.name,
+                from_model=model_id,
+                to_provider=self._fallback.name,
+                to_model=self._fallback.default_model,
+                reason=str(primary_exc)[:300],
+            )
+            log.warning(
+                "llm.fallback",
+                from_provider=event.from_provider,
+                from_model=event.from_model,
+                to_provider=event.to_provider,
+                to_model=event.to_model,
+                reason=event.reason,
+            )
+            try:
+                # The per-call `model` override is a PRIMARY model id; the
+                # fallback always uses its own configured model.
+                result = await self._fallback.call_model(
+                    prompt, model=self._fallback.default_model, **kwargs
+                )
+            except LLMError as fallback_exc:
+                raise LLMError(
+                    "both providers failed — "
+                    f"{self._primary.name} ({model_id}): {primary_exc}; "
+                    f"{self._fallback.name} ({self._fallback.default_model}): {fallback_exc}",
+                    model=model_id,
+                    provider=self._primary.name,
+                ) from fallback_exc
+            result = dataclasses.replace(result, fallback=True)
+            log.info(
+                "llm.call_finished",
+                provider=result.provider,
+                model=result.model,
+                prompt_tokens=result.tokens_in,
+                completion_tokens=result.tokens_out,
+                latency_ms=result.latency_ms,
+                fallback=True,
+            )
+            return result, event
+        log.info(
+            "llm.call_finished",
+            provider=result.provider,
+            model=result.model,
+            prompt_tokens=result.tokens_in,
+            completion_tokens=result.tokens_out,
+            latency_ms=result.latency_ms,
+            fallback=False,
+        )
+        return result, None
 
     # ------------------------------------------------------------------ text
 
@@ -101,44 +233,20 @@ class LLMClient:
         max_tokens: int = 4096,
         disable_thinking: bool = False,
     ) -> LLMResult:
-        """One completion. Returns text plus token/cost/latency accounting."""
-        model_id = model or self._default_model
-        log = _log()
-        started = time.perf_counter()
-        log.info("llm.call_started", model=model_id, prompt_chars=len(prompt or ""))
-        try:
-            result = await self._provider.call_model(
-                prompt,
-                system=system,
-                model=model_id,
-                json_schema=json_schema,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                disable_thinking=disable_thinking,
-            )
-        except Exception as exc:
-            log.warning(
-                "llm.call_failed",
-                model=model_id,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-                error=type(exc).__name__,
-            )
-            raise
-        log.info(
-            "llm.call_finished",
-            model=result.model,
-            prompt_tokens=result.tokens_in,
-            completion_tokens=result.tokens_out,
-            latency_ms=result.latency_ms
-            or int((time.perf_counter() - started) * 1000),
+        """One completion (with failover). Returns text + token/cost accounting."""
+        result, _event = await self._call_with_failover(
+            prompt,
+            model=model,
+            system=system,
+            json_schema=json_schema,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            disable_thinking=disable_thinking,
         )
         return result
 
     def call_model_sync(self, prompt: str, **kwargs: Any) -> LLMResult:
-        """Blocking convenience wrapper for synchronous callers (e.g. sync graph nodes).
-
-        Raises if called from inside a running event loop — use ``call_model`` there.
-        """
+        """Blocking wrapper for synchronous call sites (e.g. sync graph nodes)."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -151,48 +259,51 @@ class LLMClient:
 
     async def classify_batch(
         self,
-        items: Sequence[Mapping[str, Any]],
+        views: Sequence[ClassifierView],
         *,
         instructions: str,
         item_schema: Mapping[str, Any],
-        id_field: str = "item_id",
         model: str | None = None,
         system: str | None = None,
         max_attempts: int = 2,
         max_tokens: int = 8192,
         temperature: float = 0.0,
     ) -> BatchClassification:
-        """Classify 20–50 items in **one** call, validating each result against a schema.
+        """Classify up to ~25 threads in **one** LLM call, schema-validated.
 
-        ``items`` are dicts that must each carry ``id_field``. Returns only
-        schema-conformant results; anything the model omitted or malformed is
-        reported via ``missing_ids`` / ``invalid`` so the caller can degrade it
-        safely (never silently guess).
-
-        Reasoning-model discipline (Nemotron): every call sends the JSON schema as
-        a real ``response_format`` and disables thinking; a ``finish_reason ==
-        "length"`` reply is truncated, so it is **never** parse-and-retried — a
-        multi-item batch is split in half and re-issued, and a single item gets a
-        doubled token budget instead.
+        ``views`` must be :class:`ClassifierView` instances — the only shape
+        that can reach a prompt; anything else raises ``TypeError`` (privacy by
+        type: an email body is unrepresentable). Results are keyed by
+        ``thread_id``. Anything the model omitted or malformed is reported via
+        ``missing_ids`` / ``invalid`` so the caller can degrade it to
+        needs-review — never silently guess.
         """
-        if not items:
-            return BatchClassification(id_field=id_field)
+        for index, view in enumerate(views):
+            if not isinstance(view, ClassifierView):
+                raise TypeError(
+                    f"classify_batch accepts only ClassifierView instances; item {index} "
+                    f"is {type(view).__name__}. Build a ClassifierView — email bodies "
+                    "are unrepresentable in the classifier input by design."
+                )
+        if not views:
+            return BatchClassification(id_field=_ID_FIELD)
 
-        expected_ids = [str(_require_id(item, id_field, index)) for index, item in enumerate(items)]
+        expected_ids = [view.thread_id for view in views]
         if len(set(expected_ids)) != len(expected_ids):
-            raise ValueError(f"duplicate {id_field} values in batch")
+            raise ValueError(f"duplicate {_ID_FIELD} values in batch")
 
         validator = Draft202012Validator(dict(item_schema))
         model_id = model or self._default_model
-        prompt = _build_batch_prompt(items, instructions, item_schema, id_field, expected_ids)
-        items_by_id = {str(item[id_field]): item for item in items}
+        items = [view.to_prompt_dict() for view in views]
+        prompt = _build_batch_prompt(items, instructions, item_schema, expected_ids)
+        views_by_id = {view.thread_id: view for view in views}
 
         results: dict[str, dict[str, Any]] = {}
         invalid: list[dict[str, Any]] = []
-        tokens_in = tokens_out = latency_ms = 0
+        calls: list[LLMResult] = []
+        fallback_events: list[FallbackEvent] = []
         attempts = 0
         last_error: Exception | None = None
-        actual_model = model_id
         budget = max_tokens
 
         for attempt in range(1, max_attempts + 1):
@@ -200,71 +311,51 @@ class LLMClient:
             if not missing:
                 break
             attempts = attempt
-            attempt_prompt = prompt if attempt == 1 else _retry_prompt(prompt, missing, id_field)
-            log = _log()
+            attempt_prompt = prompt if attempt == 1 else _retry_prompt(prompt, missing)
             if attempt > 1:
-                log.info(
-                    "llm.retry",
+                _log().info(
+                    "llm.batch_retry",
                     model=model_id,
                     attempt=attempt,
                     missing=len(missing),
                     error=type(last_error).__name__ if last_error else None,
-                    backoff_ms=0,
                 )
-            started = time.perf_counter()
-            log.info(
-                "llm.call_started",
-                model=model_id,
-                batch_size=len(missing),
-                attempt=attempt,
-            )
             try:
-                result = await self._provider.call_model(
+                result, event = await self._call_with_failover(
                     attempt_prompt,
-                    system=system or _BATCH_SYSTEM,
                     model=model_id,
+                    system=system or _BATCH_SYSTEM,
                     json_schema=_batch_schema(item_schema),
                     disable_thinking=True,
                     temperature=temperature,
                     max_tokens=budget,
                 )
-            except Exception as exc:
-                log.warning(
-                    "llm.call_failed",
-                    model=model_id,
-                    attempt=attempt,
-                    latency_ms=int((time.perf_counter() - started) * 1000),
-                    error=type(exc).__name__,
-                )
-                raise
-            log.info(
-                "llm.call_finished",
-                model=result.model,
-                prompt_tokens=result.tokens_in,
-                completion_tokens=result.tokens_out,
-                attempt=attempt,
-                latency_ms=result.latency_ms
-                or int((time.perf_counter() - started) * 1000),
-            )
-            tokens_in += result.tokens_in
-            tokens_out += result.tokens_out
-            latency_ms += result.latency_ms
-            actual_model = result.model
+            except LLMError as exc:
+                # Both providers failed for this attempt: surface with the spend
+                # accumulated so far so the caller can persist it.
+                raise LLMError(
+                    str(exc),
+                    usage=_aggregate_usage(calls, model_id, attempts),
+                    model=exc.model,
+                    provider=exc.provider,
+                ) from exc
+            calls.append(result)
+            if event is not None:
+                fallback_events.append(event)
 
-            if getattr(result, "finish_reason", None) == "length":
-                # The reply hit the token ceiling and is truncated (often empty for
-                # reasoning models). Re-sending the same oversized request would burn
-                # the same budget again — split the work instead.
+            if result.finish_reason == "length":
+                # The reply hit the token ceiling and is truncated (often empty
+                # for reasoning models). Re-sending the same oversized request
+                # would burn the same budget again — split the work instead.
                 if len(missing) > 1:
                     half = len(missing) // 2
                     for chunk_ids in (missing[:half], missing[half:]):
-                        chunk = [items_by_id[i] for i in chunk_ids]
+                        chunk = [views_by_id[i] for i in chunk_ids]
                         try:
                             sub = await self.classify_batch(
                                 chunk,
                                 instructions=instructions,
                                 item_schema=item_schema,
-                                id_field=id_field,
                                 model=model,
                                 system=system,
                                 max_attempts=max_attempts,
@@ -273,20 +364,13 @@ class LLMClient:
                             )
                         except LLMSchemaError as exc:
                             last_error = exc
-                            sub_usage = exc.usage
-                            if sub_usage is not None:
-                                tokens_in += sub_usage.tokens_in
-                                tokens_out += sub_usage.tokens_out
-                                latency_ms += sub_usage.latency_ms
-                                attempts += sub_usage.attempts
                             continue
                         for entry in sub.results:
-                            results[str(entry[id_field])] = entry
+                            results[str(entry[_ID_FIELD])] = entry
                         invalid.extend(sub.invalid)
+                        calls.extend(sub.calls)
+                        fallback_events.extend(sub.fallback_events)
                         if sub.usage is not None:
-                            tokens_in += sub.usage.tokens_in
-                            tokens_out += sub.usage.tokens_out
-                            latency_ms += sub.usage.latency_ms
                             attempts += sub.usage.attempts
                     break
                 # A single item that still truncates needs budget, not repetition.
@@ -305,9 +389,9 @@ class LLMClient:
                 if not isinstance(entry, dict):
                     invalid.append({"raw": entry, "error": "not an object"})
                     continue
-                entry_id = str(entry.get(id_field, ""))
+                entry_id = str(entry.get(_ID_FIELD, ""))
                 if entry_id not in set(expected_ids) or entry_id in results:
-                    invalid.append({"raw": entry, "error": f"unknown or duplicate {id_field}"})
+                    invalid.append({"raw": entry, "error": f"unknown or duplicate {_ID_FIELD}"})
                     continue
                 errors = sorted(validator.iter_errors(entry), key=str)
                 if errors:
@@ -316,18 +400,10 @@ class LLMClient:
                 results[entry_id] = entry
 
         missing_ids = [i for i in expected_ids if i not in results]
-        usage = LLMResult(
-            text="",
-            model=actual_model,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            latency_ms=latency_ms,
-            usd=estimate_cost_usd(model_id, tokens_in, tokens_out),
-            attempts=attempts,
-        )
+        usage = _aggregate_usage(calls, model_id, attempts)
         if not results and last_error is not None:
             # The accumulated usage rides on the error so the caller can persist
-            # the spend of a failed batch (purpose="classify_failed").
+            # the spend of a failed batch.
             raise LLMSchemaError(
                 f"no parsable results after {attempts} attempt(s): {last_error}",
                 usage=usage,
@@ -338,11 +414,29 @@ class LLMClient:
             missing_ids=missing_ids,
             invalid=invalid,
             usage=usage,
-            id_field=id_field,
+            calls=calls,
+            fallback_events=fallback_events,
+            id_field=_ID_FIELD,
         )
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _aggregate_usage(calls: Sequence[LLMResult], model_id: str, attempts: int) -> LLMResult:
+    tokens_in = sum(c.tokens_in for c in calls)
+    tokens_out = sum(c.tokens_out for c in calls)
+    return LLMResult(
+        text="",
+        model=calls[-1].model if calls else model_id,
+        provider=calls[-1].provider if calls else "",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        latency_ms=sum(c.latency_ms for c in calls),
+        usd=sum(c.usd for c in calls),
+        attempts=max(attempts, len(calls)),
+        fallback=any(c.fallback for c in calls),
+    )
 
 
 def _batch_schema(item_schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -355,23 +449,16 @@ def _batch_schema(item_schema: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _require_id(item: Mapping[str, Any], id_field: str, index: int) -> Any:
-    if id_field not in item or item[id_field] in (None, ""):
-        raise ValueError(f"item at index {index} is missing required {id_field!r}")
-    return item[id_field]
-
-
 def _build_batch_prompt(
-    items: Iterable[Mapping[str, Any]],
+    items: Sequence[Mapping[str, Any]],
     instructions: str,
     item_schema: Mapping[str, Any],
-    id_field: str,
     expected_ids: Sequence[str],
 ) -> str:
     return (
         f"{instructions.strip()}\n\n"
         f"Classify EVERY one of the {len(expected_ids)} items below — exactly one "
-        f"result object per item, with the same {id_field}.\n\n"
+        f"result object per item, with the same {_ID_FIELD}.\n\n"
         "Each result object MUST validate against this JSON Schema:\n"
         f"{json.dumps(dict(item_schema), indent=2)}\n\n"
         "ITEMS:\n"
@@ -382,10 +469,10 @@ def _build_batch_prompt(
     )
 
 
-def _retry_prompt(prompt: str, missing: Sequence[str], id_field: str) -> str:
+def _retry_prompt(prompt: str, missing: Sequence[str]) -> str:
     return (
         f"{prompt}\n\nYour previous reply was incomplete or invalid. Return results "
-        f"for these {id_field} values only: {json.dumps(list(missing))}. "
+        f"for these {_ID_FIELD} values only: {json.dumps(list(missing))}. "
         'Reply with {"results": [ ... ]} and nothing else.'
     )
 

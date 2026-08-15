@@ -1,6 +1,6 @@
 """Gmail label management for the taxonomy — categories map 1:1 to real labels.
 
-Every category is materialised as a label named ``ZeroInbox/<Category>``. Gmail's
+Every category is materialised as a label named ``ZI/<Category>``. Gmail's
 label sidebar is the master list of what is archived and how it is categorized
 (spec/capabilities/taxonomy-management.md) — there is no separate archive table.
 
@@ -19,17 +19,17 @@ from googleapiclient.errors import HttpError
 
 from channels.base import ChannelError, RateLimited, ReauthRequired
 
-LABEL_PREFIX = "ZeroInbox/"
+LABEL_PREFIX = "ZI/"
 MAX_ATTEMPTS = 3
 
 
 def label_name_for(category_name: str) -> str:
-    """The canonical Gmail label name for a category, e.g. ``ZeroInbox/Newsletters``."""
+    """The canonical Gmail label name for a category, e.g. ``ZI/Newsletters``."""
     return f"{LABEL_PREFIX}{category_name}"
 
 
 class GmailLabelManager:
-    """Idempotent create/lookup/rename of ``ZeroInbox/*`` Gmail labels."""
+    """Idempotent create/lookup/rename of ``ZI/*`` Gmail labels."""
 
     def __init__(
         self,

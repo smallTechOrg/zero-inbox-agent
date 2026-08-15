@@ -19,21 +19,15 @@ from observability.logging import get_logger
 
 _log = get_logger("gmail.oauth")
 
+# ONE consent flow grants both sign-in and Gmail access (spec/api.md).
+# Exactly these scopes — `gmail.modify` covers every read + reversible label
+# mutation this system performs; nothing broader is ever requested.
 GOOGLE_SCOPES: list[str] = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.settings.basic",
-    "https://www.googleapis.com/auth/gmail.compose",
 ]
-
-#: Phase 8 — the mailbox-access consent. A *copy* of `GOOGLE_SCOPES`, never a
-#: rewrite of it: `intent=connect` must keep asking for exactly what it always
-#: asked for.
-CONNECT_SCOPES: tuple[str, ...] = tuple(GOOGLE_SCOPES)
-
-#: Phase 8 — the sign-in consent. Name and email only. No `gmail.*` scope, so
-#: completing it grants no mailbox access of any kind.
-SIGNIN_SCOPES: tuple[str, ...] = ("openid", "email", "profile")
 
 AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -78,6 +72,7 @@ class OAuthResult:
     scopes: list[str]
     account_email: str
     display_name: str = ""
+    picture_url: str = ""
 
 
 def _setting(name: str, env: str, default: str = "") -> str:
@@ -96,10 +91,10 @@ def _setting(name: str, env: str, default: str = "") -> str:
 
 
 def google_oauth_config(scopes: Sequence[str] | None = None) -> GoogleOAuthConfig:
-    """Build the OAuth config. ``scopes`` defaults to the Gmail connect set.
+    """Build the OAuth config from ``AGENT_GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI``.
 
-    Phase 8 passes ``SIGNIN_SCOPES`` for ``intent=signin``; every existing caller
-    passes nothing and gets exactly the behaviour it had before.
+    ``scopes`` defaults to :data:`GOOGLE_SCOPES` — the single sign-in + gmail.modify
+    consent. There is no separate sign-in-only flow.
     """
     client_id = _setting("google_client_id", "AGENT_GOOGLE_CLIENT_ID")
     client_secret = _setting("google_client_secret", "AGENT_GOOGLE_CLIENT_SECRET")
@@ -138,10 +133,6 @@ def build_authorization_url(
     The Flow generates a PKCE verifier and sends only its challenge to Google.
     The callback builds a *different* Flow object, so the verifier has to travel
     with the request or Google rejects the exchange with "Missing code verifier".
-
-    ``scopes`` overrides the config's set — Phase 8 uses it to ask for
-    :data:`SIGNIN_SCOPES` on ``intent=signin``. Omitting it is the pre-Phase-8
-    behaviour exactly.
     """
     if scopes is not None:
         config = replace(config, scopes=list(scopes))
@@ -177,17 +168,19 @@ def exchange_code(
     credentials = flow.credentials
     granted = list(credentials.scopes or config.scopes)
 
-    if _has_gmail_scope(granted):
-        profile = _fetch_profile(credentials)
-        email = profile.get("emailAddress", "")
-        display_name = email.split("@")[0]
-    else:
-        # Phase 8 sign-in: no Gmail scope was granted, so the Gmail profile
-        # endpoint would 403. `openid email profile` gives us userinfo instead —
-        # and a real display name rather than the local part of the address.
+    # The mailbox address is the identity anchor: it is what the Gmail client
+    # will operate on, so it must come from the Gmail profile, not userinfo.
+    profile = _fetch_profile(credentials) if _has_gmail_scope(granted) else {}
+    email = profile.get("emailAddress", "")
+
+    # `openid email profile` was granted in the same consent — userinfo gives a
+    # real display name and picture (best-effort: sign-in must not fail on it).
+    try:
         info = _fetch_userinfo(credentials)
-        email = info.get("email", "")
-        display_name = info.get("name") or email.split("@")[0]
+    except OAuthExchangeError:
+        info = {}
+    email = email or info.get("email", "")
+    display_name = info.get("name") or email.split("@")[0]
 
     return OAuthResult(
         refresh_token=credentials.refresh_token or "",
@@ -195,6 +188,7 @@ def exchange_code(
         scopes=granted,
         account_email=email,
         display_name=display_name,
+        picture_url=info.get("picture", "") or "",
     )
 
 
@@ -262,6 +256,27 @@ def credentials_from_refresh_token(
         client_secret=config.client_secret,
         scopes=list(config.scopes),
     )
+
+
+def get_credentials(user_id: str) -> Credentials:
+    """Load the user's stored refresh token and mint auto-refreshing credentials.
+
+    THE credentials-loading seam for the read layer
+    (``channels.gmail.client.list_inbox_threads``): a revoked/absent token
+    surfaces here — tests simulate invalid_grant by patching this function
+    (tests/fixtures/fake_gmail.py ``force_refresh_failure``).
+    """
+    from channels.gmail.store import SqlConnectionStore
+
+    try:
+        refresh_token = SqlConnectionStore().load_refresh_token(user_id=user_id)
+    except ReauthRequired:
+        raise
+    except Exception as exc:  # noqa: BLE001 — undecryptable token == reconnect
+        raise ReauthRequired(
+            "the stored Gmail token could not be read — reconnect Gmail"
+        ) from exc
+    return credentials_from_refresh_token(google_oauth_config(), refresh_token)
 
 
 def refresh_access_token(credentials: Credentials) -> Credentials:

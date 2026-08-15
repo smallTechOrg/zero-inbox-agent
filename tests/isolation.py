@@ -45,6 +45,8 @@ __all__ = [
     "assert_test_mailbox",
     "assert_row_not_real",
     "assert_not_real_gmail_request",
+    "assert_not_real_gmail_write",
+    "GMAIL_URI_FRAGMENTS",
     "current_test_name",
 ]
 
@@ -81,16 +83,27 @@ DENIED_USER_ID_PREFIXES = ("6b4ab0f4",)
 DENIED_EMAILS = ("psykrsna@gmail.com",)
 
 #: Real database files that must never be bound inside a test process.
-DENIED_DB_FILENAMES = ("zero_inbox.db",)
+#: ``agent.db`` is the redesigned schema's production file (spec/architecture.md:
+#: ``sqlite:///./data/agent.db``); ``zero_inbox.db`` is the old design's — both
+#: stay denied so a stale checkout can't leak either.
+DENIED_DB_FILENAMES = ("zero_inbox.db", "agent.db")
 
-#: The user-scoped tables the commit guard watches. These are the four whose
-#: rows are visible in the product surface and survive a run — a leaked row here
-#: is a leaked row the user sees.
-GUARDED_TABLES = ("categories", "decisions", "rules", "channel_accounts")
+#: The user-scoped tables the commit guard watches (spec/data.md). These are the
+#: tables whose rows are visible in the product surface (taxonomy chips, run
+#: cards, ledger, Gmail connection) — a leaked row here is a leaked row the user
+#: sees, and a leaked ``mutations`` row means a test described a Gmail write
+#: against a real mailbox.
+GUARDED_TABLES = (
+    "categories",
+    "gmail_accounts",
+    "runs",
+    "thread_decisions",
+    "mutations",
+)
 
 
 #: The columns on a guarded row that can carry a mailbox address.
-EMAIL_COLUMNS = ("account_email", "email", "from_email", "sender_email")
+EMAIL_COLUMNS = ("google_email", "account_email", "email", "from_email", "sender", "sender_email")
 
 #: A real account id in this system is a uuid4 (``db.models._uuid``). A test id
 #: that has that shape is a copied production id — refused even if it is not on
@@ -334,6 +347,32 @@ def assert_row_not_real(instance, *, table: str) -> None:
                 f"{column}={value!r} — that is the USER'S REAL MAILBOX "
                 "(deny-list; dots and +tags are normalised)."
             )
+
+
+#: Gmail API host fragments — a request whose URI names either is a Gmail call.
+GMAIL_URI_FRAGMENTS = ("gmail.googleapis.com", "/gmail/v1/")
+
+
+def assert_not_real_gmail_write(method: object, uri: object) -> None:
+    """Refuse any non-GET request to the Gmail API from inside a test.
+
+    The redesign's discipline (spec/architecture.md § Test-Isolation Guard):
+    Gmail READS stay real, Gmail WRITES never leave the process. Every Gmail
+    mutation (``threads.modify``, ``labels.create`` …) is a POST/PATCH/DELETE,
+    and every read the audit or triage path needs is a GET — so blocking
+    non-GET Gmail traffic sandbox-proofs the live mailbox without faking reads.
+    OAuth token refresh (``oauth2.googleapis.com``) is untouched.
+    """
+    uri_s = uri if isinstance(uri, str) else ""
+    method_s = (method if isinstance(method, str) else "GET").upper()
+    if method_s != "GET" and any(f in uri_s for f in GMAIL_URI_FRAGMENTS):
+        raise RealGmailError(
+            f"{current_test_name()}: refusing a live Gmail WRITE from a test "
+            f"({method_s} {uri_s}). Under tests the mutation choke point must "
+            "record the audit row and return applied WITHOUT calling Gmail "
+            "(AGENT_TEST_ISOLATION=1) — a real mutation on the live mailbox "
+            "cannot be undone by a test teardown."
+        )
 
 
 def assert_not_real_gmail_request(request) -> None:

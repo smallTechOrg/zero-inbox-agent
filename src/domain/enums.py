@@ -1,98 +1,72 @@
-"""Closed vocabularies shared by the domain models and the persistence layer."""
+"""String enums shared by the DB layer, the graph, and the API.
 
-from __future__ import annotations
+Values are stored as plain strings in SQLite/Postgres columns (never DB-native
+enums — Postgres-compatible and migration-friendly per spec/data.md).
+"""
 
 from enum import StrEnum
 
 
-class Channel(StrEnum):
-    GMAIL = "gmail"
-
-
-class ConnectionStatus(StrEnum):
+class GmailAccountStatus(StrEnum):
     CONNECTED = "connected"
-    REAUTH_REQUIRED = "reauth_required"
-    REVOKED = "revoked"
+    NEEDS_RECONNECT = "needs_reconnect"
 
 
-class ProposedAction(StrEnum):
-    """The complete set of actions. There is deliberately no delete/trash/spam."""
-
-    KEEP = "keep"
-    ARCHIVE = "archive"
-    DIGEST = "digest"
-
-
-class DecidedBy(StrEnum):
-    """Which tier of the cost-tiered cascade produced the decision."""
-
-    RULE = "rule"
-    SENDER_HISTORY = "sender_history"
-    LLM = "llm"
-    LLM_DEEP = "llm_deep"
-    REVIEWER = "reviewer"
-    ERROR = "error"
-
-
-class DecisionStatus(StrEnum):
-    PROPOSED = "proposed"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    APPLIED = "applied"
-    UNDONE = "undone"
-    NEEDS_YOUR_CALL = "needs_your_call"
-
-
-class ClusterKind(StrEnum):
-    LIST = "list"
-    SENDER = "sender"
-    DOMAIN = "domain"
-    CATEGORY = "category"
-
-
-class RunKind(StrEnum):
-    INCREMENTAL = "incremental"
-    BACKLOG = "backlog"
+class CategoryRule(StrEnum):
+    LABEL_ONLY = "label_only"
+    LABEL_AND_ARCHIVE = "label_and_archive"
 
 
 class RunStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+    UNDONE = "undone"
 
 
-class RuleKind(StrEnum):
-    DETERMINISTIC = "deterministic"
-    LEARNED = "learned"
-    LLM_PROPOSED = "llm_proposed"
+class RunTrigger(StrEnum):
+    CLEAN_CHUNK = "clean_chunk"
 
 
-class RuleSource(StrEnum):
-    SEED_PACK = "seed_pack"
-    MINED = "mined"
-    CHAT = "chat"
-    USER = "user"
+class MutationAction(StrEnum):
+    ADD_LABEL = "add_label"
+    REMOVE_LABEL = "remove_label"
+    REMOVE_INBOX = "remove_inbox"
+    RESTORE_INBOX = "restore_inbox"
 
 
-class RuleStatus(StrEnum):
-    PROPOSED = "proposed"
-    ACTIVE = "active"
-    #: The only state in which the agent acts without per-decision approval.
-    AUTOMATIC = "automatic"
-    DISABLED = "disabled"
+#: Undo inverse pairs (spec/data.md): add_label↔remove_label, remove_inbox↔restore_inbox.
+MUTATION_INVERSE: dict[MutationAction, MutationAction] = {
+    MutationAction.ADD_LABEL: MutationAction.REMOVE_LABEL,
+    MutationAction.REMOVE_LABEL: MutationAction.ADD_LABEL,
+    MutationAction.REMOVE_INBOX: MutationAction.RESTORE_INBOX,
+    MutationAction.RESTORE_INBOX: MutationAction.REMOVE_INBOX,
+}
 
 
-__all__ = [
-    "Channel",
-    "ClusterKind",
-    "ConnectionStatus",
-    "DecidedBy",
-    "DecisionStatus",
-    "ProposedAction",
-    "RuleKind",
-    "RuleSource",
-    "RuleStatus",
-    "RunKind",
-    "RunStatus",
-]
+class RunEventType(StrEnum):
+    CHUNK_LOADED = "chunk_loaded"
+    DECISION = "decision"
+    ACTION = "action"
+    FALLBACK = "fallback"
+    COST_TICK = "cost_tick"
+    RUN_INTERRUPTED = "run_interrupted"
+    RUN_FINISHED = "run_finished"
+    UNDO_STARTED = "undo_started"
+    UNDO_ACTION = "undo_action"
+    UNDO_FINISHED = "undo_finished"
+
+
+class DecisionSource(StrEnum):
+    LLM = "llm"
+    PROFILE = "profile"
+
+
+class LlmProvider(StrEnum):
+    NVIDIA = "nvidia"
+    GEMINI = "gemini"
+
+
+class ProfileOrigin(StrEnum):
+    AUTO = "auto"
+    MANUAL = "manual"

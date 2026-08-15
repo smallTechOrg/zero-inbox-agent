@@ -1,578 +1,244 @@
-"""SQLAlchemy 2.0 declarative schema for Zero Inbox Agent.
+"""SQLAlchemy 2.0 models — the full Zero Inbox schema (spec/data.md).
 
-Multi-tenant by construction: every user-scoped table carries ``user_id`` and is
-indexed on it, so every query can be isolated per user.
-
-HARD INVARIANT — **no email body text is ever persisted**. The only
-content-bearing column in the whole schema is ``items.snippet_redacted``
-(<= 200 chars, already passed through ``src/tools/redact.py``), plus
-model-generated ``decisions.reasoning``. Enforced by
-``tests/unit/db/test_no_body_columns.py``.
+Multi-user isolation is structural: **every table except `users` carries an
+indexed `user_id` FK**, and every query filters by it. No email body is stored
+anywhere — the largest text fragment is the ~90-char Gmail snippet. Only
+Postgres-compatible types are used (String/Text/Integer/Float/Boolean/DateTime/
+JSON) so the documented SQLite→Postgres migration is mechanical.
 """
 
-from __future__ import annotations
-
+import uuid
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
+    DateTime,
     Float,
     ForeignKey,
-    Index,
     Integer,
-    JSON,
+    String,
     Text,
-    TIMESTAMP,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# --- Redaction / privacy constants -------------------------------------------------
-
-SNIPPET_MAX_CHARS = 200
-"""Maximum length of the single content-bearing column in the schema."""
-
-#: Substrings that may never appear in a column name. A column whose name
-#: matches one of these would imply body text is being persisted.
-FORBIDDEN_COLUMN_SUBSTRINGS: tuple[str, ...] = (
-    "body",
-    "body_text",
-    "body_html",
-    "html",
-    "plain_text",
-    "raw_message",
-    "raw_email",
-    "full_text",
-    "message_body",
-    "payload",
-)
-
 
 def _uuid() -> str:
-    return str(uuid4())
+    return str(uuid.uuid4())
 
 
-def _now() -> datetime:
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _ts(**kw):
-    return mapped_column(TIMESTAMP(timezone=True), **kw)
 
 
 class Base(DeclarativeBase):
     pass
 
 
-# --- Identity -----------------------------------------------------------------------
-
-
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
-    display_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    picture_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
-class UserSettings(Base):
-    __tablename__ = "user_settings"
+class GmailAccount(Base):
+    """1—1 with users. Disconnect deletes the row; a failed refresh flips
+    status to `needs_reconnect`; reconnect overwrites the token."""
 
+    __tablename__ = "gmail_accounts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        String(36), ForeignKey("users.id"), unique=True, nullable=False, index=True
     )
-    #: Phase 7: the **global** confidence bar at or above which the agent acts on
-    #: its own — finally read by a real code path (``graph.autonomy``). The
-    #: default dropped from 0.95 to 0.80 because 0.95 sits above the model's
-    #: entire measured output range (~0.94 ceiling); see spec/data.md.
-    auto_act_threshold: Mapped[float] = mapped_column(
-        Float, nullable=False, default=0.80, server_default="0.8"
-    )
-    confidence_floor: Mapped[float] = mapped_column(Float, nullable=False, default=0.75)
-    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    llm_model: Mapped[str] = mapped_column(Text, nullable=False, default="nvidia/nemotron-3-nano-30b-a3b")
-    digest_hour_local: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
-    timezone: Mapped[str] = mapped_column(Text, nullable=False, default="UTC")
-    updated_at: Mapped[datetime] = _ts(nullable=False, default=_now, onupdate=_now)
-
-
-class ChannelAccount(Base):
-    """A connected mailbox. Channel-agnostic; ``gmail`` is the only v1 value."""
-
-    __tablename__ = "channel_accounts"
-    __table_args__ = (
-        UniqueConstraint("user_id", "channel", "account_email", name="uq_channel_account"),
-        # Phase 8: mailbox ownership is GLOBAL. Two distinct Zero Inbox users can
-        # never point at one inbox — that would mean two agents mutating the same
-        # mailbox under two independent policies. See spec/data.md#phase-8-migration.
-        Index("uq_channel_account_global", "channel", "account_email", unique=True),
-    )
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    channel: Mapped[str] = mapped_column(Text, nullable=False, default="gmail")
-    account_email: Mapped[str] = mapped_column(Text, nullable=False)
-    # Fernet ciphertext. Never logged, never returned by any API route.
-    refresh_token_enc: Mapped[str] = mapped_column(Text, nullable=False)
-    scopes: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="connected")
-    history_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    connected_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    #: Phase 8: surfaced on screen 22. NULL renders as "not synced yet" — never
-    #: as a fabricated date, so there is no backfill.
-    last_synced_at: Mapped[datetime | None] = _ts(nullable=True)
-
-
-class UserSession(Base):
-    """A session you can see is a session you can revoke.
-
-    Carried in the session cookie as ``sid``. **No raw IP and no raw user-agent
-    string is ever stored here** — only a derived summary ("Chrome on macOS") and
-    an HMAC of the IP, and neither the hash nor anything derived from the raw
-    values is returned by any route.
-    """
-
-    __tablename__ = "user_sessions"
-    __table_args__ = (Index("ix_user_sessions_user_active", "user_id", "revoked_at"),)
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    last_seen_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    #: Non-null ⇒ every request bearing this ``sid`` is 401.
-    revoked_at: Mapped[datetime | None] = _ts(nullable=True)
-    #: Derived, e.g. "Chrome on macOS". The raw UA string is never stored.
-    user_agent_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    #: HMAC-SHA256 of the client IP keyed by AGENT_SECRET_KEY. The raw IP is
-    #: never stored, never logged and never returned.
-    ip_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
-# --- Channel-agnostic content -------------------------------------------------------
-
-
-class Item(Base):
-    """A channel-agnostic thread. Headers + ids + a redacted snippet only."""
-
-    __tablename__ = "items"
-    __table_args__ = (
-        UniqueConstraint("user_id", "external_thread_id", name="uq_item_user_thread"),
-    )
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    channel_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("channel_accounts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    external_thread_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    external_message_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    from_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    from_email: Mapped[str] = mapped_column(Text, nullable=False, default="", index=True)
-    from_domain: Mapped[str] = mapped_column(Text, nullable=False, default="", index=True)
-    to_emails: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    cc_emails: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    list_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
-    unsubscribe_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    #: The ONLY content-bearing column in the schema: <= 200 chars, redacted.
-    snippet_redacted: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    internal_date: Mapped[datetime | None] = _ts(nullable=True)
-    is_unread: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    channel_labels: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-
-
-class SenderProfile(Base):
-    """Per-user, per-sender evidence — carries the never-miss reply-history signal."""
-
-    __tablename__ = "sender_profiles"
-    __table_args__ = (
-        UniqueConstraint("user_id", "sender_email", name="uq_sender_profile"),
-    )
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    sender_email: Mapped[str] = mapped_column(Text, nullable=False)
-    sender_domain: Mapped[str] = mapped_column(Text, nullable=False, default="", index=True)
-    received_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    opened_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    replied_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    archived_by_user_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    ever_replied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    last_replied_at: Mapped[datetime | None] = _ts(nullable=True)
-    last_seen_at: Mapped[datetime | None] = _ts(nullable=True)
-    importance_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-
-
-# --- Taxonomy & rules ---------------------------------------------------------------
+    google_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    refresh_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="connected")
+    connected_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
 class Category(Base):
-    """Materialises 1:1 as a real channel label (Gmail label in v1)."""
-
     __tablename__ = "categories"
-    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_category_user_key"),)
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_categories_user_name"),)
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
-    key: Mapped[str] = mapped_column(Text, nullable=False)
-    name: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    channel_label_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    channel_label_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    default_action: Mapped[str] = mapped_column(Text, nullable=False, default="keep")
-    #: Phase 7: per-category autonomy bar. NULL inherits
-    #: ``user_settings.auto_act_threshold``, which is what keeps the global
-    #: slider load-bearing. Inert while ``default_action = keep``.
-    auto_act_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
-    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rule: Mapped[str] = mapped_column(String(32), nullable=False, default="label_only")
+    gmail_label_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # The reserved "Needs review" category — not deletable (409 at the API).
+    is_needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
-class Rule(Base):
-    __tablename__ = "rules"
+class Run(Base):
+    __tablename__ = "runs"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
-    name: Mapped[str] = mapped_column(Text, nullable=False)
-    kind: Mapped[str] = mapped_column(Text, nullable=False, default="deterministic")
-    source: Mapped[str] = mapped_column(Text, nullable=False, default="seed_pack")
-    matcher: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    action: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="proposed", index=True)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    channel_filter_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    promoted_at: Mapped[datetime | None] = _ts(nullable=True)
-
-
-# --- Runs, clusters, decisions ------------------------------------------------------
-
-
-class TriageRun(Base):
-    __tablename__ = "triage_runs"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    channel_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("channel_accounts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    kind: Mapped[str] = mapped_column(Text, nullable=False, default="incremental")
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="running", index=True)
-    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    range_start: Mapped[datetime | None] = _ts(nullable=True)
-    range_end: Mapped[datetime | None] = _ts(nullable=True)
-    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
-    items_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    items_decided: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    counts: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, default="clean_chunk")
+    chunk_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    threads_decided: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    counts_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    llm_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    finished_at: Mapped[datetime | None] = _ts(nullable=True)
+    est_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    fallback_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    interrupt_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class Cluster(Base):
-    __tablename__ = "clusters"
+class ThreadDecision(Base):
+    """The per-thread decision index — never-redo + ledger core.
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    run_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("triage_runs.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    kind: Mapped[str] = mapped_column(Text, nullable=False, default="sender")
-    label: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    suggested_action: Mapped[str] = mapped_column(Text, nullable=False, default="keep")
-    min_confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    avg_confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    `gmail_thread_id` is unique **per user**: re-triaging an undone thread
+    UPDATES this row (repointing run_id, clearing `undone`) rather than
+    inserting a second one.
+    """
 
-
-class Decision(Base):
-    """The audit record: category + confidence + reasoning + which tier fired."""
-
-    __tablename__ = "decisions"
+    __tablename__ = "thread_decisions"
     __table_args__ = (
-        UniqueConstraint("run_id", "item_id", name="uq_decision_run_item"),
-        Index("ix_decisions_run_review", "run_id", "review_state"),
-        Index("ix_decisions_run_autonomy", "run_id", "autonomy_state"),
+        UniqueConstraint("user_id", "gmail_thread_id", name="uq_thread_decisions_user_thread"),
     )
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    item_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("items.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
     run_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("triage_runs.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("runs.id"), nullable=False, index=True
     )
-    cluster_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("clusters.id", ondelete="SET NULL"), nullable=True, index=True
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    sender: Mapped[str] = mapped_column(String(500), nullable=False)
+    subject: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    snippet: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    category_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("categories.id"), nullable=False, index=True
     )
-    category_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
-    )
-    proposed_action: Mapped[str] = mapped_column(Text, nullable=False, default="keep")
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    #: Human-readable justification produced by the deciding tier. Never body text.
-    reasoning: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    #: which-tier-fired: rule | sender_history | llm | llm_deep | reviewer | error
-    decided_by: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    rule_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("rules.id", ondelete="SET NULL"), nullable=True
-    )
-    time_sensitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="proposed", index=True)
-    #: The never-miss finality gate: provisional | reviewed | review_failed.
-    #: A row is durable the instant its tier decides it (``provisional``) and only
-    #: becomes appliable once the second-pass reviewer has upgraded it to
-    #: ``reviewed``. Orthogonal to ``status`` — see spec/data.md.
-    review_state: Mapped[str] = mapped_column(
-        Text, nullable=False, default="provisional", server_default="provisional"
-    )
-    #: Phase 7: the **autonomy** lifecycle — why this thread is or is not leaving
-    #: the inbox. One of graph.autonomy.AUTONOMY_STATES. Orthogonal to both
-    #: ``status`` and ``review_state``. NULL only on rows written before Phase 7,
-    #: reported by the remainder ledger as ``unclassified`` — never backfilled,
-    #: because inventing a state for a decision made under a policy that did not
-    #: exist would fabricate history.
-    autonomy_state: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    decided_at: Mapped[datetime | None] = _ts(nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="llm")
+    undone: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
-class LLMCall(Base):
+class Mutation(Base):
+    """The audit trail. Written BEFORE the Gmail call it describes.
+
+    Undo = for each non-undone row of the run, newest first, apply the inverse
+    (see domain.enums.MUTATION_INVERSE) and stamp `undone_at`.
+    """
+
+    __tablename__ = "mutations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id"), nullable=False, index=True
+    )
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    label_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RunEvent(Base):
+    """Persisted feed events — enable SSE replay on reconnect (`?after_seq`)."""
+
+    __tablename__ = "run_events"
+    __table_args__ = (UniqueConstraint("run_id", "seq", name="uq_run_events_run_seq"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id"), nullable=False, index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    sentence: Mapped[str] = mapped_column(Text, nullable=False)
+    detail_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+class LlmCall(Base):
+    """Cost ledger — one row per provider call; cumulative totals are aggregates."""
+
     __tablename__ = "llm_calls"
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
-    run_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("triage_runs.id", ondelete="CASCADE"), nullable=True, index=True
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id"), nullable=False, index=True
     )
-    purpose: Mapped[str] = mapped_column(Text, nullable=False)
-    model: Mapped[str] = mapped_column(Text, nullable=False)
-    items_in_batch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    model: Mapped[str] = mapped_column(String(120), nullable=False)
     tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    est_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    was_fallback: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
-# --- Audit trail --------------------------------------------------------------------
+class SenderProfile(Base):
+    """Phase 2 — repeat-sender LLM bypass. Schema lands day one so the never-redo
+    index and Phase-2 code share one migration-free database."""
 
-
-class ActionLog(Base):
-    """Every mailbox mutation, with the inverse operation needed to undo it.
-
-    ``operation`` never takes a destructive value — delete/trash/spam are not
-    valid operations anywhere in this system.
-    """
-
-    __tablename__ = "action_logs"
-    __table_args__ = (Index("ix_action_logs_reorg_job", "reorg_job_id"),)
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    decision_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("decisions.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    operation: Mapped[str] = mapped_column(Text, nullable=False)
-    request_params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    undo_token: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    undone_at: Mapped[datetime | None] = _ts(nullable=True)
-    #: Phase 9: the re-organisation this mutation belonged to, or NULL for an
-    #: ordinary triage apply. Indexed so bulk undo of a whole re-organisation is
-    #: ONE query over ONE index rather than a join through ``decisions`` — the
-    #: difference between an undo button that works over 10,000 threads and one
-    #: that times out. See spec/data.md § Phase 9 entities.
-    reorg_job_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("reorg_jobs.id", ondelete="SET NULL"), nullable=True
-    )
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-
-
-ALLOWED_ACTION_OPERATIONS: frozenset[str] = frozenset(
-    {"archive", "add_label", "remove_label", "create_filter", "create_draft"}
-)
-"""Whitelist of mailbox mutations. Nothing destructive is representable."""
-
-
-# --- Phase 9: re-organisation ---------------------------------------------------------
-
-
-#: The closed set of reasons a decision was NOT re-organised. Every row the job
-#: did not mutate is counted under exactly one of these, and
-#: ``done + sum(skipped.values()) == total`` is an invariant asserted in tests.
-#: A reason outside this set means the job dropped a thread silently, which is
-#: the one thing "re-organise everything" may never do.
-REORG_SKIP_REASONS: tuple[str, ...] = (
-    "not_reviewed",
-    "no_category_fit",
-    "gmail_error",
-    "already_correct",
-    "dry_run",
-    "cancelled",
-)
-
-#: ``partial`` is used whenever ANYTHING was skipped — ``completed`` never hides
-#: a skip (spec/api.md § Phase 9).
-REORG_STATUSES: tuple[str, ...] = (
-    "running",
-    "completed",
-    "partial",
-    "cancelled",
-    "failed",
-)
-
-
-class ReorgJob(Base):
-    """One re-organisation of the whole mailbox under a changed taxonomy.
-
-    Scope is **every decision row for the user** — ~10,336 on the live account,
-    including threads that are already archived, which are relabelled in place
-    and never returned to the inbox. Never capped, never sampled: ``total`` is
-    the true count and every row lands in ``done`` or in exactly one ``skipped``
-    bucket.
-    """
-
-    __tablename__ = "reorg_jobs"
-    __table_args__ = (Index("ix_reorg_jobs_user_status", "user_id", "status"),)
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="running", index=True)
-    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    #: ``{reason: count}`` over REORG_SKIP_REASONS. Reasons with a zero count are
-    #: omitted rather than rendered as noise.
-    skipped: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    #: Resume point — the id of the last decision this job finished with. A killed
-    #: job restarts strictly after it and re-does nothing.
-    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
-    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    #: The triage run the re-classification pass writes into, so re-classification
-    #: is resumable by the existing Phase 6 machinery rather than a private cursor.
-    run_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-    finished_at: Mapped[datetime | None] = _ts(nullable=True)
-    #: Non-null whenever status is ``partial`` or ``failed``, in human-readable words.
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
-class Correction(Base):
-    """A user correction — the training signal for sender importance and rules."""
-
-    __tablename__ = "corrections"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    item_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("items.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    decision_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("decisions.id", ondelete="SET NULL"), nullable=True
-    )
-    from_action: Mapped[str] = mapped_column(Text, nullable=False)
-    to_action: Mapped[str] = mapped_column(Text, nullable=False)
-    source: Mapped[str] = mapped_column(Text, nullable=False, default="dashboard")
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
-
-
-class VipEntry(Base):
-    """The never-hide list. A match here can never be archived automatically."""
-
-    __tablename__ = "vip_entries"
+    __tablename__ = "sender_profiles"
     __table_args__ = (
-        UniqueConstraint("user_id", "kind", "value", name="uq_vip_entry"),
+        UniqueConstraint("user_id", "sender_address", name="uq_sender_profiles_user_sender"),
     )
 
-    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
-    kind: Mapped[str] = mapped_column(Text, nullable=False)  # email | domain | keyword
-    value: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = _ts(nullable=False, default=_now)
+    sender_address: Mapped[str] = mapped_column(String(320), nullable=False)
+    category_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("categories.id"), nullable=False, index=True
+    )
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_from: Mapped[str] = mapped_column(String(16), nullable=False, default="manual")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
-class PriorityProfile(Base):
-    """The plain-English priorities profile, written once by the user and injected
-    verbatim into the classifier and reviewer prompts. Never rewritten by the agent."""
+class InboxSnapshot(Base):
+    """The mini-audit result (read-only inbox stats)."""
 
-    __tablename__ = "priority_profiles"
+    __tablename__ = "inbox_snapshots"
 
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True
     )
-    text: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    updated_at: Mapped[datetime] = _ts(nullable=False, default=_now, onupdate=_now)
-
-
-#: Tables that are NOT scoped to a single user. Empty in Phase 1 — shared
-#: rule-pack templates (Phase 3) will be the only entry.
-NON_USER_SCOPED_TABLES: frozenset[str] = frozenset()
-
-
-__all__ = [
-    "Base",
-    "User",
-    "UserSettings",
-    "UserSession",
-    "ChannelAccount",
-    "Item",
-    "SenderProfile",
-    "Category",
-    "Rule",
-    "TriageRun",
-    "Cluster",
-    "Decision",
-    "LLMCall",
-    "ActionLog",
-    "ReorgJob",
-    "REORG_SKIP_REASONS",
-    "REORG_STATUSES",
-    "Correction",
-    "VipEntry",
-    "PriorityProfile",
-    "ALLOWED_ACTION_OPERATIONS",
-    "FORBIDDEN_COLUMN_SUBSTRINGS",
-    "NON_USER_SCOPED_TABLES",
-    "SNIPPET_MAX_CHARS",
-]
+    total_inbox_threads: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unread: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    oldest_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    top_senders_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    category_tab_counts_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)

@@ -26,10 +26,19 @@ class Settings(BaseSettings):
     # Never hardcoded at a call site — every call may override this per user.
     nvidia_default_model: str = Field(default="nvidia/nemotron-3-nano-30b-a3b")
 
+    # --- LLM fallback: Gemini -------------------------------------------
+    gemini_api_key: str = Field(default="")
+    gemini_fallback_model: str = Field(default="gemini-2.5-flash-lite")
+
     # --- LLM call behaviour ---------------------------------------------
-    llm_timeout_seconds: float = Field(default=90.0)
+    # Hard per-call timeout — a stalled provider is impossible by construction
+    # (spec/architecture.md; AGENT_LLM_TIMEOUT_SECONDS, default 30s).
+    llm_timeout_seconds: float = Field(default=30.0)
     llm_max_retries: int = Field(default=3)
     llm_batch_size: int = Field(default=25, ge=1, le=50)
+
+    # --- Triage run ------------------------------------------------------
+    chunk_limit: int = Field(default=50, ge=1, le=200)
 
     # --- Google OAuth ----------------------------------------------------
     google_client_id: str = Field(default="")
@@ -49,6 +58,16 @@ class Settings(BaseSettings):
     def has_nvidia_key(self) -> bool:
         """Presence-only check — never log or expose the key itself."""
         return bool(self.nvidia_api_key.strip())
+
+    @property
+    def has_gemini_key(self) -> bool:
+        """Presence-only check — never log or expose the key itself."""
+        return bool(self.gemini_api_key.strip())
+
+    @property
+    def has_google_oauth(self) -> bool:
+        """Presence-only check for the OAuth client pair."""
+        return bool(self.google_client_id.strip()) and bool(self.google_client_secret.strip())
 
 
 class RuntimeSettings(BaseSettings):

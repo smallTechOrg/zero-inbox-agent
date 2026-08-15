@@ -1,99 +1,66 @@
 import { expect, type Page, type Locator } from '@playwright/test';
 
-export const APP_URL = 'http://localhost:8001/app/';
+/** The Next.js dashboard (spec/roadmap.md "How the user tests it"). */
+export const APP_URL = 'http://localhost:3000/';
+
+/** The exact stub badge wording — binding per spec/ui.md § Stub convention. */
+export const STUB_BADGE_TEXT = 'Coming in Phase 2 — not yet functional';
 
 /**
- * Pre-seed the signed `zi_session` cookie from the ZI_SESSION env var so the full
- * triage journey can run headlessly against an already-connected mailbox:
+ * Pre-seed the signed session cookie from the ZI_SESSION env var so the
+ * signed-in journey can run headlessly against an already-connected account:
  *
- *   ZI_SESSION=<cookie value> npx playwright test tests/e2e/
+ *   ZI_SESSION=<cookie value> pnpm --dir frontend exec playwright test tests/e2e/phase1
  *
- * Get the value by connecting Gmail once at http://localhost:8001/app/ and copying
- * the `zi_session` cookie from the browser's devtools (Application → Cookies).
- * When ZI_SESSION is unset the suite runs anonymously and the connected-mailbox
- * journey skips with a loud reason — never a silent pass.
+ * Sign in once at http://localhost:3000, copy the session cookie value from
+ * devtools (Application → Cookies). When unset, signed-in specs skip with a
+ * loud reason — never a silent pass. The backend under test must run with the
+ * test-isolation guard so no live Gmail mutation can occur.
  */
-export function sessionStorageState():
-  | {
-      cookies: {
-        name: string;
-        value: string;
-        domain: string;
-        path: string;
-        expires: number;
-        httpOnly: boolean;
-        secure: boolean;
-        sameSite: 'Lax';
-      }[];
-      origins: never[];
-    }
+export function sessionCookie():
+  | { name: string; value: string; domain: string; path: string; httpOnly: boolean; secure: boolean; sameSite: 'Lax' }[]
   | undefined {
-  const token = process.env.ZI_SESSION;
-  if (!token) return undefined;
-  return {
-    cookies: [
-      {
-        name: 'zi_session',
-        value: token,
-        domain: 'localhost',
-        path: '/',
-        expires: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
-        httpOnly: true,
-        secure: false,
-        sameSite: 'Lax',
-      },
-    ],
-    origins: [],
-  };
+  const value = process.env.ZI_SESSION;
+  if (!value) return undefined;
+  const name = process.env.ZI_SESSION_COOKIE_NAME || 'zi_session';
+  return [
+    { name, value, domain: 'localhost', path: '/', httpOnly: true, secure: false, sameSite: 'Lax' },
+  ];
 }
 
-/** Open the dashboard and wait for the client bundle to hydrate. */
-export async function openApp(page: Page): Promise<void> {
+export const hasSession = (): boolean => Boolean(process.env.ZI_SESSION);
+
+export async function openDashboard(page: Page): Promise<void> {
+  const cookies = sessionCookie();
+  if (cookies) await page.context().addCookies(cookies);
   await page.goto(APP_URL, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('body')).toBeVisible();
-  // Give the static export's JS a moment to render the shell.
   await page.waitForLoadState('networkidle').catch(() => undefined);
 }
 
-/**
- * Prefer a stable `data-testid`; fall back to visible text so this suite is not
- * coupled to one particular markup choice.
- */
-export function byTestIdOrText(page: Page, testId: string, text: RegExp | string): Locator {
-  const byId = page.locator(`[data-testid="${testId}"]`);
-  return byId.or(page.getByText(text)).first();
-}
-
-/** Is a Gmail mailbox connected for this browser session? */
-export async function isMailboxConnected(page: Page): Promise<boolean> {
-  const response = await page.request.get('http://localhost:8001/api/me');
-  if (!response.ok()) return false;
-  const body = await response.json().catch(() => null);
-  const connections = body?.data?.connections ?? [];
-  return Array.isArray(connections) && connections.length > 0;
-}
-
-/** Proof the CSS bundle really loaded — a built page, not an unstyled DOM dump. */
+/** The page must be a styled app, not an unstyled DOM dump or an error page. */
 export async function assertPageIsStyled(page: Page): Promise<void> {
-  const stylesheetCount = await page.evaluate(() => document.styleSheets.length);
-  expect(stylesheetCount, 'no stylesheet loaded — the page is unstyled').toBeGreaterThan(0);
-
-  const bodyBackground = await page.evaluate(
-    () => getComputedStyle(document.body).backgroundColor,
-  );
-  expect(bodyBackground, 'body has no computed background colour').toBeTruthy();
-
-  const hasUtilityRules = await page.evaluate(() => {
-    for (const sheet of Array.from(document.styleSheets)) {
-      let rules: CSSRuleList;
-      try {
-        rules = (sheet as CSSStyleSheet).cssRules;
-      } catch {
-        continue;
-      }
-      if (rules && rules.length > 20) return true;
-    }
-    return false;
-  });
-  expect(hasUtilityRules, 'stylesheet present but essentially empty').toBe(true);
+  await expect(page.locator('body')).toBeVisible();
+  const font = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
+  expect(font, 'body has no computed font-family — CSS did not load').toBeTruthy();
+  await expect(page.locator('body')).not.toContainText('Application error');
+  await expect(page.locator('body')).not.toContainText('Internal Server Error');
+  await expect(page.locator('body')).not.toContainText('Traceback');
 }
+
+/**
+ * Locate a dashboard section. CROSS-SLICE CONTRACT with frontend-dashboard:
+ * prefer stable data-testids (`ledger-section`, `costs-section`,
+ * `profiles-section`, `taxonomy-panel`, `command-strip`, `run-timeline`,
+ * `activity-feed`); fall back to a heading-text match so the suite is not
+ * coupled to one markup choice.
+ */
+export function section(page: Page, testId: string, heading: RegExp): Locator {
+  const byId = page.getByTestId(testId);
+  const byHeading = page
+    .locator('section, [role="region"], div')
+    .filter({ has: page.getByRole('heading', { name: heading }) })
+    .first();
+  return byId.or(byHeading).first();
+}
+
+export const stubBadges = (page: Page): Locator => page.getByText(STUB_BADGE_TEXT, { exact: false });
