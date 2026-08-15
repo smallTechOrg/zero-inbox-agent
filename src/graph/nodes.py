@@ -1249,11 +1249,7 @@ def persist_decisions(state: TriageState) -> dict:
     """
     try:
         from db.session import create_db_session
-        from graph.persistence import (
-            persist_run_results,
-            run_cost_totals,
-            upgrade_review_state,
-        )
+        from graph.persistence import persist_run_results, run_cost_totals
 
         floor = float(
             (state.get("settings") or {}).get("confidence_floor", DEFAULT_CONFIDENCE_FLOOR)
@@ -1261,9 +1257,24 @@ def persist_decisions(state: TriageState) -> dict:
         decisions = apply_confidence_floor(state.get("decisions") or [], floor)
         review_failed = set(state.get("review_failed_item_ids") or [])
         for decision in decisions:
-            decision["review_state"] = (
-                "review_failed" if decision["item_id"] in review_failed else "reviewed"
-            )
+            # Phase 9, item zero. This used to write `reviewed` onto EVERY row that
+            # was not review_failed, and then upgrade the run wide with
+            # `upgrade_review_state(run_id=..., state="reviewed")`. Both were claims
+            # about a RUN, and `review_state="reviewed"` is a claim about a
+            # DECISION: "the never-miss reviewer audited this thread". That is how
+            # 171 live `digest` decisions read `reviewed` having never been looked
+            # at, 44 of which were applied.
+            #
+            # The reviewer's own `finalise_review` has already marked exactly the
+            # rows it actually audited. Everything else is left alone here, so a row
+            # no reviewer saw stays `provisional` — durable, resumable, and simply
+            # not appliable. `persist_run_results` refuses a `reviewed` from this
+            # direction anyway (`PERSISTABLE_REVIEW_STATES`); not writing it is the
+            # honest version of the same rule.
+            if decision["item_id"] in review_failed:
+                decision["review_state"] = "review_failed"
+            else:
+                decision.pop("review_state", None)
         counts = _counts(decisions)
         cost = _cost(state)
 
@@ -1281,10 +1292,14 @@ def persist_decisions(state: TriageState) -> dict:
                 llm_calls=state.get("llm_calls") or [],
                 status="running",
             )
-            # Safety sweep: nothing may finish the graph still provisional. Any row
-            # the reviewer never saw (e.g. checkpointed by a tier after the reviewer
-            # ran) is upgraded here, so no decision is left permanently un-appliable.
-            upgrade_review_state(session, run_id=state["run_id"], state="reviewed")
+            # The "safety sweep" that used to live here — a run-wide upgrade to
+            # `reviewed` so that "no decision is left permanently un-appliable" —
+            # was the defect, not the safety net: it vouched for every row the
+            # reviewer never saw. `upgrade_review_state` now REFUSES an
+            # un-narrowed promotion to `reviewed`, so the sweep is not merely
+            # removed, it is no longer expressible. A row the reviewer could not
+            # reach stays provisional and is recovered explicitly via
+            # `graph.review_retry` — which reviews it for real.
             cost = run_cost_totals(session, state["run_id"])
         try:
             from events import bus
@@ -1477,15 +1492,32 @@ def _apply_session():
 def distance_to_zero(run_id: str, user_id: str) -> int:
     """Decisions the agent itself decided should leave the inbox and that are still in it.
 
-    ``count(decisions WHERE run_id = :id AND autonomy_state = 'auto_act'
-    AND status != 'applied')``. On a healthy completed run this is 0. Best-effort:
-    it is read in failure paths, so it never raises.
+    ``count(decisions WHERE run_id = :id AND autonomy_state IN
+    APPLIABLE_AUTONOMY_STATES AND proposed_action IN MUTABLE_ACTIONS AND
+    status != 'applied')``. On a healthy completed run this is 0. Best-effort: it
+    is read in failure paths, so it never raises.
+
+    **Phase 9.** ``auto_act`` alone is no longer the whole answer. A never-miss
+    verdict is now expressed as *archive under its label*, so a
+    ``held_by_never_miss`` row that resolved a label and did not reach Gmail is
+    just as much "still in your inbox against the agent's own decision" as a
+    stalled ``auto_act`` archive — and if it were not counted here, a run in
+    which every never-miss archive failed would report ``apply_ok=true``. The
+    ``proposed_action`` clause is what keeps the answer honest in the other
+    direction: a never-miss thread with **no** resolvable label was deliberately
+    left as a ``keep``, nothing was attempted, and it is reported under
+    ``no_never_miss_label`` instead of being counted as a failure.
+    (For ``auto_act`` the clause is a no-op — ``classify_autonomy_state`` only
+    returns ``auto_act`` for a leaving action — so pre-Phase-9 behaviour is
+    unchanged.)
     """
     try:
         from sqlalchemy import func, select as sa_select
 
         from db.session import create_db_session
+        from graph.autonomy import APPLIABLE_AUTONOMY_STATES
         from graph.persistence import model_for
+        from tools.actions import MUTABLE_ACTIONS
 
         decision_cls = model_for("decisions")
         if decision_cls is None or not hasattr(decision_cls, "autonomy_state"):
@@ -1496,7 +1528,8 @@ def distance_to_zero(run_id: str, user_id: str) -> int:
                     sa_select(func.count(decision_cls.id)).where(
                         decision_cls.run_id == run_id,
                         decision_cls.user_id == user_id,
-                        decision_cls.autonomy_state == "auto_act",
+                        decision_cls.autonomy_state.in_(sorted(APPLIABLE_AUTONOMY_STATES)),
+                        decision_cls.proposed_action.in_(sorted(MUTABLE_ACTIONS)),
                         decision_cls.status != "applied",
                     )
                 ).scalar_one()
@@ -1573,6 +1606,7 @@ def _apply_pass(
     from channels.base import ChannelError, DryRunViolation
     from sqlalchemy import select as sa_select
 
+    from graph.autonomy import APPLIABLE_AUTONOMY_STATES
     from graph.persistence import model_for
     # Imported as a module, not as a name, so the call site is a single
     # observable seam (`tools.actions.apply_decision`) that the gate spies on to
@@ -1616,7 +1650,7 @@ def _apply_pass(
                 ledger["not_reviewed"] += 1
                 continue
             autonomy_state = getattr(row, "autonomy_state", None)
-            if autonomy_state != "auto_act":
+            if autonomy_state not in APPLIABLE_AUTONOMY_STATES:
                 # `below_threshold` is its own bucket; everything else (including a
                 # NULL/unclassified row) stays in the inbox and is counted as kept.
                 if autonomy_state == "below_threshold":
@@ -1676,15 +1710,31 @@ def _apply_pass(
                 # apply_decision and an un-reviewed row can never slip through.
                 row.status = "approved"
                 session.flush()
-                actions_module.apply_decision(
-                    session,
-                    user_id,
-                    decision_id,
-                    mutator=mutator,
-                    label_lookup=label_lookup,
-                    dry_run=False,
-                    force=False,  # Rule D2 — never a side door around a `keep`.
-                )
+                if getattr(row, "autonomy_state", None) == "held_by_never_miss":
+                    # Phase 9. A never-miss verdict is expressed as an archive
+                    # under the label that names it, and this is the ONLY entry
+                    # point that can perform one. It refuses without a resolved
+                    # never-miss category, so "no never-miss thread is ever
+                    # archived without its label" is enforced by the code path
+                    # itself rather than by everyone remembering.
+                    actions_module.archive_to_never_miss_label(
+                        session,
+                        user_id,
+                        decision_id,
+                        mutator=mutator,
+                        label_lookup=label_lookup,
+                        dry_run=False,
+                    )
+                else:
+                    actions_module.apply_decision(
+                        session,
+                        user_id,
+                        decision_id,
+                        mutator=mutator,
+                        label_lookup=label_lookup,
+                        dry_run=False,
+                        force=False,  # Rule D2 — never a side door around a `keep`.
+                    )
                 session.commit()
                 ledger["applied"] += 1
             except (ActionsError, ChannelError, DryRunViolation) as exc:

@@ -356,6 +356,9 @@ def test_reviewer_started_and_finished_bracket_the_never_miss_chain(
                     "status": "proposed",
                 }
             ],
+            # Phase 9: the scope of the audit is now explicit and required — only
+            # the rows the reviewer actually looked at may be upgraded.
+            audited_item_ids=["item0"],
         )
         session.commit()
 

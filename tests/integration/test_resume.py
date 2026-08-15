@@ -99,6 +99,8 @@ def _run_row(run_id: str):
 
     with create_db_session() as session:
         row = session.get(TriageRun, run_id)
+        if row is None:
+            return None
         return {
             "status": row.status,
             "items_total": row.items_total,
@@ -351,14 +353,28 @@ class TestFullResume:
     """spec/roadmap.md Phase 6 assertions 1-6 over the 220-thread fixture."""
 
     @pytest.fixture
-    def interrupted(self, db, _nim_key, monkeypatch):
-        """A real 220-thread run interrupted once ~40 % of threads are decided."""
+    def interrupted(self, db, _nim_key):
+        """A real 220-thread run interrupted once ~40 % of threads are decided.
+
+        The interrupt is installed in its OWN monkeypatch context. It used to share
+        the function-scoped ``monkeypatch`` with the ``db`` fixture, so the
+        ``monkeypatch.undo()`` that lifts the interrupt also un-bound the isolated
+        engine — every read after it (``_decisions``, ``_run_row``) then went to
+        whatever database ``db.session`` defaults to, which is how this fixture
+        started raising ``'NoneType' object has no attribute 'status'``.
+        """
         threads = build_threads()
-        _interrupt_after(int(TOTAL * 0.4), monkeypatch)
-        state = execute_triage(
-            user_id=USER_ID, channel_account_id=ACCOUNT_ID, items=threads, dry_run=True
+        with pytest.MonkeyPatch.context() as interrupt_patch:
+            _interrupt_after(int(TOTAL * 0.4), interrupt_patch)
+            state = execute_triage(
+                user_id=USER_ID,
+                channel_account_id=ACCOUNT_ID,
+                items=threads,
+                dry_run=True,
+            )
+        assert _run_row(state["run_id"]) is not None, (
+            "the isolated engine must still be bound after the interrupt is lifted"
         )
-        monkeypatch.undo()
         return {
             "run_id": state["run_id"],
             "threads": threads,
@@ -408,7 +424,18 @@ class TestFullResume:
         # Cost is additive, never reset.
         assert _run_row(run_id)["cost_usd"] >= interrupted["cost_usd"]
 
-    def test_every_row_ends_reviewed_and_the_run_is_complete(self, interrupted, _nim_key):
+    def test_every_audited_row_ends_reviewed_and_the_run_is_complete(
+        self, interrupted, _nim_key
+    ):
+        """Phase 9, item zero: ``reviewed`` means audited, and nothing else.
+
+        This used to assert ``{"reviewed"}`` over the whole run, which was only
+        ever true because ``persist_decisions`` ran a run-wide "safety sweep"
+        vouching for rows the never-miss reviewer never looked at. The reviewer
+        audits ``REVIEWABLE_ACTIONS`` (archive/digest); those must all end
+        ``reviewed``. A row it never had to audit stays ``provisional`` —
+        durable, and simply not appliable.
+        """
         run_id = interrupted["run_id"]
         _orphan_and_reconcile(run_id)
         execute_triage(
@@ -419,8 +446,17 @@ class TestFullResume:
             run_id=run_id,
         )
         rows = _decisions()
-        assert {r["review_state"] for r in rows} == {"reviewed"}
         assert _run_row(run_id)["status"] == "completed"
+        assert {r["review_state"] for r in rows} <= {"reviewed", "provisional"}
+        unaudited_but_reviewable = [
+            r
+            for r in rows
+            if r["proposed_action"] in ("archive", "digest")
+            and r["review_state"] != "reviewed"
+        ]
+        assert unaudited_but_reviewable == [], (
+            "every archive/digest proposal must carry a real reviewer verdict"
+        )
 
     def test_every_decided_thread_emitted_exactly_one_classification_event(
         self, db, _nim_key, monkeypatch

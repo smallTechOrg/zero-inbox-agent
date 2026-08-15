@@ -628,6 +628,32 @@ def insert_provisional_decisions(
     return written
 
 
+#: The only ``review_state`` values a bulk persistence write may set. ``reviewed``
+#: is deliberately absent: it is issued by :func:`finalise_review` alone, per
+#: audited row. A caller that hands ``persist_run_results`` a blanket
+#: ``review_state="reviewed"`` (the run-wide upgrade of Phase 9, item zero) is
+#: ignored here rather than obeyed — the row keeps whatever the reviewer left.
+PERSISTABLE_REVIEW_STATES = frozenset({"provisional", "review_failed"})
+
+
+def _safe_review_state(value: object) -> str | None:
+    """Filter a caller-supplied ``review_state`` down to what it may assert."""
+    if isinstance(value, str) and value in PERSISTABLE_REVIEW_STATES:
+        return value
+    return None
+
+
+class ReviewScopeError(RuntimeError):
+    """A caller tried to mark rows ``reviewed`` without naming which rows.
+
+    Phase 9, item zero. ``review_state="reviewed"`` is a claim about a *decision*
+    — "the never-miss reviewer audited this thread" — never a claim about a run.
+    A run-wide upgrade is how 171 ``digest`` decisions came to read ``reviewed``
+    having never been audited, 44 of which were applied. It is no longer
+    expressible: name the audited item ids or do not upgrade.
+    """
+
+
 def upgrade_review_state(
     session: Session,
     *,
@@ -638,9 +664,18 @@ def upgrade_review_state(
 ) -> int:
     """Move this run's decision rows onto the next never-miss review state.
 
-    ``item_ids`` (database item ids) narrows the upgrade; omitted, every row of the
-    run is upgraded. Returns the number of rows changed.
+    ``item_ids`` (database item ids) narrows the upgrade. It is **mandatory** when
+    ``state="reviewed"``: an un-narrowed promotion to ``reviewed`` raises
+    :class:`ReviewScopeError` rather than silently vouching for rows nothing
+    audited. Returns the number of rows changed.
     """
+    if state == "reviewed" and item_ids is None:
+        raise ReviewScopeError(
+            "upgrade_review_state(state='reviewed') requires an explicit "
+            "item_ids scope — only the rows the never-miss reviewer actually "
+            "audited may be marked reviewed. A run-wide upgrade would make the "
+            "NotReviewedError gate pass vacuously (see Phase 9, item zero)."
+        )
     decision_cls = model_for("decisions")
     if decision_cls is None:
         return 0
@@ -665,23 +700,35 @@ def finalise_review(
     run_id: str,
     user_id: str,
     decisions: list[dict],
+    audited_item_ids: list[str],
     review_failed_item_ids: list[str] | None = None,
 ) -> dict:
     """Write the reviewer's verdict onto the run's rows and upgrade ``review_state``.
 
-    This is the moment a decision stops being provisional and becomes final. Rows the
-    reviewer could not process become ``review_failed`` and are treated exactly like
-    un-reviewed rows: ``apply_decision`` refuses them forever.
+    This is the moment a decision stops being provisional and becomes final — but
+    only for the rows the never-miss reviewer **actually audited**.
+    ``audited_item_ids`` is that explicit set (state item ids or db item ids); it is
+    required, and it is the *only* thing that becomes ``reviewed``. Rows the
+    reviewer could not process become ``review_failed``. Every other row is left
+    exactly as it was — provisional, and therefore never appliable — and counted in
+    ``not_audited`` so the run ledger can state it.
 
-    Returns ``{"reviewed": n, "review_failed": n, "flipped": [state_item_id, ...]}``.
+    Phase 9, item zero: before this change the whole run was upgraded, so a
+    ``digest`` decision the reviewer never looked at read ``reviewed`` and the
+    ``NotReviewedError`` gate passed vacuously.
+
+    Returns ``{"reviewed": n, "review_failed": n, "not_audited": n,
+    "flipped": [state_item_id, ...]}``.
     """
     decision_cls = model_for("decisions")
     item_cls = model_for("items")
     if decision_cls is None or item_cls is None:
-        return {"reviewed": 0, "review_failed": 0, "flipped": []}
+        return {"reviewed": 0, "review_failed": 0, "not_audited": 0, "flipped": []}
 
     # Graph state ids are either the persisted item id or the channel thread id.
     state_ids = {d["item_id"] for d in decisions}
+    state_ids |= set(audited_item_ids or [])
+    state_ids |= set(review_failed_item_ids or [])
     db_id_of: dict[str, str] = {}
     if state_ids:
         for row in session.execute(
@@ -698,12 +745,17 @@ def finalise_review(
     failed_db_ids = {
         db_id_of[i] for i in (review_failed_item_ids or []) if i in db_id_of
     }
+    audited_db_ids = {db_id_of[i] for i in (audited_item_ids or []) if i in db_id_of}
+    # A row cannot be both audited and un-auditable. review_failed wins: it is the
+    # conservative reading, and it is the one that keeps the row un-appliable.
+    audited_db_ids -= failed_db_ids
     by_db_id = {
         db_id_of[d["item_id"]]: d for d in decisions if d["item_id"] in db_id_of
     }
 
     reviewed = 0
     failed = 0
+    not_audited = 0
     flipped: list[str] = []
     for row in session.execute(
         select(decision_cls).where(decision_cls.run_id == run_id)
@@ -730,9 +782,14 @@ def finalise_review(
         if row.item_id in failed_db_ids:
             row.review_state = "review_failed"
             failed += 1
-        elif row.review_state == "provisional":
-            row.review_state = "reviewed"
+        elif row.item_id in audited_db_ids:
+            if row.review_state == "provisional":
+                row.review_state = "reviewed"
             reviewed += 1
+        elif row.review_state == "provisional":
+            # Never audited -> never vouched for. Left provisional deliberately;
+            # apply_decision will refuse it. Counted, not hidden.
+            not_audited += 1
     session.flush()
     # Rule I2 granularity: the never-miss reviewer's verdict is durable at exactly
     # this point. Logged (never hand-emitted) so `activity_bus_processor` bridges it
@@ -742,9 +799,15 @@ def finalise_review(
         run_id=run_id,
         reviewed=reviewed,
         review_failed=failed,
+        not_audited=not_audited,
         flipped=len(flipped),
     )
-    return {"reviewed": reviewed, "review_failed": failed, "flipped": flipped}
+    return {
+        "reviewed": reviewed,
+        "review_failed": failed,
+        "not_audited": not_audited,
+        "flipped": flipped,
+    }
 
 
 def persist_run_results(
@@ -837,8 +900,9 @@ def persist_run_results(
                 _assign(
                     row, decision_cls, {"autonomy_state": decision["autonomy_state"]}
                 )
-            if decision.get("review_state"):
-                row.review_state = decision["review_state"]
+            requested_state = _safe_review_state(decision.get("review_state"))
+            if requested_state:
+                row.review_state = requested_state
             continue
         row = _new(
             decision_cls,
@@ -855,7 +919,8 @@ def persist_run_results(
                 "rule_id": decision.get("rule_id"),
                 "time_sensitive": bool(decision.get("time_sensitive")),
                 "status": decision.get("status", "proposed"),
-                "review_state": decision.get("review_state") or "provisional",
+                "review_state": _safe_review_state(decision.get("review_state"))
+                or "provisional",
                 "autonomy_state": decision.get("autonomy_state"),
             },
         )

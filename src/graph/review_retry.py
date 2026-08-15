@@ -87,10 +87,22 @@ def _item_state(row: Any) -> dict:
 
 
 def _load_pending(session, *, run_id: str, user_id: str) -> tuple[list, list]:
-    """The run's non-``reviewed`` decisions and their items, user-scoped."""
+    """The run's *retryable* non-``reviewed`` decisions and their items, user-scoped.
+
+    "Retryable" is narrower than "not reviewed". The never-miss reviewer only ever
+    audits ``proposed_action in REVIEWABLE_ACTIONS`` (the same set as
+    ``tools.actions.MUTABLE_ACTIONS``), so a ``keep``-proposed row that is still
+    ``provisional``/``review_failed`` can never be upgraded by a retry, no matter
+    how many times it runs. Loading it anyway made every retry report
+    ``still_failed: 1`` forever and never converge — the same class of wart closed
+    in ``d678ddc``. Excluding it removes no safety: ``apply_decision`` refuses a
+    non-mutable action independently of ``review_state``, so the row stays exactly
+    as un-mutatable as it was.
+    """
     from sqlalchemy import select
 
     from db.models import Decision, Item
+    from tools.actions import MUTABLE_ACTIONS
 
     decisions = list(
         session.execute(
@@ -98,6 +110,7 @@ def _load_pending(session, *, run_id: str, user_id: str) -> tuple[list, list]:
                 Decision.run_id == run_id,
                 Decision.user_id == user_id,
                 Decision.review_state.in_(PENDING_REVIEW_STATES),
+                Decision.proposed_action.in_(sorted(MUTABLE_ACTIONS)),
             )
         ).scalars()
     )

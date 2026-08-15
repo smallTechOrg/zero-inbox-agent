@@ -37,6 +37,12 @@ PENDING = {
     "it-keep": ("mum@family.net", "keep"),
 }
 
+#: The subset of :data:`PENDING` a retry can actually move. The never-miss
+#: reviewer only audits ``REVIEWABLE_ACTIONS`` (== ``MUTABLE_ACTIONS``), so the
+#: ``keep``-proposed row is not loaded by ``_load_pending`` at all — retrying it
+#: would report ``still_failed: 1`` forever without ever being able to fix it.
+RETRYABLE = {k: v for k, v in PENDING.items() if v[1] in ("archive", "digest")}
+
 
 class RecordingMutator:
     """Any archive here for a row that was not reviewed is a never-miss regression."""
@@ -326,9 +332,14 @@ def test_retry_reviews_and_applies_what_the_reviewer_passes(
     states = _states()
     assert states["it-news-1"] == "reviewed"
     assert states["it-news-2"] == "reviewed"
-    assert counts["retried"] == len(PENDING)
-    assert counts["reviewed"] == len(PENDING)
+    # The keep-proposed row is not retryable (the reviewer never audits a keep),
+    # so it is never loaded and never counted — the retry converges to zero.
+    assert counts["retried"] == len(RETRYABLE)
+    assert counts["reviewed"] == len(RETRYABLE)
     assert counts["still_failed"] == 0
+    assert _states()["it-keep"] == "review_failed", (
+        "an un-retryable keep row is left exactly where it was, not swept to reviewed"
+    )
     # Only the two plain newsletters may leave the inbox: VIP, reply-history and
     # the keep-proposed row are all held.
     assert sorted(mutator.archived) == ["thread-it-news-1", "thread-it-news-2"]
@@ -390,11 +401,11 @@ def test_a_failing_reviewer_leaves_every_row_blocked_and_mutates_nothing(
     states = _states()
     for item_id in ("it-news-1", "it-news-2", "it-vip", "it-replied"):
         assert states[item_id] == "review_failed", item_id
-    # The one keep-proposed row is "reviewed" by definition — the reviewer only ever
-    # audits archive proposals, exactly as on a normal run. Every archive row the
-    # reviewer could not process stays blocked.
-    assert counts["reviewed"] == 1
-    assert counts["still_failed"] == len(PENDING) - 1
+    # Nothing is upgraded: the keep-proposed row is not retryable and so is not in
+    # the retry's scope at all, and every archive row the reviewer could not process
+    # stays blocked. No row is ever swept to `reviewed` on the reviewer's behalf.
+    assert counts["reviewed"] == 0
+    assert counts["still_failed"] == len(RETRYABLE)
     assert counts["applied"] == 0
     assert mutator.calls == [], "a failed reviewer must produce zero Gmail calls"
     assert _actions() == []
@@ -423,9 +434,12 @@ def test_a_reviewer_that_never_runs_leaves_every_thread_short_of_the_mutator(
     assert counts["applied"] == 0
     assert mutator.calls == [], "no thread may reach the mutator without a reviewer pass"
     assert apply_spy == []
-    assert set(_states()[i] for i in PENDING) == {"provisional"}, (
+    assert set(_states()[i] for i in RETRYABLE) == {"provisional"}, (
         "the rows stay at the gate — provisional is refused by apply_decision "
         "exactly as hard as review_failed"
+    )
+    assert _states()["it-keep"] == "review_failed", (
+        "the un-retryable keep row never entered the gate and is left untouched"
     )
 
 
@@ -514,7 +528,7 @@ def test_dry_run_reviews_but_mutates_nothing(seeded, mutator, apply_spy, monkeyp
     _stub_reviewer(monkeypatch, failed=False)
     counts = retry_review(run_id=RUN_ID, user_id=USER_ID)
 
-    assert counts["reviewed"] == len(PENDING), "dry-run still reviews"
+    assert counts["reviewed"] == len(RETRYABLE), "dry-run still reviews"
     assert counts["applied"] == 0
     assert mutator.calls == [], "dry_run is absolute — zero mutations"
     assert apply_spy == []

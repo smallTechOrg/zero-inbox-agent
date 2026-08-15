@@ -31,6 +31,49 @@ _PROMPT_CACHE: dict[str, str] = {}
 MIN_BATCH = 20
 MAX_BATCH = 50
 
+#: Every action that can reach the Gmail mutator, and therefore every action the
+#: never-miss reviewer must audit. Scope is defined by **mutability**, not by the
+#: ``archive`` label: ``digest`` reaches the same
+#: ``archive_and_label(remove_label_ids=[INBOX])`` call. Auditing only ``archive``
+#: is how 171 live ``digest`` decisions read ``reviewed`` having never been looked
+#: at (Phase 9, item zero).
+#:
+#: This set and ``tools.actions.MUTABLE_ACTIONS`` are ONE contract, asserted equal
+#: by ``tests/unit/graph/test_review_scope.py`` so a future third mutating action
+#: cannot silently reopen the hole. It is duplicated rather than imported so that
+#: importing the reviewer never drags in the Gmail action layer, and so the
+#: equality is a real assertion rather than a tautology.
+REVIEWABLE_ACTIONS: frozenset[str] = frozenset({"archive", "digest"})
+
+#: run_id -> the item ids the reviewer actually audited in this process.
+#:
+#: ``audited_item_ids`` is not a declared ``TriageState`` channel, and LangGraph
+#: silently drops undeclared keys from a node's return value — so a state-only
+#: hand-off between ``second_pass_reviewer`` and ``apply_never_miss_floor`` would
+#: be plumbed but never wired. This registry is the transport that actually
+#: carries it. Absence fails CLOSED: no audited set means nothing is upgraded to
+#: ``reviewed``, so a broken hand-off produces zero mutations rather than
+#: unreviewed ones.
+_AUDITED_BY_RUN: dict[str, list[str]] = {}
+
+
+def record_audited(run_id: str, item_ids: list[str]) -> None:
+    """Publish the reviewer's audited set for the rest of this run."""
+    if run_id:
+        _AUDITED_BY_RUN[str(run_id)] = sorted(set(item_ids))
+
+
+def audited_item_ids_for(run_id: str | None) -> list[str]:
+    """The audited set for a run — empty when the reviewer never published one."""
+    if not run_id:
+        return []
+    return list(_AUDITED_BY_RUN.get(str(run_id), []))
+
+
+def forget_audited(run_id: str | None) -> None:
+    if run_id:
+        _AUDITED_BY_RUN.pop(str(run_id), None)
+
 _REVIEW_SCHEMA = {
     "type": "object",
     "required": ["item_id", "flip", "reasoning"],
@@ -156,12 +199,14 @@ def review_archive_batch(
 
 
 def second_pass_reviewer(state: TriageState) -> dict:
-    """Mechanism A. Audits every archive proposal for false negatives.
+    """Mechanism A. Audits every **mutating** proposal for false negatives.
 
-    Only ever flips ``archive -> keep``; the model is never given the option
-    to propose archive itself. A batch that cannot be reviewed after retries
-    leaves every one of its threads in ``needs_your_call`` rather than
-    archiving anything un-reviewed.
+    Scope is ``REVIEWABLE_ACTIONS`` — archive *and* digest — because both reach
+    the Gmail mutator. Only ever flips toward ``keep``; the model is never given
+    the option to propose archive itself.
+
+    Returns ``audited_item_ids``: exactly the threads a reviewer batch completed
+    successfully. Nothing outside that set may later be marked ``reviewed``.
     """
     decisions = list(state.get("decisions") or [])
     items_by_id = {i["id"]: i for i in state.get("items") or []}
@@ -171,14 +216,17 @@ def second_pass_reviewer(state: TriageState) -> dict:
     archive_indices = [
         i
         for i, d in enumerate(decisions)
-        if d.get("proposed_action") == "archive" and d.get("status") != "needs_your_call"
+        if d.get("proposed_action") in REVIEWABLE_ACTIONS
+        and d.get("status") != "needs_your_call"
     ]
     if not archive_indices:
-        return {"decisions": decisions}
+        record_audited(state.get("run_id") or "", [])
+        return {"decisions": decisions, "audited_item_ids": []}
 
     calls: list[dict] = []
     flipped = 0
     failed_ids: set[str] = set()
+    audited_ids: set[str] = set()
 
     for chunk in _chunk(archive_indices):
         batch = [decisions[i] for i in chunk]
@@ -189,6 +237,7 @@ def second_pass_reviewer(state: TriageState) -> dict:
         if failed:
             failed_ids.update(d["item_id"] for d in batch)
             continue
+        audited_ids.update(d["item_id"] for d in batch)
         for i in chunk:
             decision = decisions[i]
             reason = flips.get(decision["item_id"])
@@ -221,11 +270,15 @@ def second_pass_reviewer(state: TriageState) -> dict:
         reviewed=len(archive_indices) - len(failed_ids),
         flipped=flipped,
         failed_batches=len(failed_ids),
+        audited=len(audited_ids),
     )
+    audited_sorted = sorted(audited_ids - failed_ids)
+    record_audited(state.get("run_id") or "", audited_sorted)
     return {
         "decisions": decisions,
         "llm_calls": calls,
         "review_failed_item_ids": sorted(failed_ids),
+        "audited_item_ids": audited_sorted,
     }
 
 
@@ -267,11 +320,17 @@ def _upgrade_review_state(state: TriageState, decisions: list[dict]) -> None:
     ``thread_classified`` so the live feed shows provisional becoming final in place.
     A failure here leaves the rows provisional, which is the safe direction: an
     un-upgraded row can never be applied.
+
+    Only the ids the reviewer actually audited are promoted. Everything else stays
+    provisional and is reported as ``not_audited`` — the fix for the vacuous gate.
     """
     run_id = state.get("run_id")
     if not run_id:
         return
     failed_ids = list(state.get("review_failed_item_ids") or [])
+    audited_ids = list(state.get("audited_item_ids") or []) or audited_item_ids_for(
+        run_id
+    )
     try:
         from db.session import create_db_session
         from graph.persistence import finalise_review
@@ -282,32 +341,43 @@ def _upgrade_review_state(state: TriageState, decisions: list[dict]) -> None:
                 run_id=run_id,
                 user_id=state["user_id"],
                 decisions=decisions,
+                audited_item_ids=audited_ids,
                 review_failed_item_ids=failed_ids,
             )
     except Exception as exc:
         log.warning("never_miss.review_state_upgrade_failed", run_id=run_id, error=str(exc))
         return
+    finally:
+        forget_audited(run_id)
 
     log.info(
         "never_miss.review_state",
         run_id=run_id,
         reviewed=outcome["reviewed"],
         review_failed=outcome["review_failed"],
+        not_audited=outcome["not_audited"],
         flipped=len(outcome["flipped"]),
     )
 
     from graph.checkpoint import emit_decisions
 
     failed_set = set(failed_ids)
+    audited_set = set(audited_ids)
     changed = set(outcome["flipped"]) | failed_set
     for decision in decisions:
-        if decision["item_id"] not in changed:
+        item_id = decision["item_id"]
+        if item_id not in changed:
             continue
+        if item_id in failed_set:
+            feed_state = "review_failed"
+        elif item_id in audited_set:
+            feed_state = "reviewed"
+        else:
+            # Never audited — the live feed must not claim otherwise.
+            feed_state = "provisional"
         emit_decisions(
             state,
             [decision],
             tier=decision.get("decided_by") or "reviewer",
-            review_state=(
-                "review_failed" if decision["item_id"] in failed_set else "reviewed"
-            ),
+            review_state=feed_state,
         )
