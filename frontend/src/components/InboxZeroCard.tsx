@@ -58,20 +58,25 @@ async function postRetryReview(runId: string): Promise<void> {
   }
 }
 
+/** The bucket headline — what is held. Plain language, never the raw key. */
 const BUCKET_LABEL: Record<keyof RemainderBuckets, string> = {
-  needs_your_call: 'need your call',
-  category_keep: 'kept by category',
+  needs_your_call: 'waiting for your call',
+  category_keep: 'kept by your categories',
   below_threshold: 'not confident enough to archive on its own',
-  held_by_never_miss: 'held by VIP or reply history',
+  held_by_never_miss: 'held by never-miss',
   unclassified: 'decided before this policy existed',
 }
 
+/** The bucket sub-line — *why* it is held, in the user's terms. */
 const BUCKET_REASON: Record<keyof RemainderBuckets, string> = {
-  needs_your_call: 'below the confidence floor, or the agent couldn’t decide',
-  category_keep: '',
-  below_threshold: '',
-  held_by_never_miss: '',
-  unclassified: '',
+  needs_your_call:
+    'The agent could not decide these on its own, so it is asking you instead of guessing.',
+  category_keep: 'You told the agent these categories always stay in your inbox.',
+  below_threshold:
+    'The agent leaned toward archiving, but not confidently enough to act without you.',
+  held_by_never_miss:
+    'You have replied to these, they are from someone on your VIP list, or they look time-sensitive. This is the never-miss guarantee doing its job — the agent will never archive these behind your back.',
+  unclassified: 'Decided by an earlier run, before your current policy existed.',
 }
 
 /** "A", "A and B", "A, B and C" — the taxonomy read back in the user's words. */
@@ -219,6 +224,8 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
   // Read defensively so an older backend renders the card without the bar rather
   // than crashing — `lib/types.ts` belongs to another slice this phase.
   const notReviewed = Number((ledger as { not_reviewed?: number }).not_reviewed ?? 0)
+  /** The genuinely-empty inbox — the only state allowed to claim "inbox zero". */
+  const atZero = ledger.inbox_remaining === 0
   const isDryRun = ledger.dry_run === true
   const applyFailed = !isDryRun && ledger.apply_ok === false
   const reason =
@@ -309,19 +316,52 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
         </div>
       ) : null}
 
-      {/* Headline — three numbers, largest first */}
+      {/* Headline — the HONEST state first.
+          `distance_to_zero` is a narrow number: the count of archives the agent
+          itself decided on and has not applied yet (src/graph/remainder.py:47).
+          Zero therefore means "nothing left that I decided should go" — it does
+          NOT mean the inbox is empty, and the card must never let it read that
+          way while `inbox_remaining > 0`. */}
+      <div className="space-y-1">
+        <p data-testid="iz-headline" className="text-sm text-gray-900">
+          {atZero ? (
+            <>
+              <span className="text-xl font-bold">Inbox zero.</span> Nothing is left in your inbox.
+            </>
+          ) : (
+            <>
+              <span className="text-xl font-bold tabular-nums">
+                {ledger.inbox_remaining.toLocaleString()}
+              </span>{' '}
+              thread{ledger.inbox_remaining === 1 ? '' : 's'} still in your inbox
+            </>
+          )}
+        </p>
+        <p data-testid="iz-headline-explainer" className="text-xs text-gray-600">
+          {atZero
+            ? 'Every thread the agent decided should go has been archived — never deleted, always undoable.'
+            : ledger.distance_to_zero === 0
+              ? `Nothing left that the agent decided should go — it is holding all ${ledger.inbox_remaining.toLocaleString()} of these on purpose. Here is exactly why:`
+              : `${ledger.distance_to_zero.toLocaleString()} of them the agent decided should leave but has not archived yet; the rest it is holding on purpose. Here is exactly why:`}
+        </p>
+      </div>
+
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <span data-testid="iz-applied" className="text-sm text-gray-900">
-          <span className="text-xl font-bold">{ledger.applied.toLocaleString()}</span> archived this
-          run
+        <span data-testid="iz-applied" className="text-sm text-gray-700">
+          <span className="font-bold tabular-nums">{ledger.applied.toLocaleString()}</span> archived
+          this run
         </span>
         <span data-testid="iz-inbox-remaining" className="text-sm text-gray-700">
-          <span className="font-bold">{ledger.inbox_remaining.toLocaleString()}</span> still in your
-          inbox
+          <span className="font-bold tabular-nums">
+            {ledger.inbox_remaining.toLocaleString()}
+          </span>{' '}
+          still in your inbox
         </span>
         <span data-testid="iz-distance" className="text-sm text-gray-700">
-          distance to zero:{' '}
-          <span className="font-bold">{ledger.distance_to_zero.toLocaleString()}</span>
+          still to archive:{' '}
+          <span className="font-bold tabular-nums">
+            {ledger.distance_to_zero.toLocaleString()}
+          </span>
         </span>
         {isDryRun ? (
           <span
@@ -357,38 +397,55 @@ export function InboxZeroCard({ runId, autoActThreshold, confidenceFloor }: Inbo
         <p className="mt-1 italic text-gray-500">Change which categories leave → Settings → Taxonomy</p>
       </div>
 
-      {/* The remainder ledger — buckets at zero are greyed, never hidden */}
+      {/* The remainder ledger — what is held, and why, per bucket.
+          Buckets at zero are de-emphasised (greyed, and labelled "none") but
+          never hidden: ui.md #16 and the Phase-7 Playwright assertion both
+          require every bucket to render. `unclassified` is the single
+          documented exception. */}
+      <p data-testid="remainder-ledger-heading" className="text-xs font-bold text-gray-900">
+        {atZero ? 'Nothing is being held.' : 'What is still in your inbox, and why'}
+      </p>
       <ul data-testid="remainder-ledger" className="divide-y divide-gray-100 rounded-lg border border-gray-200">
         {REMAINDER_ORDER.map(bucket => {
           const count = ledger.remainder?.[bucket] ?? 0
           // `unclassified` is the one bucket rendered only when > 0 (ui.md #16).
           if (bucket === 'unclassified' && count === 0) return null
           const zero = count === 0
-          let copy = BUCKET_LABEL[bucket]
-          if (bucket === 'category_keep' && keepCategoryNames.length > 0) {
-            copy = `${copy} — ${keepCategoryNames.join(', ')}`
-          } else if (BUCKET_REASON[bucket]) {
-            copy = `${copy} — ${BUCKET_REASON[bucket]}`
-          }
+          const label =
+            bucket === 'category_keep' && keepCategoryNames.length > 0
+              ? `${BUCKET_LABEL[bucket]} — ${keepCategoryNames.join(', ')}`
+              : BUCKET_LABEL[bucket]
           return (
             <li
               key={bucket}
               data-testid={`remainder-row-${bucket}`}
               data-count={String(count)}
-              className={`flex items-baseline gap-2 px-3 py-2 text-xs ${
-                zero ? 'text-gray-400' : 'text-gray-800'
-              }`}
+              data-state={zero ? 'empty' : 'held'}
+              className={`px-3 py-2 text-xs ${zero ? 'text-gray-400' : 'text-gray-800'}`}
             >
-              <span className="font-bold tabular-nums">{count.toLocaleString()}</span>
-              <span>{copy}</span>
-              {bucket === 'below_threshold' && autoActThreshold ? (
-                <span className="text-[11px] text-gray-500" data-testid="iz-below-threshold-hint">
+              <p className="flex items-baseline gap-2">
+                <span className="font-bold tabular-nums">
+                  {/* State is carried by the word, not by the grey alone. */}
+                  {zero ? 'none' : count.toLocaleString()}
+                </span>
+                <span className="font-semibold">{label}</span>
+              </p>
+              {!zero && BUCKET_REASON[bucket] ? (
+                <p
+                  data-testid={`remainder-why-${bucket}`}
+                  className="mt-0.5 text-[11px] leading-relaxed text-gray-600"
+                >
+                  {BUCKET_REASON[bucket]}
+                </p>
+              ) : null}
+              {!zero && bucket === 'below_threshold' && autoActThreshold ? (
+                <p className="mt-0.5 text-[11px] text-gray-500" data-testid="iz-below-threshold-hint">
                   (the bar is {autoActThreshold.toFixed(2)}
                   {confidenceFloor != null
                     ? `; these scored ${confidenceFloor.toFixed(2)}–${(autoActThreshold - 0.01).toFixed(2)}`
                     : ''}
                   )
-                </span>
+                </p>
               ) : null}
             </li>
           )
