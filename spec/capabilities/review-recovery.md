@@ -48,7 +48,10 @@ only recovery is a whole new run. The gate is right; the missing piece is a way 
 ## Success Criteria
 - [ ] A completed run seeded with 30 `review_failed` decisions and a working reviewer ends with those
       rows `reviewed`, the archive-eligible ones `applied` with non-null `undo_token`s, and
-      `remainder.not_reviewed` reduced by exactly the number the reviewer passed.
+      the `not_reviewed` figure on `GET /api/runs/{id}/remainder` reduced by exactly the number the
+      reviewer passed. (As of Phase 8 that figure is computed live in `src/api/runs.py`, not emitted by
+      `src/graph/remainder.py` — a deliberate, accepted deviation recorded in
+      [roadmap.md](../roadmap.md#accepted-deviations-and-follow-ups-phase-8).)
 - [ ] With the reviewer stubbed to fail, `retry-review` leaves every row `review_failed`, performs
       **zero** Gmail mutations, and the response and ledger name the failure.
 - [ ] Across the whole retry path, `apply_decision` is never called with `force=True` and

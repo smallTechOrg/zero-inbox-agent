@@ -258,7 +258,7 @@ mailbox you already own is the existing idempotent upsert and is unaffected.
 | `DELETE` | `/api/account/connections/{connection_id}` | | `{disconnected: true}` — best-effort token revocation at Google, then deletes the `channel_accounts` row. Triage history is retained. `404` for another user's connection. Performs **zero** Gmail mutations. |
 | `DELETE` | `/api/account/sessions/{session_id}` | | `{revoked: true}` — sets `revoked_at`. `404` for another user's session. Revoking the current session also clears the cookie. |
 | `POST` | `/api/account/sessions/revoke-all` | | `{revoked: n}` — revokes every session for the user including the current one, and clears the cookie |
-| `DELETE` | `/api/account` | `{confirm_email: "..."}` | `{deleted: true}` — `422 validation_error` unless `confirm_email` equals the user's email. Cascade-deletes every user-scoped row and clears the cookie. **Performs no Gmail mutation of any kind** — archived mail stays archived. |
+| `DELETE` | `/api/account` | `{confirm_email: "..."}` | `{deleted: true}` — `422 validation_error` unless `confirm_email` equals the user's email. Deletes every user-scoped row **explicitly**, then the `users` row, then clears the cookie. Not an FK cascade — SQLite does not enforce `ON DELETE CASCADE` without `PRAGMA foreign_keys=ON`, so the route deletes metadata-driven (every table carrying `user_id`, children first) with a `WHERE user_id = :user_id` on every statement; see [data.md](data.md#deletion-semantics). **Performs no Gmail mutation of any kind** — archived mail stays archived. |
 | `POST` | `/api/runs/{run_id}/retry-review` | | `{retried: n, reviewed: n, still_failed: n, applied: n}` — re-runs the **real** never-miss reviewer over this run's `review_state IN ('provisional','review_failed')` decisions, then runs the ordinary apply pass for whatever the reviewer upgraded. Background task; returns immediately with `{run_id, status: "retrying_review"}` and the counts land on `GET /api/runs/{run_id}/remainder`. `409 not_retryable` unless `status == "completed"` and at least one non-`reviewed` decision exists. Idempotent: a second call while one is in flight is a no-op. |
 
 **`retry-review` may not weaken any guarantee.** It calls the same reviewer node as a normal run and
@@ -275,8 +275,21 @@ and the run reports it. See
 - **Legacy compatibility:** a cookie carrying only `uid` (every session issued before Phase 8) stays
   valid until it expires; on its next authenticated request a `user_sessions` row is created and the
   cookie is re-issued with a `sid`. No user is signed out by this migration.
-- `set_session_cookie` sets `secure=True` whenever the request scheme is `https` (it is currently
+- `set_session_cookie` sets `secure=True` whenever the request arrived over TLS (it was previously
   hardcoded `False`), keeps `httponly` and `samesite=lax`, and rotates the token on every sign-in.
+  **Scheme detection is not `request.url.scheme` alone.** Starlette builds `request.url` from the
+  ASGI scope, and a scope with no `server` and no `Host` header produces a URL with the scheme
+  dropped — so a bare `request.url.scheme == "https"` test silently returns `False` and would ship
+  the session cookie in clear over an https deployment. `_is_https` therefore tries
+  `request.url.scheme` and **falls back to the raw ASGI `scope["scheme"]`**, which is always
+  populated by the server. Do not collapse this back to the URL-only check.
+- The legacy-cookie upgrade above happens **inside `require_user_id`**, which re-issues the cookie
+  via `set_session_cookie`. Nobody is signed out by scheme detection or by the upgrade: a legacy
+  `uid`-only cookie authenticates on arrival and is upgraded in place. Because a route returning a
+  bare `Response` cannot carry the re-issued cookie, a bounded LRU (512 entries) maps an
+  already-seen legacy token to the `user_sessions` row minted for it, so a replayed legacy cookie
+  does not mint a fresh row per request. The cache is always re-validated against the DB before use,
+  so it can never authenticate a revoked row; eviction is never a correctness event.
 - `AGENT_SECRET_KEY` becomes **required**: the `"insecure-dev-key"` fallback in `api/auth.py` is
   removed, and the app fails to start without the key rather than signing cookies with a public string.
 - `user_sessions.last_seen_at` is updated at most once per 60 s per session, so the device list is

@@ -1414,10 +1414,14 @@ the token names in [ui.md](ui.md#colour-tokens)), and all five land in the same 
   `user_id` raises, and the route maps it to `409 mailbox_already_connected` having written nothing.
 - `session.py`: cookie payload `{uid, sid}`; `require_user_id` rejects a revoked/unknown `sid`;
   legacy `uid`-only cookies authenticate, get a `user_sessions` row and a re-issued cookie;
-  `last_seen_at` throttled to once per 60 s; `secure=(request.url.scheme == "https")`.
-- `account.py` (new): the five routes in [api.md](api.md#routes). Deletion cascades via the existing
-  FK cascades and makes **zero** Gmail calls. Disconnect revokes at Google best-effort (WARNING on
-  failure) and deletes the local ciphertext regardless.
+  `last_seen_at` throttled to once per 60 s; `secure=` set from `_is_https(request)`, which tries
+  `request.url.scheme` and **falls back to the raw ASGI `scope["scheme"]`** (a scope with no server
+  and no Host header drops the URL scheme, which would ship the cookie without `secure` over https).
+- `account.py` (new): the five routes in [api.md](api.md#routes). Deletion does **not** use FK
+  cascade — SQLite does not enforce it without `PRAGMA foreign_keys=ON`; the route deletes every
+  `user_id`-carrying table explicitly, metadata-driven and user-scoped
+  ([data.md](data.md#deletion-semantics)) — and makes **zero** Gmail calls. Disconnect revokes at
+  Google best-effort (WARNING on failure) and deletes the local ciphertext regardless.
 - `models.py` + `0007`: `user_sessions`, the guarded global unique index on
   `(channel, account_email)`, and `channel_accounts.last_synced_at`. Per
   [data.md](data.md#phase-8-migration), the ownership guard **raises naming the offending addresses**
@@ -1563,6 +1567,44 @@ tests plus no new regressions**.
   `src/graph/state.py`, covered by `tests/unit/graph/test_error_channel_reducer.py`). **Build on top
   of it. Never revert it, never re-annotate that channel, never edit that reducer or its test.** Slice
   2 does not own `src/graph/state.py` for exactly this reason.
+
+#### Accepted deviations and follow-ups (Phase 8)
+
+Deliberate, reviewed departures from the letter of this spec. **None of these is a defect** — each was
+accepted at the Phase 8 gate. They are recorded here so a later phase neither "restores" the original
+wording nor re-litigates the decision.
+
+- **(1) FK cascade → explicit user-scoped delete.** The spec described account deletion as an FK
+  cascade. SQLite does not enforce `ON DELETE CASCADE` without `PRAGMA foreign_keys=ON` per
+  connection, so the cascade would have orphaned every child row on the production SQLite file while
+  passing on Postgres. `src/api/account.py` deletes every `user_id`-carrying table explicitly,
+  metadata-driven and user-scoped. **The spec has been corrected** ([data.md](data.md#deletion-semantics),
+  [api.md](api.md#routes), [account-and-identity](capabilities/account-and-identity.md)) — the code is
+  the reference, not the original wording.
+- **(2) `secure` cookie flag → scheme with an ASGI-scope fallback.** The spec described deriving the
+  flag from `request.url.scheme`. A scope with no `server` and no `Host` header drops the URL scheme,
+  which would have shipped the session cookie without `secure` over https. `src/api/session.py:_is_https`
+  falls back to the raw ASGI `scope["scheme"]`. Legacy `uid`-only cookies remain valid and are upgraded
+  in place — **this phase signs nobody out**. **The spec has been corrected**
+  ([api.md](api.md#session-hardening-behaviour-change-no-new-route)).
+- **(3) `not_reviewed` is computed in `src/api/runs.py`, not `src/graph/remainder.py`.**
+  [ui.md](ui.md) screen 24 requires the figure, and `remainder.py` does not emit it; the review-recovery
+  slice computed it in the runs API instead, as a live user- and run-scoped
+  `COUNT(decisions WHERE review_state IN ('provisional','review_failed'))` that is **never cached**.
+  That is the correct behaviour under concurrency — a retry in flight must not be read from a stale
+  ledger snapshot — and it was accepted on that basis. **Follow-up, not a defect:** move the count into
+  `remainder.py` when screen 24 is next revised, keeping it a live query rather than a cached ledger
+  field. Until then `remainder.py`'s documented invariant at line 45,
+  `inbox_remaining == sum(remainder.values()) + distance_to_zero`, is unaffected: `not_reviewed` is an
+  additional live figure, not a remainder bucket.
+
+**Phase 9 candidate (do not fix in Phase 8, do not spec a fix yet).** `second_pass_reviewer` audits
+only rows whose `proposed_action == "archive"` (`src/graph/nodes_review.py:171-175`), so a pending
+`digest`-proposed row can be finalised as `reviewed` without a reviewer verdict, and `digest` is a
+mutable action (`src/tools/actions.py:140`). This matches normal-run behaviour exactly and is
+pre-existing — `retry-review` did not introduce it and must not diverge from the normal run to paper
+over it. Recorded for a Phase 9 decision on whether the reviewer's audit scope should widen to every
+mutable proposed action.
 
 #### Production safety (binding on every implementer and the auditor)
 

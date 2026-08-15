@@ -16,7 +16,9 @@ so the already-multi-tenant data model has a real product around it.
 4. Session hardening: `secure` cookie on https, token rotation on sign-in, `AGENT_SECRET_KEY`
    required (the `"insecure-dev-key"` fallback is deleted), no raw IP or raw user-agent stored.
 5. Account lifecycle: disconnect a mailbox (revoke at Google + delete the ciphertext), delete the
-   account (cascade), with the consequence of each stated in exact counts before it happens.
+   account (an explicit, metadata-driven, strictly user-scoped delete of every table carrying a
+   `user_id` — **not** an FK cascade, see the business rule below), with the consequence of each
+   stated in exact counts before it happens.
 
 **Explicitly deferred — not promised anywhere in the UI, the copy or the README:** SSO/SAML/OIDC
 beyond Google, SCIM provisioning, organisations/teams, roles and RBAC, an admin console, audit-log
@@ -63,6 +65,17 @@ half-built is worse than a short list that holds.
   existing cross-user isolation tests.
 - `refresh_token_enc`, raw IPs and raw user-agent strings are never returned by any route and never
   logged.
+- **Account deletion does not rely on FK cascade.** SQLite does not enforce `ON DELETE CASCADE`
+  unless `PRAGMA foreign_keys=ON` is set per connection, so a cascade-only delete would orphan every
+  child row on SQLite while looking correct on Postgres. The route instead deletes every table
+  carrying a `user_id` explicitly, derived from the ORM metadata (children first) so a table added
+  in a later phase cannot be silently missed, with `WHERE user_id = :user_id` on **every** statement
+  — deletion is strictly user-scoped and can never remove or orphan another user's rows. See
+  [data.md](../data.md#deletion-semantics). Do not replace this with a cascade.
+- **`secure` cookie detection does not rely on `request.url.scheme` alone.** An ASGI scope with no
+  `server` and no `Host` header yields a URL with the scheme dropped, which would silently ship the
+  session cookie without `secure` over https; the check falls back to the raw ASGI `scope["scheme"]`.
+  See [api.md](../api.md#session-hardening-behaviour-change-no-new-route).
 - Deleting an account or disconnecting a mailbox performs **no Gmail mutation**. Archived mail stays
   archived and labelled; this is stated in the confirm dialog rather than implied.
 - Nothing in this capability touches the triage graph, the reviewer, `apply_decision`, the mutator or
@@ -85,8 +98,11 @@ half-built is worse than a short list that holds.
       /api/account/sessions/{id}` and `DELETE /api/account/connections/{id}` return `404` for another
       user's id.
 - [ ] `DELETE /api/account` with a mismatched `confirm_email` returns `422` and deletes nothing; with
-      the correct email it removes every user-scoped row (asserted table by table) and makes zero
-      Gmail calls.
+      the correct email it removes every user-scoped row (asserted table by table, on SQLite with
+      `PRAGMA foreign_keys` **off** — the default — so the assertion proves the explicit delete and
+      not a cascade) and makes zero Gmail calls.
+- [ ] Deleting user A's account leaves **every** row belonging to user B intact — asserted table by
+      table, with no orphan left behind in any table carrying a `user_id`.
 - [ ] A cookie carrying only `uid` (pre-Phase-8) authenticates successfully and is re-issued with a
       `sid`, and the resulting session appears in `GET /api/account`.
 - [ ] No response body from any Phase 8 route contains `refresh_token_enc`, a raw IP or a raw

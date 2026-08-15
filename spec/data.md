@@ -355,10 +355,25 @@ accounts**, so every statement is spelled out and every one is additive or guard
 Downgrade drops `last_synced_at`, `uq_channel_account_global`, `ix_user_sessions_user_active` and
 `user_sessions`. It is fully reversible; there is no one-way data migration in this revision.
 
-**Deletion semantics.** `DELETE /api/account` relies on the existing `ON DELETE CASCADE` from
-`users.id` throughout the schema; the migration adds no cascade and the route adds no manual delete
-loop that could miss a table. It performs **zero** Gmail calls: deleting the account does not
-un-archive, un-label or delete a single message.
+**Deletion semantics.** `DELETE /api/account` **does not rely on `ON DELETE CASCADE`.** The
+`ON DELETE CASCADE` clauses above are declared, but **SQLite does not enforce them unless
+`PRAGMA foreign_keys=ON` is set on every connection** — which this app does not do. Relying on the
+FKs alone would therefore leave every child row orphaned on SQLite while appearing correct on
+Postgres, and the account would read as deleted while its decisions, action logs, sessions and
+connections survived. *Do not "simplify" this back to a cascade.*
+
+Instead the route deletes explicitly, driven off the SQLAlchemy metadata rather than a hand-written
+list (`src/api/account.py:_user_scoped_tables`): every table in `Base.metadata` that carries a
+`user_id` column, in reverse `sorted_tables` order (children first), is deleted with
+`WHERE user_id = :user_id`, then the `users` row itself. Two properties are load-bearing:
+
+- **Metadata-driven, so it cannot miss a table** added in a later phase — a hand-written loop is
+  exactly the thing that silently skips a new table two phases later.
+- **Strictly user-scoped**, so it can never delete or orphan another user's rows: every statement
+  carries the `user_id` predicate and no statement is unfiltered.
+
+It performs **zero** Gmail calls: deleting the account does not un-archive, un-label or delete a
+single message.
 
 ---
 

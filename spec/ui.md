@@ -222,6 +222,16 @@ Loaded from `GET /api/runs/{run_id}/remainder` for the latest run (refetched on 
 **Headline row** — three numbers, largest first:
 `{applied} archived this run` · `{inbox_remaining} still in your inbox` · `distance to zero: {n}`.
 
+**`distance_to_zero == 0` does not mean an empty inbox, and the card must never imply that it does.**
+Per `src/graph/remainder.py:47`, `distance_to_zero` counts only the decisions **the agent itself
+decided should leave the inbox** and has not yet applied — so a healthy run legitimately reports
+`distance_to_zero: 0` while thousands of threads remain, held by category, by the confidence floor or
+by never-miss. The card therefore **leads with the honest `inbox_remaining` count and the per-bucket
+ledger**, and may **never** render a bare "you reached inbox zero" / "all clear" claim while
+`inbox_remaining > 0`. A "reached zero" celebration is permitted only when `inbox_remaining == 0`.
+Threads held by never-miss are the safety guarantee **working**: present them as the agent showing
+its work — *"held so you can see them"* — never as a failure, a backlog or an error state.
+
 **The definition, stated plainly and always visible** (not behind a tooltip, not in a modal — a user
 who thinks "zero" means one thing and gets another has been misled):
 
@@ -572,8 +582,17 @@ Closes a real gap: a `completed` run holding `review_failed` decisions can never
 the never-miss gate correctly refuses them — and `POST /api/runs/{id}/apply` cannot clear them. Today
 the only recovery is a whole new run.
 
-On the Inbox-Zero card (screen 16), when the remainder ledger reports `not_reviewed > 0`, an amber bar
-sits **below** the red apply-failure bar (never replacing it — both can be true):
+On the Inbox-Zero card (screen 16), when `not_reviewed > 0`, an amber bar sits **below** the red
+apply-failure bar (never replacing it — both can be true):
+
+> **Where `not_reviewed` comes from.** It belongs in `src/graph/remainder.py` alongside the other
+> ledger figures, but as of Phase 8 it is computed in `src/api/runs.py` as a live, user- and
+> run-scoped `COUNT(decisions WHERE review_state IN ('provisional','review_failed'))` that is
+> **never cached** — a retry in flight must not be read from a stale snapshot. That is a deliberate,
+> accepted deviation (see [roadmap.md](roadmap.md#accepted-deviations-and-follow-ups-phase-8)), to be
+> moved into `remainder.py` — still as a live query — when this screen is next revised. It is an
+> additional figure, **not** a remainder bucket: it does not enter
+> `inbox_remaining == sum(remainder.values()) + distance_to_zero`.
 
 > **{n} threads never got past the reviewer**, so they were left in your inbox rather than archived
 > unseen. The reviewer failed or was unavailable during this run.
