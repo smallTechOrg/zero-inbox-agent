@@ -18,6 +18,7 @@ log = structlog.get_logger(__name__)
 from collections.abc import Callable
 from datetime import datetime
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from channels.base import (
@@ -140,6 +141,13 @@ class GmailAdapter(ChannelAdapter):
         for attempt in range(MAX_ATTEMPTS):
             try:
                 return request.execute()
+            except RefreshError as exc:
+                # A revoked/expired refresh token fails when google-auth mints the
+                # access token — never as an HttpError. Unmapped it escapes as a
+                # raw traceback; the user must be told to reconnect Gmail instead.
+                raise ReauthRequired(
+                    "Gmail rejected the stored credentials — reconnect Gmail"
+                ) from exc
             except HttpError as exc:
                 status = getattr(exc.resp, "status", None)
                 if status in (401, 403) and self._is_auth_error(status, exc):
