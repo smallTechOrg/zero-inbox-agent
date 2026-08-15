@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -59,15 +58,12 @@ class TokenCipher:
 
 
 def get_secret_key() -> str:
-    """Read ``AGENT_SECRET_KEY`` from settings, falling back to the environment.
+    """Return ``AGENT_SECRET_KEY``, or raise ``FatalConfigError`` if it is unset.
 
-    The settings module is owned by another slice; the env fallback keeps this
-    module usable (and testable) regardless of which fields it currently declares.
+    Phase 8: this never returns a default. The previous version swallowed every
+    settings error and returned ``""``, which let callers silently derive a key
+    from an empty secret instead of stopping.
     """
-    try:
-        from config.settings import get_settings
+    from config.settings import require_secret_key
 
-        value = getattr(get_settings(), "secret_key", "") or ""
-    except Exception:  # pragma: no cover - settings unavailable
-        value = ""
-    return value or os.environ.get("AGENT_SECRET_KEY", "")
+    return require_secret_key()

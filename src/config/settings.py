@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     google_redirect_uri: str = Field(default="http://localhost:8001/auth/google/callback")
 
     # --- App -------------------------------------------------------------
+    # REQUIRED. Declared with an empty default so importing settings never raises a
+    # raw pydantic ValidationError dump; the requirement is enforced by
+    # `require_secret_key()` below, which fails with a message a human can act on.
     secret_key: str = Field(default="")
     log_level: str = Field(default="INFO")
     # `PORT` is conventionally unprefixed; `AGENT_PORT` also works.
@@ -74,3 +77,54 @@ def get_runtime_settings() -> RuntimeSettings:
     if _runtime_settings is None:
         _runtime_settings = RuntimeSettings()
     return _runtime_settings
+
+
+# --- Required secrets ----------------------------------------------------
+
+SECRET_KEY_ENV_VAR = "AGENT_SECRET_KEY"
+
+#: The one line a human sees when the app refuses to start. It names the variable,
+#: says where it goes, and gives the exact command that produces a value. It is a
+#: single line on purpose: the server runs under a restart supervisor, so this text
+#: is what a reader of a crash-looping log has to be able to act on at a glance.
+MISSING_SECRET_KEY_MESSAGE = (
+    "FATAL CONFIG ERROR: AGENT_SECRET_KEY is not set — Zero Inbox refuses to start. "
+    "Add AGENT_SECRET_KEY=<value> to .env (see .env.example), generating the value with: "
+    'python -c "import secrets; print(secrets.token_hex(32))". '
+    "There is no fallback key: it encrypts stored OAuth refresh tokens and signs session "
+    "cookies, and a published constant would make every session forgeable. "
+    "Restarting will not fix this — set the variable, then start the server again."
+)
+
+
+class FatalConfigError(RuntimeError):
+    """An unrecoverable configuration error. Restarting the process cannot fix it.
+
+    ``exit_code`` is ``os.EX_CONFIG`` (78), the conventional "configuration error"
+    status, so a supervisor can distinguish "misconfigured, do not respin" from an
+    ordinary crash.
+    """
+
+    exit_code = 78  # os.EX_CONFIG
+
+
+def fatal_config_banner(message: str = MISSING_SECRET_KEY_MESSAGE) -> str:
+    """Render ``message`` so it is unmissable at the top of a supervised log."""
+    rule = "=" * 78
+    return f"\n{rule}\n{message}\n{rule}\n"
+
+
+def require_secret_key() -> str:
+    """Return ``AGENT_SECRET_KEY`` or raise :class:`FatalConfigError`.
+
+    The insecure development fallback is deleted — there is no value this returns
+    that was not supplied by the operator.
+    """
+    import os
+
+    value = (get_settings().secret_key or "").strip()
+    if not value:
+        value = os.environ.get(SECRET_KEY_ENV_VAR, "").strip()
+    if not value:
+        raise FatalConfigError(MISSING_SECRET_KEY_MESSAGE)
+    return value
