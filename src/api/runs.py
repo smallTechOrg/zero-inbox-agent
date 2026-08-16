@@ -356,40 +356,59 @@ def get_run(
     return ok(card)
 
 
+def _undo_run_task(*, run_id: str, user_id: str) -> None:
+    """Execute the whole-run undo in the background. Never raises into the
+    server; ``undo_run`` commits row by row, so any crash leaves a resumable
+    state (re-triggering continues from the first non-undone mutation)."""
+    from db.session import create_db_session
+    from tools.undo import undo_run
+
+    try:
+        with create_db_session() as session:
+            run = session.get(Run, run_id)
+            if run is None:
+                return
+            mutator = gmail_mutator_for_user(session, user_id)
+            lookup = label_lookup_for_user(session, user_id)
+            try:
+                undo_run(session, run=run, mutator=mutator, label_lookup=lookup)
+            except ReauthRequired:
+                _mark_needs_reconnect(session, user_id)
+                session.commit()
+    except Exception:  # noqa: BLE001 — undo is resumable; never crash the server
+        _log.warning("runs.undo_background_failed run_id=%s", run_id, exc_info=True)
+    finally:
+        with _undo_lock:
+            _undo_in_flight.discard(run_id)
+
+
 @router.post("/api/runs/{run_id}/undo")
 def undo_run_route(
     run_id: str,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(require_current_user),
     session: Session = Depends(get_session),
 ) -> dict:
     """Whole-run undo. 409 if the run is active or already undone.
 
-    Executes synchronously through the audited choke point; every inverse is
-    committed row by row, so an interrupted undo re-triggered continues from
-    the first non-undone mutation. ``undo_*`` events stream on
-    ``GET /api/runs/{id}/events``.
+    Starts the undo in the background and returns immediately — replaying a
+    50-thread run against Gmail takes tens of seconds, far beyond proxy
+    timeouts. Progress streams as ``undo_*`` events on
+    ``GET /api/runs/{id}/events``; completion is visible as ``undone_at`` on
+    the run card, which the UI polls for.
     """
-    from tools.undo import undo_run
-
     run = load_run(session, run_id, user_id)
     if run.status == RunStatus.RUNNING:
         raise api_error(CONFLICT, "This run is still in progress — wait for it to finish.", 409)
     if run.status == RunStatus.UNDONE:
         raise api_error(CONFLICT, "This run has already been undone.", 409)
 
-    mutator = gmail_mutator_for_user(session, user_id)
-    lookup = label_lookup_for_user(session, user_id)
+    _connected_account(session, user_id)  # gmail_reconnect surfaces before we accept
 
     with _undo_lock:
         if run_id in _undo_in_flight:
             raise api_error(CONFLICT, "An undo for this run is already in progress.", 409)
         _undo_in_flight.add(run_id)
-    try:
-        result = undo_run(session, run=run, mutator=mutator, label_lookup=lookup)
-    except ReauthRequired as exc:
-        _mark_needs_reconnect(session, user_id)
-        raise gmail_reconnect() from exc
-    finally:
-        with _undo_lock:
-            _undo_in_flight.discard(run_id)
-    return ok(result)
+
+    background_tasks.add_task(_undo_run_task, run_id=run_id, user_id=user_id)
+    return ok({"run_id": run_id, "undo_started": True})

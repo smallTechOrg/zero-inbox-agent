@@ -29,6 +29,7 @@ Security properties:
 
 from __future__ import annotations
 
+import os
 import secrets
 
 from fastapi import APIRouter, Depends, Request
@@ -75,7 +76,7 @@ SESSION_COOKIE = COOKIE_NAME
 STATE_COOKIE = "zi_oauth_state"
 STATE_SALT = "zi-oauth-state"
 STATE_MAX_AGE = 60 * 10
-DASHBOARD_URL = "/"
+DASHBOARD_URL = os.environ.get("AGENT_DASHBOARD_URL", "http://localhost:3000/")
 
 def gmail_reconnect_response(user_id: str | None = None) -> JSONResponse:
     """The structured ``gmail_reconnect`` error every surface returns on a

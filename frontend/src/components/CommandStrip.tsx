@@ -42,7 +42,10 @@ export function CommandStrip({
   const disabled = starting || runActive || disabledReason != null
 
   return (
-    <section className="zi-card flex flex-wrap items-center justify-between gap-6 p-6">
+    <section
+      className="zi-card flex flex-wrap items-center justify-between gap-6 p-6"
+      data-testid="command-strip"
+    >
       <div className="space-y-2">
         <button
           type="button"

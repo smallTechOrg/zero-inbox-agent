@@ -105,11 +105,9 @@ def test_undo_replays_audit_rows_in_reverse_and_restores_state(client, db_sessio
 
     resp = client.post(f"/api/runs/{run.id}/undo")
     assert resp.status_code == 200, resp.text
-    data = resp.json()["data"]
-    assert data["reversed"] == 2
-    assert data["remaining"] == 0
-    assert data["errors"] == []
-    assert data["status"] == "undone"
+    # Async contract: the route accepts and the TestClient runs the background
+    # task to completion before returning — final state is asserted below.
+    assert resp.json()["data"] == {"run_id": run.id, "undo_started": True}
 
     # Newest first: the archive is inverted before the label.
     thread_id = f"test-thread-{run.id[:8]}"
@@ -167,7 +165,6 @@ def test_interrupted_undo_resumes_without_double_inverting(client, db_session, a
 
     resp = client.post(f"/api/runs/{run.id}/undo")
     assert resp.status_code == 200
-    assert resp.json()["data"]["reversed"] == 1
     # Only the remaining (label) row was inverted — nothing double-inverted.
     assert client.mutator.calls == [
         ("remove_label", f"test-thread-{run.id[:8]}", "test-label-newsletters")
@@ -199,10 +196,10 @@ def test_revoked_token_surfaces_as_gmail_reconnect(alice, db_session, monkeypatc
     )
     with make_client(ALICE) as client:
         resp = client.post(f"/api/runs/{run.id}/undo")
-    assert resp.status_code == 409
-    err = resp.json()["error"]
-    assert err["code"] == "gmail_reconnect"
-    assert err["message"] == "Reconnect Gmail to continue."
+    # Async contract: the route accepts (the account looks connected at POST
+    # time); the background task hits ReauthRequired and flips the account to
+    # needs_reconnect — the UI's /api/me poll surfaces the reconnect prompt.
+    assert resp.status_code == 200
     assert "Traceback" not in resp.text
 
     db_session.expire_all()
@@ -221,8 +218,13 @@ def test_undo_with_unresolvable_label_reports_error_and_continues(client, db_ses
     db_session.commit()
 
     resp = client.post(f"/api/runs/{run.id}/undo")
-    data = resp.json()["data"]
-    assert data["reversed"] == 1  # the archive was still restored
-    assert data["remaining"] == 1
-    assert data["status"] != "undone"  # incomplete undo never claims completion
-    assert any("Ghost category" in e for e in data["errors"])
+    assert resp.status_code == 200
+
+    db_session.expire_all()
+    from db.models import Mutation, Run
+
+    # The archive was still restored; the ghost-label row stayed pending.
+    undone = [m for m in db_session.query(Mutation).filter_by(run_id=run.id) if m.undone_at]
+    assert len(undone) == 1
+    # Incomplete undo never claims completion.
+    assert db_session.get(Run, run.id).status != "undone"

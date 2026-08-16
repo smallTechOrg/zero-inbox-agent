@@ -69,7 +69,8 @@ function asRecord(v: unknown): Record<string, unknown> {
 function normalizeMe(raw: unknown): Me {
   const r = asRecord(raw)
   const user = asRecord(r.user ?? r)
-  const status = (r.gmail_status ?? r.gmail ?? asRecord(r.gmail_account).status ?? 'none') as
+  const gmailRaw = r.gmail_status ?? r.gmail ?? asRecord(r.gmail_account).status ?? 'none'
+  const status = (typeof gmailRaw === 'string' ? gmailRaw : asRecord(gmailRaw).status) as
     | Me['gmail_status']
     | undefined
   return {
@@ -139,7 +140,11 @@ export const api = {
   latestAudit: async () => normalizeAudit(await request<unknown>('/api/audit/latest')),
 
   taxonomy: {
-    list: () => request<Category[]>('/api/taxonomy'),
+    list: async () => {
+      const data = await request<unknown>('/api/taxonomy')
+      const rows = Array.isArray(data) ? data : (asRecord(data).categories as unknown[]) ?? []
+      return rows as Category[]
+    },
     add: (body: { name: string; description: string; rule: CategoryRule }) =>
       request<Category>('/api/taxonomy', { method: 'POST', body: JSON.stringify(body) }),
     patch: (id: string, patch: Partial<Pick<Category, 'name' | 'description' | 'rule'>>) =>
@@ -154,7 +159,11 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(chunkLimit ? { chunk_limit: chunkLimit } : {}),
       }),
-    list: async () => ((await request<unknown[]>('/api/runs')) ?? []).map(normalizeRun),
+    list: async () => {
+      const data = await request<unknown>('/api/runs')
+      const rows = Array.isArray(data) ? data : (asRecord(data).runs as unknown[]) ?? []
+      return rows.map(normalizeRun)
+    },
     get: async (id: string) => normalizeRun(await request<unknown>(`/api/runs/${id}`)),
     undo: (id: string) => request<unknown>(`/api/runs/${id}/undo`, { method: 'POST' }),
     /** SSE endpoint URL — consumed by useRunFeed, not fetch. */

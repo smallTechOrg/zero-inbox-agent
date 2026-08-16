@@ -182,10 +182,10 @@ def test_full_run_feed_card_and_undo_journey(alice, db_session, monkeypatch):
         assert [f["seq"] for f in tail] == [f["seq"] for f in frames[3:]]
 
         # 5) Whole-run undo restores everything, newest first, audited.
+        # Async contract: accepted immediately; the TestClient runs the
+        # background task to completion, so final state is checked below.
         undone = client.post(f"/api/runs/{run_id}/undo").json()["data"]
-        assert undone["status"] == "undone"
-        assert undone["reversed"] == mutation_count
-        assert undone["errors"] == []
+        assert undone == {"run_id": run_id, "undo_started": True}
 
         db_session.expire_all()
         from db.models import Run, RunEvent, ThreadDecision

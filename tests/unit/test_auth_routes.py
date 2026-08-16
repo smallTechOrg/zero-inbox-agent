@@ -90,7 +90,7 @@ def test_callback_creates_user_encrypted_token_and_session(app, client, monkeypa
     monkeypatch.setenv("AGENT_GOOGLE_CLIENT_SECRET", "client-secret")
     response = _sign_in(app, client, _result())
     assert response.status_code == 302
-    assert response.headers["location"] == "/"
+    assert response.headers["location"] == "http://localhost:3000/"
     assert "zi_session" in response.cookies
 
     from db.models import GmailAccount, User
@@ -218,4 +218,4 @@ def test_callback_without_refresh_token_is_structured_gmail_reconnect(app, clien
 def test_user_declined_consent_redirects_home_with_reason_not_a_traceback(client):
     response = client.get("/auth/google/callback?error=access_denied")
     assert response.status_code == 302
-    assert response.headers["location"] == "/?auth_error=access_denied"
+    assert response.headers["location"] == "http://localhost:3000/?auth_error=access_denied"

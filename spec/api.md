@@ -35,7 +35,7 @@ traceback). All routes are per-session-user scoped.
 | `GET /api/runs` | Run cards, newest first (status, counts, costs, undo state). |
 | `GET /api/runs/{id}` | Card detail + this run's decisions. |
 | `GET /api/runs/{id}/events` | SSE: replays persisted `run_events` from `?after_seq`, then live. |
-| `POST /api/runs/{id}/undo` | Whole-run undo; streams `undo_*` events on the same channel; 409 if running or already undone. |
+| `POST /api/runs/{id}/undo` | Whole-run undo, **async**: returns `{run_id, undo_started}` immediately (replaying a 50-thread run takes tens of seconds); progress streams as `undo_*` events on the same channel and completion lands as `undone_at` on the run card; 409 if running or already undone. |
 | `GET /api/health` | Liveness + config sanity (no secrets). |
 
 ## Phase 2
