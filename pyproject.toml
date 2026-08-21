@@ -9,14 +9,23 @@ dependencies = [
     "pydantic-settings>=2.3",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
-    "anthropic>=0.28",
-    "structlog>=24.1",
     "langgraph>=0.1",
-    "google-genai>=2.9.0",
+    "google-genai>=2.9.0",           # kept per spec/agent.md for the Phase-3 chat graph
+    "openai>=2.53.0",
+    "jsonschema>=4.26.0",
+    "google-auth-oauthlib>=1.4.0",
+    "google-api-python-client>=2.198.0",
+    "cryptography>=49.0.0",
+    "itsdangerous>=2.2.0",
+    "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27"]
+# pytest-timeout is NOT optional: the Phase-6 "never stuck" tests assert with
+# @pytest.mark.timeout, and without the plugin installed that marker silently
+# no-ops — a hung test would hang the suite while the assertion it was supposed
+# to make quietly never runs. A test that cannot fail is worse than no test.
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "pytest-timeout>=2.3"]
 
 [build-system]
 requires = ["hatchling"]
@@ -29,3 +38,11 @@ packages = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+markers = [
+    "integration: hits a real external API using keys from .env",
+    "slow: the full 220-thread real-LLM gate (minutes); run with -m slow or use test_triage_small.py for the fast per-commit gate",
+]
+# No global marker filter: the Phase-1 Gate command is `uv run pytest tests/unit tests/integration -q`
+# (spec/roadmap.md) and it is REQUIRED to include tests/integration/test_triage_pipeline.py — the
+# full 220-thread real-NVIDIA-NIM run. If slow tests must be skipped for a fast local loop, opt in
+# explicitly: `uv run pytest -m 'not slow' tests/unit tests/integration/test_triage_small.py`.

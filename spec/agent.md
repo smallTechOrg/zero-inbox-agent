@@ -1,218 +1,85 @@
-# Agent
+# Agent Graph — Triage Run
 
-> Required when the project uses an agent framework. Delete this file if your project has no agent framework.
->
-> If your project has no agent framework (e.g., a simple script or single-LLM API call), delete this file.
->
+Framework: **LangGraph**. Pattern: linear pipeline with a batch loop and an
+error-handler edge (no deep-read escalation, no planner — a single cheap batched
+classification pass; see `harness/patterns/agentic-ai.md` "pipeline" pattern).
 
----
-
-## Agent Architecture Pattern
-
-<!-- FILL IN: Which pattern does this agent follow? Choose one and describe why. -->
-
-| Pattern | Use when |
-|---------|----------|
-| **Single-agent loop** | One LLM drives a deterministic tool-call loop. No branches, no handoffs. |
-| **Graph (LangGraph)** | Multi-step pipeline with conditional edges, checkpointing, or parallel nodes. |
-| **Multi-agent** | Specialised sub-agents with distinct roles; orchestrator routes between them. |
-| **Supervisor** | One supervisor LLM dispatches to worker agents based on task type. |
-| **Human-in-the-loop** | Execution pauses at defined checkpoints for user review or approval. |
-
-**Chosen:** <!-- state pattern + one-sentence rationale -->
-
----
-
-## LLM Provider & Model
-
-<!-- FILL IN: Which model drives each agent/node? State provider, model ID, and why. -->
-
-| Agent / Node | Provider | Model ID | Rationale |
-|-------------|----------|----------|-----------|
-| <!-- node --> | Anthropic | <!-- e.g. claude-sonnet-4-6 --> | <!-- latency vs. quality trade-off --> |
-
-**Fallback behaviour:** <!-- Production resilience only: retry/backoff, degraded mode, or a surfaced error if the LLM API is unavailable or rate-limited. NOT a test/offline stub path — tests call the real API with keys from `.env`. -->
-
-**Prompt strategy:** <!-- System/user split, few-shot examples, structured output (tool_use / JSON mode)? -->
-
----
-
-## Tools & Tool Calling
-
-<!-- FILL IN: Every tool the agent can call. -->
-
-| Tool name | Description | Inputs | Output | Side-effects |
-|-----------|-------------|--------|--------|--------------|
-| <!-- name --> | <!-- what it does --> | <!-- params --> | <!-- return type --> | <!-- DB write, API call, file write, etc. --> |
-
-**Tool selection strategy:** <!-- How does the agent decide which tool to call? (LLM choice, rule-based routing, forced single tool) -->
-
-**Tool failure handling:** <!-- retry, fallback, abort — per tool or global policy? -->
-
----
-
-## Agent State
-
-<!-- FILL IN: The full state type. Every field must be named, typed, and annotated with what populates it. -->
+## State
 
 ```python
-class AgentState(TypedDict):
-    # Identity
-    run_id: int                          # set at initialisation
-
-    # Input
-    # ...                                # fields populated from the trigger
-
-    # Pipeline data (populated progressively by nodes)
-    # ...
-
-    # Output
-    # ...                                # final result fields
-
-    # Control
-    error: str | None                    # set by any node on fatal failure
-    checkpoint: str | None              # last completed node (for resume)
+class RunState(TypedDict):
+    run_id: str
+    user_id: str
+    chunk_limit: int                 # 50 (Phase 1) … 100 (Phase 2)
+    threads: list[ClassifierView]    # undecided INBOX threads, newest first
+    batches: list[list[ClassifierView]]
+    batch_index: int
+    decisions: list[Decision]        # this run's decisions so far
+    counts: dict[str, int]           # per-category
+    cost: CostTotals                 # calls, tokens, est_cost, fallback_events
+    error: str | None                # human-readable; set only by error handler
 ```
 
----
+`ClassifierView` holds ONLY the privacy-allowed fields (see architecture.md).
+`Decision` = thread_id, category_id, confidence (0–1), one-line reason, needs_review.
 
-## Nodes / Steps
+## Nodes
 
-<!-- FILL IN: One section per node. For single-agent loops, describe each "step" or "tool call phase." -->
+| Node | Does |
+|---|---|
+| `load_chunk` | Fetch up to `chunk_limit` INBOX threads newest-first; drop any `gmail_thread_id` already in `thread_decisions` for this user (never-redo). Emit `chunk_loaded`. Empty chunk → straight to `finalize` ("inbox chunk clean"). |
+| `match_profiles` | (Phase 2; Phase 1 pass-through) Decide threads whose sender has a `sender_profiles` row — no LLM. Emit one feed event each. |
+| `classify_batch` | One `classify_batch()` LLM call for the next ≤25 undecided threads against the user's current taxonomy (fetched fresh each run — the agent adapts to edits). Confidence < 0.7 ⇒ keep best-guess category AND set `needs_review`. Persist each decision row immediately. Emit per-thread feed events with reasoning + cost ticker update. |
+| `apply_actions` | For each new decision: apply the category's rule — always add the category label; `auto_archive` rule also removes INBOX; `needs_review` additionally adds the "Needs review" label. Audit row written before each Gmail call. Serial per run. |
+| `error_handler` | Any node exception: persist run status `interrupted` with a human-readable reason (rate limit / reconnect Gmail / provider down), emit `run_interrupted`, go to `finalize`. Work already persisted stays; the next `POST /runs` resumes. |
+| `finalize` | Write run totals + status (`completed`/`interrupted`), emit `run_finished`. Always runs. |
 
-### `node_[name]`
-
-**Reads from state:** <!-- field names -->
-
-**Writes to state:** <!-- field names -->
-
-**LLM call:** <!-- yes/no; if yes: prompt template summary, model used, output format -->
-
-**External calls:**
-
-| System | Operation | On Failure |
-|--------|-----------|------------|
-| <!-- system --> | <!-- what it calls --> | <!-- fatal (set error) / partial (log + continue) / retry --> |
-
-**Behaviour:** <!-- One paragraph. What decision or transformation does this node perform? -->
-
----
-
-## Graph / Flow Topology
-
-<!-- FILL IN: ASCII diagram of node flow. Show ALL conditional edges explicitly. -->
+## Edges
 
 ```
-START
-  │
-  ▼
-node_a ──(error)──► node_handle_error ──► END
-  │
-  ▼
-node_b ──(condition)──► node_c
-  │                         │
-  │                         ▼
-  └──────────────────► node_finalize
-                             │
-                             ▼
-                            END
+START → load_chunk → match_profiles → classify_batch → apply_actions
+apply_actions → classify_batch        # while batch_index < len(batches)
+apply_actions → finalize              # when all batches done
+load_chunk → finalize                 # empty chunk
+(any node exception) → error_handler → finalize → END
 ```
 
-**Conditional edges:**
+## Concurrency & Resumability
 
-| Source node | Condition | Target |
-|-------------|-----------|--------|
-| <!-- node --> | <!-- e.g. state["error"] is not None --> | <!-- target node --> |
+- One active run per user (enforced at `POST /runs`; a second trigger while running
+  returns the active run_id).
+- Batches are sequential; Gmail mutations are serial. Within `classify_batch` the
+  single LLM call covers the whole batch (that IS the batching).
+- Resumability is **data-driven, not checkpoint-driven**: `thread_decisions` is the
+  source of truth. A resumed run re-enters `load_chunk`, which skips decided
+  threads; decided-but-unapplied decisions (decision row exists, no audit row) are
+  re-applied idempotently. No LangGraph checkpointer needed.
 
----
+## LLM Call Contract (inside `classify_batch`)
 
-## Memory & Context
+- Prompt: `src/prompts/classify.md` + taxonomy (names, descriptions) + batch of
+  `ClassifierView`s. Output: strict JSON list of `{thread_id, category, confidence,
+  reason}`; unparseable entries → `needs_review` with reason "classifier output
+  invalid", never a crash.
+- Provider: NVIDIA; on timeout (30s hard)/429/error → Gemini for this batch, emit
+  `fallback` event; next batch tries NVIDIA first again.
 
-<!-- FILL IN: How does the agent remember things across turns, steps, or runs? -->
-
-| Scope | Mechanism | What is stored |
-|-------|-----------|----------------|
-| **Within a run** | LangGraph state | All in-progress data |
-| **Across runs** | <!-- DB / vector store / none --> | <!-- e.g. past results, user prefs --> |
-| **Conversation** | <!-- message history / summary / none --> | <!-- if chat-style --> |
-
-**Context window management:** <!-- How is the prompt kept within limits? (summary, sliding window, RAG retrieval) -->
-
----
-
-## Human-in-the-Loop Checkpoints
-
-<!-- FILL IN: Where does execution pause for human input? Delete section if not applicable. -->
-
-| Checkpoint | What is shown to the user | Expected user action | Timeout / default |
-|------------|--------------------------|----------------------|-------------------|
-| <!-- name --> | <!-- what the agent surfaces --> | <!-- approve / edit / abort --> | <!-- timeout action --> |
-
----
-
-## Error Handling & Recovery
-
-<!-- FILL IN: How the agent handles failures at each level. -->
-
-**Node-level:** <!-- Each node catches its own exceptions; fatal errors set state["error"] and route to handle_error node. -->
-
-**Graph-level (handle_error node):**
-- Reads: `state.error`, `state.run_id`
-- Updates DB: run status → "failed", `error_message`, `completed_at`
-- Logs error with `run_id` context
-- Terminates graph
-
-**Resume / retry strategy:** <!-- Can a failed run be resumed from its last checkpoint? How? -->
-
-**Partial failure:** <!-- If a non-critical step fails, does the agent degrade gracefully or abort? -->
-
----
-
-## Observability
-
-<!-- FILL IN: What is logged, traced, and measured? -->
-
-| Signal | What | Where |
-|--------|------|-------|
-| **Trace** | One trace per run, one span per node | <!-- OpenTelemetry / LangSmith / stdout --> |
-| **LLM calls** | Prompt tokens, completion tokens, latency, model | <!-- LangSmith / structured log --> |
-| **Tool calls** | Tool name, inputs, success/error, latency | Structured log |
-| **Run outcome** | Status, total duration, error if any | DB + structured log |
-
----
-
-## Concurrency Model
-
-<!-- FILL IN: How concurrent agent runs are handled. -->
-
-- **Run isolation:** <!-- one-at-a-time (API returns 409) / queue / parallel with run_id scoping -->
-- **Parallel nodes within a run:** <!-- which nodes run in parallel and why -->
-- **Checkpointing:** <!-- none / SqliteSaver / PostgresSaver — required if human-in-the-loop or long-running -->
-
----
-
-## Graph Assembly (`agent/graph.py`)
-
-<!-- FILL IN: Pseudocode showing how nodes and edges are wired. Must be ≤ 60 lines in the real file. -->
+## Assembly
 
 ```python
-graph = StateGraph(AgentState)
-
-graph.add_node("node_a", node_a)
-graph.add_node("node_b", node_b)
-graph.add_node("finalize", node_finalize)
-graph.add_node("handle_error", node_handle_error)
-
-graph.set_entry_point("node_a")
-
-graph.add_conditional_edges(
-    "node_a",
-    lambda s: "handle_error" if s.get("error") else "node_b",
-)
-
-graph.add_edge("node_b", "finalize")
-graph.add_edge("finalize", END)
-graph.add_edge("handle_error", END)
-
-compiled_graph = graph.compile()
+g = StateGraph(RunState)
+for name in ("load_chunk", "match_profiles", "classify_batch", "apply_actions",
+             "error_handler", "finalize"):
+    g.add_node(name, wrap_with_error_edge(node_fns[name]))  # exceptions → error_handler
+g.set_entry_point("load_chunk")
+g.add_conditional_edges("load_chunk", has_threads, {True: "match_profiles", False: "finalize"})
+g.add_edge("match_profiles", "classify_batch")
+g.add_edge("classify_batch", "apply_actions")
+g.add_conditional_edges("apply_actions", more_batches, {True: "classify_batch", False: "finalize"})
+g.add_edge("error_handler", "finalize")
+g.add_edge("finalize", END)
+agent = g.compile()
 ```
+
+`src/graph/runner.py` exposes `run_triage(user_id, run_id)`; the API starts it as a
+FastAPI background task and streams its events over SSE.

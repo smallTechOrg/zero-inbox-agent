@@ -1,38 +1,25 @@
 # Capabilities Index
 
-> **Boilerplate status:** The spec-writer sub-agent creates one file per capability in this directory. Each file describes exactly one discrete thing the agent can do.
+Ground-up redesign, 2026-08. Any capability file not listed here is superseded and
+must be deleted.
 
----
+## Phase 1
 
-## What Is a Capability?
+| Capability | One line |
+|---|---|
+| [google-signin](google-signin.md) | Google sign-in + Gmail connection, encrypted tokens, reconnect-not-traceback |
+| [inbox-audit](inbox-audit.md) | Fast read-only mini-audit of the INBOX |
+| [taxonomy-management](taxonomy-management.md) | Editable per-user categories with per-category rules, seeded defaults |
+| [triage-run](triage-run.md) | One manual 50-thread cleaning chunk — batched, header-only, resumable, never-redo |
+| [live-activity-feed](live-activity-feed.md) | Streaming plain-English actions, reasoning, progress, cost ticker |
+| [run-undo-audit](run-undo-audit.md) | Run timeline cards, one-click whole-run undo, full audit trail |
 
-A capability is a single, discrete action or behavior the agent performs. Examples:
-- "Search the web for companies matching criteria X"
-- "Draft a personalized email given a lead profile"
-- "Send a Slack notification when a threshold is crossed"
+## Phase 2
 
-## Capabilities in This Project
-
-<!-- FILL IN: List capabilities here as they are defined. Each entry links to its spec file (no number prefix). -->
-
-| Capability | File |
-|-----------|------|
-| <!-- name --> | [name.md](name.md) |
-
-## How to Add a New Capability
-
-Run `/zero-shot-build [description]` on the existing spec. The spec-writer sub-agent will:
-1. Create a new file in this directory (`<name>.md`, no number prefix)
-2. Update this index
-3. Flag any dependencies on existing capabilities
-4. Self-review that it fits the architecture and data model before returning
-
-## Capability File Template
-
-Each capability file should answer:
-- **What it does** (one sentence)
-- **Inputs** (what data it receives)
-- **Outputs** (what it produces)
-- **External calls** (APIs, LLMs, databases it touches)
-- **Error cases** (what can go wrong and how it's handled)
-- **Success criteria** (how we test it)
+| Capability | One line |
+|---|---|
+| [backlog-drive](backlog-drive.md) | Chunk-by-chunk drive to inbox zero with progress |
+| [sender-profiles](sender-profiles.md) | Repeat senders skip the LLM entirely |
+| [ledger-search](ledger-search.md) | Searchable per-email decision ledger |
+| [category-rules](category-rules.md) | Merge/delete/reassign categories as undoable runs |
+| [cost-dashboard](cost-dashboard.md) | Per-run cost cards + cumulative totals |
